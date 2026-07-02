@@ -47,7 +47,7 @@ Public Sub Main01()
 
     ' Enable Chrome extension(Please install the Google Translate extension in advance.)
     Dim extensionPath As String
-    extensionPath = Environ("LOCALAPPDATA") & "\Google\Chrome\User Data\Default\Extensions\aapbdbdomjkkjkaonfhkkikfgjllcleb\2.0.16_0"
+    extensionPath = Environ("LOCALAPPDATA") & "\Google\Chrome\User Data\Default\Extensions\aapbdbdomjkkjkaonfhkkikfgjllcleb\2.0.17_0"
     bidi.ExecuteWebExtensionInstall extensionPath
        
     ' Navigate to test.html
