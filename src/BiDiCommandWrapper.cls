@@ -139,9 +139,13 @@ Private m_recorderLogs As Collection
 Private m_isRecording As Boolean
 Private m_recorderStartTime As Double
 Private m_excludeResources As Boolean
-' [AI-Log] Per-request lifecycle + suppression bookkeeping for the discovery log.
-Private m_recPendingReqMs As Dictionary   ' reqId -> start NowMs() (for dur= and [REQ-OPEN] flush)
-Private m_recPendingKey As Dictionary     ' reqId -> normalized endpoint key
+' [AI-Log] Suppression bookkeeping for the discovery log.
+' NOTE: Per-request lifecycle tracking (dur= / [REQ] / [REQ-OPEN]) was REMOVED.
+' It required network.beforeRequestSent, which is deliberately NOT subscribed
+' (its per-request-initiation flood destabilizes the single-threaded input loop
+' on Wiz-style SPAs -- see StartDiscoveryLog). Without that event a request-start
+' timestamp never exists, so dur= could only ever have printed "?". The pending
+' maps were therefore dead state; the log LEGEND now matches this reality.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_droppedHeadCount As Long          ' count of oldest timeline lines evicted by the MAX_LOG_SIZE ring buffer (0 = none)
 
@@ -2138,8 +2142,6 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     ' it from (NowMs()/1000) so the displayed offset is in seconds (e.g. "1.23s").
     m_recorderStartTime = socket_.NowMs() / 1000
     m_excludeResources = excludeImagesAndCss
-    Set m_recPendingReqMs = New Dictionary
-    Set m_recPendingKey = New Dictionary
     Set m_recSuppByKey = New Dictionary
     m_droppedHeadCount = 0
     ' Include network.fetchError so blocked requests (Network.setBlockedURLs
@@ -2167,11 +2169,10 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
 
     If m_recorderLogs Is Nothing Then Exit Sub
 
-    ' [AI-Log] Append end-of-run summaries to the timeline tail: requests that
-    ' never received a response (a strong fire-and-forget / keepalive signal),
-    ' and a tally of suppressed (filtered) events by endpoint so nothing is
-    ' hidden without a trace.
-    FlushOpenRequests
+    ' [AI-Log] Append the end-of-run summary to the timeline tail: a tally of
+    ' suppressed (filtered) events by endpoint so nothing is hidden without a
+    ' trace. (Open-request flushing was removed along with the dur=/[REQ]
+    ' machinery -- see the NOTE at the m_recSuppByKey declaration.)
     AppendSuppressedSummary
     
     ' Save logic
@@ -2202,8 +2203,9 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
                           " event(s) are shown. Earlier events existed but were evicted (ring buffer)." & vbCrLf
         End If
         ' [AI-Log] Legend so a reader can interpret fields without external context.
-        stm.WriteText "LEGEND | [REQ]/[RES] carry: id=<reqId> key=<host+path, volatile query stripped, rpcids kept> dur=<resp latency ms> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
-        stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [REQ-OPEN]=request with no response seen  [SUPPRESSED]=filtered-noise tally" & vbCrLf
+        stm.WriteText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
+        stm.WriteText "LEGEND | per-request latency (dur=) and [REQ]/[REQ-OPEN] lines are NOT recorded BY DESIGN: network.beforeRequestSent is not subscribed (its event flood destabilizes input on heavy SPAs), so request-start times do not exist in this log." & vbCrLf
+        stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
         stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
@@ -2226,10 +2228,11 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "     Flag any wait with slack < ~100ms as marginal -> consider raising minStableMs, especially" & vbCrLf
         stm.WriteText "     if that action is capture/timing-sensitive." & vbCrLf
         stm.WriteText "   - Check maxElapsed vs maxTimeoutMs (headroom). Any TIMEOUT/HALT = wait too short or a real stall." & vbCrLf
-        stm.WriteText "   - Long elapsed caused by slow server responses (see dur=) is NOT a threshold problem; do not" & vbCrLf
-        stm.WriteText "     raise minStableMs for that." & vbCrLf
+        stm.WriteText "   - Long elapsed caused by slow server responses is NOT a threshold problem; do not raise" & vbCrLf
+        stm.WriteText "     minStableMs for that. Infer server latency from the timestamp gaps between consecutive" & vbCrLf
+        stm.WriteText "     [RES]/[NAV] lines (per-request dur is not recorded; see LEGEND)." & vbCrLf
         stm.WriteText vbCrLf
-        stm.WriteText "Per-line features to use: id (pairs REQ/RES), key (normalized endpoint), dur (latency ms)," & vbCrLf
+        stm.WriteText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
         stm.WriteText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
         stm.WriteText "=== END REQUEST ===" & vbCrLf
         stm.WriteText "--------------------------------------------------------" & vbCrLf
@@ -2258,8 +2261,6 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
     End If
 
     Set m_recorderLogs = Nothing
-    Set m_recPendingReqMs = Nothing
-    Set m_recPendingKey = Nothing
     Set m_recSuppByKey = Nothing
 End Sub
 
@@ -2442,26 +2443,20 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
 
             If m_excludeResources Then
                 If IsNoiseUrl(resUrl) Or IsNoiseMime(mime) Then
-                    If Len(resId) > 0 Then ClearPending resId
                     BumpSuppressed resKey
                     Exit Sub
                 End If
             End If
 
-            ' [AI-Log] Pair with the originating request to report dur=, then close it.
-            Dim resDur As String: resDur = "?"
-            If Len(resId) > 0 Then
-                If m_recPendingReqMs.Exists(resId) Then
-                    resDur = CStr(CLng(socket_.NowMs() - CDbl(m_recPendingReqMs.Item(resId))))
-                    ClearPending resId
-                End If
-            End If
+            ' [AI-Log] dur= intentionally NOT reported: request-start times would
+            ' require network.beforeRequestSent, which is deliberately not
+            ' subscribed (see StartDiscoveryLog / the m_recSuppByKey NOTE).
 
             Dim resStatus As String: resStatus = ""
             If res.Exists("status") Then resStatus = CStr(res("status"))
             ' [AI-Log] url= omitted (see [REQ] above) - key= is the analysis field.
             LogLine = "[" & relTime & "] [RES] " & resStatus & " [" & mime & "] | id=" & ShortId(resId) & _
-                      " | key=" & resKey & " | dur=" & resDur & "ms | idle=" & IIf(IsIdleIgnored(resUrl), "skip", "track")
+                      " | key=" & resKey & " | idle=" & IIf(IsIdleIgnored(resUrl), "skip", "track")
 
         Case "network.fetchError"
             ' Surface failed requests in the discovery log. Two sub-cases:
@@ -2478,9 +2473,6 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             Dim ferReq As Object: Set ferReq = params("request")
             If Not ferReq.Exists("url") Then Exit Sub
             Dim ferUrl As String: ferUrl = CStr(ferReq("url"))
-            ' [AI-Log] A fetchError terminates the request; close any pending entry.
-            If ferReq.Exists("request") Then ClearPending CStr(ferReq("request"))
-
             If m_excludeResources Then
                 If IsNoiseUrl(ferUrl) Then BumpSuppressed NormalizeEndpointKey(ferUrl): Exit Sub
             End If
@@ -2710,32 +2702,6 @@ Private Sub BumpSuppressed(ByVal keyStr As String)
     Else
         m_recSuppByKey.Add keyStr, 1
     End If
-    On Error GoTo 0
-End Sub
-
-' [AI-Log] ClearPending: removes a request from the open-request maps once it has
-'   completed or errored, so it is not later flushed as [REQ-OPEN].
-Private Sub ClearPending(ByVal idStr As String)
-    On Error Resume Next
-    If Not m_recPendingReqMs Is Nothing Then If m_recPendingReqMs.Exists(idStr) Then m_recPendingReqMs.Remove idStr
-    If Not m_recPendingKey Is Nothing Then If m_recPendingKey.Exists(idStr) Then m_recPendingKey.Remove idStr
-    On Error GoTo 0
-End Sub
-
-' [AI-Log] FlushOpenRequests: at save time, emit one [REQ-OPEN] line per request
-'   that never produced a response or fetchError. A request that stays open is a
-'   strong fire-and-forget / keepalive / long-poll signal a reader can use.
-Private Sub FlushOpenRequests()
-    On Error Resume Next
-    If m_recorderLogs Is Nothing Or m_recPendingReqMs Is Nothing Then Exit Sub
-    Dim k As Variant
-    For Each k In m_recPendingReqMs.keys
-        Dim openMs As Double: openMs = CDbl(socket_.NowMs() - CDbl(m_recPendingReqMs.Item(k)))
-        Dim keyStr As String: keyStr = ""
-        If m_recPendingKey.Exists(k) Then keyStr = CStr(m_recPendingKey.Item(k))
-        m_recorderLogs.Add "[end] [REQ-OPEN] id=" & ShortId(CStr(k)) & " | key=" & keyStr & _
-                           " | openMs=" & CStr(CLng(openMs)) & " | (no response seen)"
-    Next k
     On Error GoTo 0
 End Sub
 
