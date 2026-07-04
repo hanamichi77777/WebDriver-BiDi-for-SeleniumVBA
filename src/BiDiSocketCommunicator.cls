@@ -39,8 +39,8 @@ Option Explicit
 ' Read before editing any single method. The risk is not "where is X" but
 ' "which wire-level invariant does X participate in". This class owns the
 ' socket; business logic, retries and SPA waits live in BiDiCommandWrapper.
-'
 ' [FUNNELS]  Route through these; do not open ad-hoc paths.
+
 '   Connect        : 7-stage WinHttp WebSocket handshake; the ONLY place handles are acquired.
 '   SendCommand    : unified id-gen + envelope + size-check + SendAndReceive (callers pass method+params).
 '   SendAndReceive : core synchronous I/O, held under the m_isSendReceiving lock.

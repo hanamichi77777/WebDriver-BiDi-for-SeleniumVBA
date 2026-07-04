@@ -123,9 +123,10 @@ Private Const SHORT_WAIT_MS As Long = 500
 Private Const MAX_LOG_SIZE As Long = 500
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging
 Private Const MIN_MSG_SIZE As Long = 10     ' Ignore extremely short messages
-' [BiDi spec compliance] Fixed reserved POSITIVE id for PostScript (fire-and-forget).
-' Kept FIXED + equality-recognized (the proven-good pattern); only the sign changed from
-' the old -1 sentinel. Command ids start at CMD_ID_FLOOR (socket), so 2 never collides.
+' Fixed reserved POSITIVE id for PostScript (fire-and-forget; ids are js-uint per spec).
+' Best-effort traffic: replies are always discarded via the socket's reserved-band check,
+' so duplicate outstanding ids are tolerated. Command ids start at CMD_ID_FLOOR (socket),
+' so 2 never collides with them.
 Private Const POST_SCRIPT_ID As Long = 2
 
 ' --- Noise Filtering State ---
@@ -654,7 +655,15 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         Call ExecuteBrowsingContextNavigate(targetUrl, modeStr, vMinStable, vMaxTimeout, targetCtx)
         Dim navErr As Long: navErr = Err.Number
         Dim navDesc As String: navDesc = Err.description
+        Dim navSrc As String: navSrc = Err.source
         On Error GoTo 0
+        
+        ' CONSENSUS HALT is a deliberate stop signal: never absorb it into the
+        ' retry loop. vbObjectError-based codes are negative, so it would slip
+        ' past the >= 600 check below and be retried as a re-navigation.
+        If navErr = ERR_CONSENSUS_HALT Then
+            Err.Raise navErr, navSrc, navDesc
+        End If
         
         ' Fatal socket errors (600+) should not be retried
         If navErr >= 600 Then
@@ -2080,7 +2089,9 @@ Public Sub ExecuteRegisterAutoClickerByXPath(ByVal xpath As String, _
     Me.ExecuteSessionSubscribe "log.entryAdded", , True
     
     Dim sourceJs As String: sourceJs = GetActionJs("autoclicker")
-    Dim safeXpath As String: safeXpath = Replace(xpath, "'", "\'")
+    ' JSON-encode the XPath into a complete JS string literal (handles quotes,
+    ' backslashes, newlines). The template placeholder is unquoted to match.
+    Dim safeXpath As String: safeXpath = WebJsonConverter.ConvertToJson(xpath)
     sourceJs = Replace(sourceJs, "{{XPATH}}", safeXpath)
     sourceJs = Replace(sourceJs, "{{TIMEOUT}}", CStr(timeoutMs))
     
@@ -3183,8 +3194,9 @@ Private Function GetActionJs(ByVal actionType As String) As String
         Case "autoclicker"
             ' Background MutationObserver clicker (script.addPreloadScript).
             ' Preload runs with NO args per document -> xpath/timeout inlined via {{}};
+            ' {{XPATH}} receives a JSON-encoded string literal (quotes included).
             ' wrapper is a function expression (BiDi executes it). Cf. ShadowUnlocker.
-            js = js & "function(){const x='{{XPATH}}',t={{TIMEOUT}},s=Date.now();"
+            js = js & "function(){const x={{XPATH}},t={{TIMEOUT}},s=Date.now();"
             js = js & "const f=()=>{const e=document.evaluate(x,document,null,9,null).singleNodeValue;"
             js = js & "if(e&&(e.offsetWidth>0||e.offsetHeight>0)){e.click();e.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
             js = js & "console.log('BiDi-AutoClicker: Target clicked');return 1}return 0};"
@@ -3343,15 +3355,19 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             ' --- fetch() wrapper: intercepts fetch calls to track inflight count ---
             ' Wraps window.fetch once (__vbaWrapped flag). Increments inflightFetchCount on
             ' call, decrements on resolve/reject. Skipped if URL matches ignoreNetwork.
+            ' A synchronous throw from the original fetch also decrements (a stuck
+            ' counter would block idle consensus until the next navigation).
             js = js & "var __vbaMatch=function(u,pat){if(pat.indexOf('*')<0)return u.indexOf(pat)!==-1;var re=pat.replace(/[.+^${}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*').replace(/\?/g,'.');try{return new RegExp(re).test(u)}catch(e){return u.indexOf(pat)!==-1}};"
             js = js & "if(typeof window.fetch==='function'&&!window.fetch.__vbaWrapped){var oF=window.fetch;window.fetch=function(u,o){var r=(typeof u==='string')?u:(u&&u.url)||'';if(ignoreNetwork.some((pat)=>__vbaMatch(r,pat)))return oF.apply(this,arguments);"
-            js = js & "p.inflightFetchCount++;p.inflightUrls.add(r);var dec=()=>{p.inflightFetchCount--;p.inflightUrls.delete(r);uT()};return oF.apply(this,arguments).then((r2)=>{dec();return r2}).catch((e)=>{dec();throw e})};window.fetch.__vbaWrapped=true}"
+            js = js & "p.inflightFetchCount++;p.inflightUrls.add(r);var dec=()=>{p.inflightFetchCount--;p.inflightUrls.delete(r);uT()};try{return oF.apply(this,arguments).then((r2)=>{dec();return r2}).catch((e)=>{dec();throw e})}catch(e2){dec();throw e2}};window.fetch.__vbaWrapped=true}"
             ' --- XHR wrapper: intercepts XMLHttpRequest open/send to track inflight count ---
             ' Wraps prototype.open to capture URL, prototype.send to increment counter.
             ' Decrements on 'loadend' event. Skipped if URL matches ignoreNetwork.
+            ' A synchronous throw from send() decrements via dn(), since 'loadend'
+            ' never fires for a request that was never started.
             js = js & "if(!XMLHttpRequest.prototype.__vbaWrapped){var oO=XMLHttpRequest.prototype.open,oS=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this.__vbaUrl=u;this.__vbaHooked=true;return oO.apply(this,arguments)};"
             js = js & "XMLHttpRequest.prototype.send=function(){var s=this,u=this.__vbaUrl||'';if(ignoreNetwork.some((pat)=>__vbaMatch(u,pat))){s.__vbaHooked=false;return oS.apply(this,arguments)}p.inflightXhrCount++;p.inflightUrls.add(u);"
-            js = js & "var dn=()=>{if(s.__vbaHooked){p.inflightXhrCount--;p.inflightUrls.delete(u);s.__vbaHooked=false;uT()}s.removeEventListener('loadend',dn)};this.addEventListener('loadend',dn);return oS.apply(this,arguments)};XMLHttpRequest.prototype.__vbaWrapped=true}return true})();"
+            js = js & "var dn=()=>{if(s.__vbaHooked){p.inflightXhrCount--;p.inflightUrls.delete(u);s.__vbaHooked=false;uT()}s.removeEventListener('loadend',dn)};this.addEventListener('loadend',dn);try{return oS.apply(this,arguments)}catch(e2){dn();throw e2}};XMLHttpRequest.prototype.__vbaWrapped=true}return true})();"
         Case "query"
             ' Returns JSON snapshot of probe state: active flag, timing, inflight counts,
             ' pending DOM change list, and inflight URLs. Clears changeList after read.
@@ -3502,9 +3518,9 @@ CleanExit:
     ' STEP 4: ERROR PROPAGATION (504, 505, or 517 from JS)
     If errNum <> 0 Then
         ' --- Consensus Failure Analysis ---
-        ' Check if pending network requests caused the failure.
-        ' If yes: HALT processing and log URLs for triage.
-        ' If no:  Propagate as a normal error (absorbed by TrySyncPhase).
+        ' HALT escalation applies ONLY to the logical timeout (504) with pending
+        ' requests. Other errors (505 probe panic, socket 6xx) must keep their
+        ' original code so the socket-recovery / best-effort paths stay reachable.
         On Error Resume Next
         Application.Interactive = True
         
@@ -3527,16 +3543,24 @@ CleanExit:
         On Error GoTo 0
         
         ' [Tier1 Diagnostics] Record the give-up outcome BEFORE raising, so the
-        ' saved discovery log distinguishes a real consensus from a timeout/halt.
-        ' (Previously these only went to the Immediate Window and left no trace
-        ' in the log, making every run look like it settled cleanly.)
+        ' saved discovery log distinguishes a real consensus from a timeout,
+        ' halt, or error (outcome key: see WriteSpaWaitEnd). Previously these
+        ' only went to the Immediate Window and left no trace in the log.
+        Dim endStatus As String
+        If errNum = 504 And Len(inflightDetail) > 0 Then
+            endStatus = "HALT"
+        ElseIf errNum = 504 Then
+            endStatus = "TIMEOUT"
+        Else
+            endStatus = "ERROR"
+        End If
         On Error Resume Next
-        Call WriteSpaWaitEnd(IIf(Len(inflightDetail) > 0, "HALT", "TIMEOUT"), mode, ctx, startTick)
+        Call WriteSpaWaitEnd(endStatus, mode, ctx, startTick)
         Err.Clear
         On Error GoTo 0
 
-        If Len(inflightDetail) > 0 Then
-            ' --- HALT: Pending requests are blocking consensus ---
+        If errNum = 504 And Len(inflightDetail) > 0 Then
+            ' --- HALT: 504 timeout with pending requests blocking consensus ---
             ' Output to Immediate Window and raise non-absorbable error.
             Debug.Print String(60, "=")
             Debug.Print "[" & Format(Now, "hh:mm:ss") & "] CONSENSUS HALT"
@@ -3549,8 +3573,8 @@ CleanExit:
             
             Err.Raise ERR_CONSENSUS_HALT, "BiDi:MasterWaitEngine:" & errSrc, haltMsg
         Else
-            ' --- NORMAL TIMEOUT: No pending requests (e.g. DOM mutations only) ---
-            ' Propagate as a standard error; TrySyncPhase will absorb this.
+            ' --- NON-HALT: DOM-only 504, or a non-504 error (505 / socket 6xx) ---
+            ' Propagate with the original code; TrySyncPhase absorbs non-HALT errors.
             Err.Raise errNum, "BiDi:MasterWaitEngine:" & errSrc, errDesc
         End If
     End If
@@ -3572,8 +3596,9 @@ End Function
 
 ' [Tier1 Diagnostics] WriteSpaWaitEnd
 '   Emits a single [SPA-WAIT-END] line summarising the outcome of one SPA-idle
-'   wait: STABLE (consensus reached), TIMEOUT (gave up, no pending network), or
-'   HALT (gave up with requests still pending). Reports wall-clock elapsedMs, the
+'   wait: STABLE (consensus reached), TIMEOUT (504, no pending network),
+'   HALT (504 with requests still pending), or ERROR (non-504 failure:
+'   505 probe panic, socket 6xx, JS error). Reports wall-clock elapsedMs, the
 '   DOM-quiet duration actually achieved (domQuietMs), the slack over the
 '   configured threshold (slackMs = domQuietMs - minStableMs), and the network
 '   counters at exit. Paired with [SPA-WAIT-BEGIN] this lets an analyzer tell a
@@ -4284,12 +4309,14 @@ End Function
 Public Function ExecuteEnableGlobalShadowUnlocker() As String
     Dim params As New Dictionary, js As String
     
-    ' Hook attachShadow to always execute with mode: 'open'
+    ' Hook attachShadow to force mode:'open' while PRESERVING all other options
+    ' (delegatesFocus, slotAssignment, serializable). Dropping slotAssignment:
+    ' 'manual' would break rendering of manually slotted components.
     js = "function() { "
     js = js & "if (Element.prototype._attachShadow) return; "
     js = js & "Element.prototype._attachShadow = Element.prototype.attachShadow; "
     js = js & "Element.prototype.attachShadow = function(options) { "
-    js = js & "  return this._attachShadow({ mode: 'open' }); "
+    js = js & "  return this._attachShadow(Object.assign({}, options || {}, { mode: 'open' })); "
     js = js & "}; }"
     
     params.Add "functionDeclaration", js
