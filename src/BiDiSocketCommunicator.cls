@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.2
+' Version: 1.3
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -45,7 +45,9 @@ Option Explicit
 '   SendCommand    : unified id-gen + envelope + size-check + SendAndReceive (callers pass method+params).
 '   SendAndReceive : core synchronous I/O, held under the m_isSendReceiving lock.
 '   SendMessage    : raw frame send; never re-sends the same id (see INVARIANTS).
-'   GetMessage     : 100ms poll; swallows the PING(1) reply, returns all other BiDi events.
+'                    allowRecovery:=False = best-effort path (PostScript), never recovers.
+'   GetMessage     : 100ms poll; swallows reserved-band replies (id < CMD_ID_FLOOR),
+'                    returns all other BiDi events.
 '
 ' [STATE OWNERSHIP]  This class is the owner. Do not duplicate these upstream.
 '   WinHttp/WebSocket handles : hSession_, hConnection_, hRequest_, hWebSocket_
@@ -59,9 +61,14 @@ Option Explicit
 '                      defensively. Never retain or double-close it.
 '   RE-ENTRANCY      : no DoEvents / PumpMessages while m_isSendReceiving is True (WinHttp
 '                      state corrupts under re-entrant receive).
-'   ID BANDS         : [1..99] reserved (PING=1, PostScript reply=2); commands [CMD_ID_FLOOR=100 .. ID_MAX].
+'   ID BANDS         : [1..99] reserved (PostScript reply=2 fixed; heartbeat pings rotate
+'                      in [3..99]); commands [CMD_ID_FLOOR=100 .. ID_MAX]. Recognition is
+'                      band-based: any root id below CMD_ID_FLOOR is system traffic.
 '   NO RESEND        : on send failure SendMessage recovers the socket but returns False; the same
 '                      id is never re-sent (W3C requires unique ids). Retry is the Wrapper's job, new id.
+'   SILENT PEER      : sync WebSocket Receive has NO timeout; the timeout tiers work only
+'                      while frames arrive. A TCP-alive, frame-silent peer blocks
+'                      indefinitely (see the LIMITATION note in SendAndReceive).
 '   ERROR HANDLER    : no file I/O (Trace) inside the error handler.
 '   QPC FAIL-FAST    : Class_Initialize raises vbObjectError+9001 if QPC is unavailable.
 ' ==========================================================================
@@ -85,6 +92,7 @@ Private Declare PtrSafe Function WinHttpWebSocketCompleteUpgrade Lib "WinHttp" (
 Private Declare PtrSafe Function WinHttpWebSocketSend Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByVal eBufferType As Long, ByRef pvBuffer As Any, ByVal dwBufferLength As Long) As Long
 Private Declare PtrSafe Function WinHttpWebSocketReceive Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByRef pvBuffer As Any, ByVal dwBufferLength As Long, ByRef pdwBytesRead As Long, ByRef peBufferType As Long) As Long
 Private Declare PtrSafe Function WinHttpWebSocketClose Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByVal usStatus As Long, ByRef pvReason As Any, ByVal dwReasonLength As Long) As Long
+Private Declare PtrSafe Function WinHttpWebSocketShutdown Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByVal usStatus As Long, ByRef pvReason As Any, ByVal dwReasonLength As Long) As Long
 
 ' --- Utility API Declarations ---
 Private Declare PtrSafe Sub SleepWinAPI Lib "kernel32" Alias "Sleep" (ByVal milliseconds As Long)
@@ -109,14 +117,17 @@ Private Const WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE           As Long = 4
 
 ' --- Library Settings ---
 Private Const NO_ERROR As Long = 0
-' [BiDi spec compliance] Fixed reserved POSITIVE ids for system traffic (js-uint conformant).
-' Commands are issued only from [CMD_ID_FLOOR .. ID_MAX], so reserved ids 1/2 (and 3..99)
-' can never collide. Recognition stays equality-based (the proven-good pattern).
+' [BiDi spec compliance] Reserved POSITIVE id band for system traffic (js-uint conformant).
+' Commands are issued only from [CMD_ID_FLOOR .. ID_MAX]; ids [1..99] never collide with them.
+' Heartbeat pings ROTATE within [3..99] so no duplicate id is ever outstanding (W3C unique-id
+' compliance, same rationale as the NO RESEND invariant). Recognition is band-based:
+' IsReservedSystemId discards every root id below CMD_ID_FLOOR at both receive sites.
 Private Const CMD_ID_FLOOR As Long = 100         ' command ids: [100 .. ID_MAX]
 Private Const ID_MAX As Long = 2000000000        ' wrap ceiling (within VBA Long range)
-Private Const SYSTEM_PING_ID As Long = 1         ' reserved fixed id: keep-alive ping
 Private Const POST_SCRIPT_REPLY_ID As Long = 2   ' reserved fixed id: PostScript fire-and-forget reply (discarded)
-' (3..99 free for future system ids)
+Private Const SYSTEM_PING_ID_MIN As Long = 3     ' heartbeat rotating id band floor
+Private Const SYSTEM_PING_ID_MAX As Long = 99    ' heartbeat rotating id band ceiling
+Private Const MAX_CONSECUTIVE_SOFT_TIMEOUTS As Long = 2 ' soft timeouts on one connection before StateError
 Private Const DEFAULT_BUFFER_SIZE As Long = 8192
 Private Const MAX_BUFFER_SIZE As Long = 10485760 ' 10MB
 Private Const DEFAULT_TIMEOUT_MS As Long = 30000
@@ -174,6 +185,8 @@ Private m_lastPumpTicks As Currency ' Throttle state for PumpMessages
 
 ' --- Request ID Management (owner; see AI NAVIGATION MAP) ---
 Private m_nextRequestId As Long
+Private m_nextSystemPingId As Long ' heartbeat id rotation cursor [3..99]
+Private m_consecutiveSoftTimeouts As Long ' consecutive soft timeouts on the current connection
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging (mirrors Wrapper constant)
 
 ' Initialization & Termination
@@ -216,6 +229,8 @@ Private Sub Class_Initialize()
 
     ' Request ID seed (first issued id = CMD_ID_FLOOR)
     m_nextRequestId = CMD_ID_FLOOR - 1
+    ' Heartbeat id seed (first issued ping id = SYSTEM_PING_ID_MIN)
+    m_nextSystemPingId = SYSTEM_PING_ID_MIN - 1
 
     SetState StateDisconnected
 End Sub
@@ -391,6 +406,7 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
         
         m_lastPollTime = 0
         m_RetryCount = 0
+        m_consecutiveSoftTimeouts = 0 ' fresh connection: reset silence tracking
         SetState StateConnected
         Connect = True
     Else
@@ -406,13 +422,17 @@ ErrorHandler:
 End Function
 
 ' Sends a raw UTF-8 string message through the WebSocket.
-Public Function SendMessage(ByVal Msg As String) As Boolean
+' allowRecovery:=False makes this a best-effort send: on StateError or send failure
+' it exits/returns False WITHOUT invoking AttemptRecovery (no backoff wait). Used by
+' PostScript so fire-and-forget can never block teardown or HUD updates.
+Public Function SendMessage(ByVal Msg As String, Optional ByVal allowRecovery As Boolean = True) As Boolean
     If LenB(Msg) = 0 Then Exit Function
     
     ' NEW: Log every send attempt before it happens
     Trace ">>> [Socket] Attempting to send message..."
 
     If m_State = StateError Then
+        If Not allowRecovery Then Exit Function
         If Not AttemptRecovery() Then Exit Function
     End If
 
@@ -455,13 +475,15 @@ Public Function SendMessage(ByVal Msg As String) As Boolean
     ' after a socket drop violates the protocol and corrupts the inflight request map.
     ' We heal the connection here, but strictly return False so the upper layer
     ' handles the failure (e.g., re-generating the ID or raising an exception).
-    Call AttemptRecovery
+    ' Best-effort sends (allowRecovery:=False) skip healing entirely.
+    If allowRecovery Then Call AttemptRecovery
     SendMessage = False
 End Function
 
 ' PostScript: Fire & Forget transport. Sends a message without expecting a response.
+' Best-effort: never triggers recovery/backoff (see SendMessage allowRecovery).
 Public Sub PostScript(ByVal Msg As String)
-    SendMessage Msg
+    SendMessage Msg, False
 End Sub
 
 ' FUNCTION: GetNextRequestId
@@ -474,6 +496,23 @@ Public Function GetNextRequestId() As Long
     ' Wrap within the command band [CMD_ID_FLOOR .. ID_MAX]; never re-enter reserved 1..99
     If m_nextRequestId > ID_MAX Then m_nextRequestId = CMD_ID_FLOOR
     GetNextRequestId = m_nextRequestId
+End Function
+
+' Next heartbeat id, rotating within [SYSTEM_PING_ID_MIN .. SYSTEM_PING_ID_MAX].
+' Rotation keeps every outstanding ping id unique (W3C unique-id compliance).
+Private Function GetNextSystemPingId() As Long
+    m_nextSystemPingId = m_nextSystemPingId + 1
+    If m_nextSystemPingId > SYSTEM_PING_ID_MAX Then m_nextSystemPingId = SYSTEM_PING_ID_MIN
+    GetNextSystemPingId = m_nextSystemPingId
+End Function
+
+' True if idStr is a numeric root id inside the reserved system band [1 .. CMD_ID_FLOOR).
+' BiDi events carry no id (idStr = "") and are NOT system traffic.
+Private Function IsReservedSystemId(ByVal idStr As String) As Boolean
+    If Len(idStr) = 0 Then Exit Function
+    If Not IsNumeric(idStr) Then Exit Function
+    Dim v As Double: v = val(idStr)
+    IsReservedSystemId = (v >= 1 And v < CMD_ID_FLOOR)
 End Function
 
 ' FUNCTION: SendCommand
@@ -568,10 +607,14 @@ Private Sub InternalCleanup()
     On Error Resume Next
     
     If hWebSocket_ <> 0 Then
-        ' Attempt to send a close frame (Status 1000: Normal Closure).
-        ' We don't wait for the server's response here to ensure the cleanup
-        ' remains fast and responsive during error or disconnect sequences.
-        WinHttpWebSocketClose hWebSocket_, 1000, ByVal 0&, 0
+        ' Send a close frame (Status 1000) WITHOUT waiting for the peer's reply.
+        ' DANGER: WinHttpWebSocketClose performs the FULL close handshake (send +
+        ' wait for the peer's close frame) and blocks indefinitely against a
+        ' half-dead peer (e.g. suspended driver: TCP still ACKs, no frames ever
+        ' arrive). WinHttpWebSocketShutdown is the send-only half; the handle
+        ' release below tears the connection down regardless of the peer.
+        ' (ForceClose already avoided Close for the same reason.)
+        WinHttpWebSocketShutdown hWebSocket_, 1000, ByVal 0&, 0
         WinHttpCloseHandle hWebSocket_
         hWebSocket_ = 0
     End If
@@ -649,18 +692,30 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
         End If
     End If
     
-    ' WHY: two-tier timeout strategy to distinguish between slow responses and
-    '       genuine connection loss. Heavy SPAs (e.g., ServiceNow) can cause the
-    '       browser to become temporarily unresponsive, but the WebSocket connection
-    '       itself remains healthy. Previously, a single timeout immediately transitioned
-    '       to StateError and destroyed all WinHttp handles, forcing a full reconnection
-    '       sequence even for transient browser slowness.
+    ' WHY: two-tier timeout strategy distinguishes transient browser slowness from
+    '       sustained socket silence without immediately destroying handles.
     '
-    '       Soft Timeout (1x): Raises error 604 to the caller (ExecuteBiDiCommand retry
-    '           loop can attempt recovery), but preserves the WebSocket connection.
-    '       Hard Timeout (2x): Only reached if the caller retries and hits the deadline
-    '           again. Transitions to StateError and forces handle cleanup, as sustained
-    '           silence indicates a genuine connection problem.
+    '       Soft Timeout (1x): no matching response within the normal window. Raises
+    '           604 but PRESERVES the connection; the caller (ExecuteBiDiCommand)
+    '           retries as a NEW SendAndReceive call with a new id and fresh deadlines.
+    '           Each soft timeout on the same connection increments
+    '           m_consecutiveSoftTimeouts; reaching MAX_CONSECUTIVE_SOFT_TIMEOUTS is
+    '           judged sustained silence (half-dead socket that still accepts sends)
+    '           and escalates to StateError. The counter resets on any successfully
+    '           matched response and on a fresh Connect.
+    '       Hard Timeout (2x): reachable only WITHIN a single call, when ReadFromWire
+    '           (whose internal deadline is hardDeadline) stays in fragment assembly
+    '           past twice the window. Transitions to StateError immediately.
+    '       On StateError, handles are cleaned up on exit ONLY when AutoReconnect
+    '           is enabled (see Cleanup); otherwise they persist until Disconnect.
+    '       LIMITATION (empirically verified): both tiers require ReadFromWire to
+    '           regain control, i.e. frames must still arrive. A peer that is
+    '           TCP-alive but sends nothing (suspended or deadlocked driver: the
+    '           kernel keeps ACKing) blocks WinHttpWebSocketReceive indefinitely;
+    '           NO WinHTTP timeout option applies to synchronous WebSocket
+    '           receives. A KILLED peer does unblock it (TCP reset -> receive
+    '           error). Escaping a silent-but-alive peer would require async
+    '           WinHTTP or a second thread, neither available to VBA.
     Dim timeout As Long: timeout = IIf(waitTimeMs > 0, waitTimeMs, m_DefaultTimeout)
     Dim softDeadline As Double: softDeadline = NowMs() + timeout
     Dim hardDeadline As Double: hardDeadline = NowMs() + (timeout * 2)
@@ -692,8 +747,9 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
                 ' BiDi events (network.beforeRequestSent etc.) have no "id" field,
                 ' so the old condition (inId <> "") silently discarded them.
                 ' Losing these one-shot events degraded SPA idle detection accuracy.
-                ' Discard reserved system replies (heartbeat pong, PostScript reply)
-                If inId <> CStr(SYSTEM_PING_ID) And inId <> CStr(POST_SCRIPT_REPLY_ID) Then
+                ' Discard reserved-band system replies (rotating heartbeat pongs,
+                ' PostScript reply) via a single band check.
+                If Not IsReservedSystemId(inId) Then
                     m_EventBuffer.Add Msg
                     
                     ' FIFO Protection to prevent memory exhaustion
@@ -715,11 +771,19 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
         End If
         
         ' SOFT Timeout: Response not received within the normal timeout window.
-        ' Raises an error for the caller to handle (retry/recovery), but the
-        ' WebSocket connection is preserved for potential subsequent attempts.
+        ' First occurrence preserves the connection for a caller retry; consecutive
+        ' occurrences on the same connection indicate a half-dead socket (sends
+        ' still succeed, nothing ever matches) and escalate to StateError.
         If nowT > softDeadline Then
-            Err.Raise 604, "BiDiSocket", "Socket Silence: Soft timeout waiting for ID: " & cmdId & _
-                      ". Connection preserved for retry."
+            m_consecutiveSoftTimeouts = m_consecutiveSoftTimeouts + 1
+            If m_consecutiveSoftTimeouts >= MAX_CONSECUTIVE_SOFT_TIMEOUTS Then
+                SetState StateError
+                Err.Raise 604, "BiDiSocket", "Socket Silence: " & m_consecutiveSoftTimeouts & _
+                          " consecutive soft timeouts (connection presumed lost) waiting for ID: " & cmdId
+            Else
+                Err.Raise 604, "BiDiSocket", "Socket Silence: Soft timeout waiting for ID: " & cmdId & _
+                          ". Connection preserved for retry."
+            End If
         End If
 
         ' [PATCH] Drain at full speed while messages are flowing; only sleep when
@@ -739,6 +803,8 @@ Cleanup:
     If succeeded Then
         savedErrNum = 0
         Err.Clear
+        ' A matched response proves the connection is alive: reset silence tracking.
+        m_consecutiveSoftTimeouts = 0
     End If
     
     m_isSendReceiving = False
@@ -844,7 +910,8 @@ Public Function GetMessage() As String
     Dim isLoggingTime As Boolean
     isLoggingTime = (nowT - m_lastHeartbeatLogTime >= HEARTBEAT_INTERVAL_MS Or m_lastHeartbeatLogTime = 0)
     
-    Dim pingCmd As String: pingCmd = "{""id"":" & SYSTEM_PING_ID & ", ""method"":""session.status"", ""params"":{}}"
+    Dim pingId As Long: pingId = GetNextSystemPingId()
+    Dim pingCmd As String: pingCmd = "{""id"":" & pingId & ", ""method"":""session.status"", ""params"":{}}"
 
     If ENABLE_HEARTBEAT_LOGGING And isLoggingTime Then
         m_lastHeartbeatLogTime = nowT
@@ -860,16 +927,17 @@ Public Function GetMessage() As String
     End If
 
     Dim inId As String: inId = ExtractJsonId(rawMsg)
-    If inId = CStr(SYSTEM_PING_ID) Then
-        If m_RetryCount > 0 Then m_RetryCount = 0
-        ' Only log the response if we logged the request
-        If ENABLE_HEARTBEAT_LOGGING And isLoggingTime Then
-            Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [HB-RES] session.status (Connection healthy)"
+    If IsReservedSystemId(inId) Then
+        ' Reserved band: heartbeat pong (rotating [3..99]) or PostScript reply (2).
+        ' All are swallowed so they never reach the recorder/event stream.
+        If inId <> CStr(POST_SCRIPT_REPLY_ID) Then
+            ' Heartbeat pong: connection proven healthy.
+            If m_RetryCount > 0 Then m_RetryCount = 0
+            ' Only log the response if we logged the request
+            If ENABLE_HEARTBEAT_LOGGING And isLoggingTime Then
+                Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [HB-RES] session.status (Connection healthy)"
+            End If
         End If
-        GetMessage = "" ' Swallow heartbeat response
-    ElseIf inId = CStr(POST_SCRIPT_REPLY_ID) Then
-        ' Swallow PostScript fire-and-forget reply so it never reaches the
-        ' recorder/event stream (symmetric with the heartbeat swallow above).
         GetMessage = ""
     Else
         ' Return the actual BiDi message (Event/Response)
