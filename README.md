@@ -91,6 +91,15 @@ A specialized tool for reverse-engineering and debugging complex automation scen
 * **Event Stream:** Uses `StartDiscoveryLog` to capture a raw feed of every browser event, including network requests, console logs, and DOM changes (with an option to exclude image/css noise).
 * **Analysis:** Records activity using `RecordEventsForSeconds` for a specified duration and saves it via `StopAndSaveDiscoveryLog` for post-mortem analysis.
  >💡 **Tip:** By providing this log to an AI, you can identify **noisy request URLs** and get recommendations for the **optimal idle time**.
+
+### 10. Main10: Completion-Signal Gate & Bridging the Settle-to-Render Gap
+This procedure demonstrates the completion-signal gate (`ArmContentSignal`), which injects the operator's knowledge of "what marks done" into the idle consensus — closing the class of failures where an XHR settles quickly but the corresponding DOM paint lands noticeably later.
+* **Arm-then-Act Pattern:** Uses `ArmContentSignal` immediately before each click to declare the exact DOM subtree (`#table-body`) whose rewrite signals completion. The subsequent SPA wait cannot conclude as STABLE on quiescence alone while the declared signal is still outstanding — the wait is gated on the actual content rewrite, not on apparent quiet.
+* **One-Shot Consumption:** Each armed signal is consumed exactly once at wait end, so it never leaks into an unrelated subsequent wait. This is why the sample re-arms before every click: one signal, one wait.
+* **Fail-Fast Arming:** `ArmContentSignal` raises immediately if the declared target does not exist at arm time, so a mistyped XPath surfaces as an instant error instead of a silently meaningless wait.
+* **Noise Filtering as a Prerequisite:** Registers background telemetry (`cdn-cgi/rum`, Facebook tracking) with `AddIdleIgnoreNetworkPattern` first, so the consensus engine judges idleness only from traffic that actually matters.
+* **Pre-Navigation Recording:** Starts the Discovery Log before navigation to capture initial-load diagnostics. The receive-side `MaxIncomingSize` cap (tunable via `GetSocket.MaxIncomingSize`, default 2 MB) guards against event-flood freezes if oversized messages appear on heavy pages.
+
 ---
 ### 🔗 External Links
 * [Midium - Article by hanamichi77777](https://medium.com/@hanamichi77777/webdriver-bidi-for-seleniumvba-ee4687887d03)
