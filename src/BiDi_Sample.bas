@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.4
+' Version: 1.5
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Foreground message box: declared with hWnd=0 (no owner) so the dialog is an
@@ -640,10 +640,10 @@ Public Sub Main10()
     
     ' One-shot gate: the click's SPA wait cannot go STABLE until the existing
     ' #table-body subtree is rewritten (bridges the XHR-settle-to-render gap).
-    bidi.ArmContentSignal "//*[@id='table-body']"
+'    bidi.ArmContentSignal "//*[@id='table-body']"
     bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2015']"
     
-    bidi.ArmContentSignal "//*[@id='table-body']"
+'    bidi.ArmContentSignal "//*[@id='table-body']"
     bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2014']"
     
     ' ==========================================

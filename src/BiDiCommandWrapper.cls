@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.4
+' Version: 1.5
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -2281,7 +2281,7 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
-        stm.WriteText "Using ONLY the data in this log, produce two things for THIS site:" & vbCrLf
+        stm.WriteText "Using ONLY the data in this log, produce three things for THIS site:" & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "1) Network config suggestions" & vbCrLf
         stm.WriteText "   - IGNORE (bidi.AddIdleIgnoreNetworkPattern): background telemetry / high-freq APIs that" & vbCrLf
@@ -2305,9 +2305,28 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "     [RES]/[NAV] lines (per-request dur is not recorded; see LEGEND)." & vbCrLf
         stm.WriteText "   - Gated waits ([SPA-WAIT-BEGIN] carries signal=): a TIMEOUT with signal=..:miss is NOT a" & vbCrLf
         stm.WriteText "     threshold problem -- do not suggest raising minStableMs for it; fix the armed selector/" & vbCrLf
-        stm.WriteText "     pattern or the action instead. Flag every [SPA-SIGNAL-HIT] with quietAtHit > minStableMs:" & vbCrLf
-        stm.WriteText "     each is a settle-to-render gap where the gate's timer reset prevented the premature" & vbCrLf
-        stm.WriteText "     consensus an ungated wait would have reached." & vbCrLf
+        stm.WriteText "     pattern or the action instead. quietAtHit > minStableMs on a net/vis HIT is a settle-to-" & vbCrLf
+        stm.WriteText "     render gap the gate absorbed; for dom HITs use section 3 instead (a dom HIT is itself a" & vbCrLf
+        stm.WriteText "     mutation, so its quietAtHit is structurally near zero and proves nothing)." & vbCrLf
+        stm.WriteText vbCrLf
+        stm.WriteText "3) Settle-to-render gap detection (response settled, render landed later)" & vbCrLf
+        stm.WriteText "   - Pairing rule: within one wait, if EXACTLY ONE idle=track json/API [RES] precedes the" & vbCrLf
+        stm.WriteText "     render marker, pair them provisionally. Zero such [RES] -> client-side render, skip." & vbCrLf
+        stm.WriteText "     Two or more -> AMBIGUOUS: list the candidates, do not compute a gap." & vbCrLf
+        stm.WriteText "   - Render marker: gated wait -> the dom [SPA-SIGNAL-HIT]; ungated wait -> the LAST" & vbCrLf
+        stm.WriteText "     [SPA-ACT] before [SPA-STABLE]." & vbCrLf
+        stm.WriteText "   - gap = marker time - paired [RES] time. A negative gap = drain-delayed logging ->" & vbCrLf
+        stm.WriteText "     indeterminate, do not flag." & vbCrLf
+        stm.WriteText "   - Verdict: gap > minStableMs + 300ms (poll-jitter guard) -> SUSPECTED. Between minStableMs" & vbCrLf
+        stm.WriteText "     and +300ms -> MARGINAL. At or below minStableMs -> safe, no flag. CONFIRMED is reserved" & vbCrLf
+        stm.WriteText "     for runs with net AND dom both armed (HIT-to-HIT diff, no pairing guess)." & vbCrLf
+        stm.WriteText "   - Ungated early-consensus check: a json/API [RES] between a [SPA-WAIT-END] STABLE and the" & vbCrLf
+        stm.WriteText "     next [SPA-WAIT-BEGIN] -> MARGINAL. Trust its position, not its timestamp (drain delay)." & vbCrLf
+        stm.WriteText "   - On SUSPECTED/MARGINAL: do NOT raise minStableMs on ungated waits. Propose concrete gates" & vbCrLf
+        stm.WriteText "     from observed lines: bidi.ArmContentSignal ""<xpath seen in [SPA-ACT]>"" and/or" & vbCrLf
+        stm.WriteText "     bidi.ArmNetworkSignal ""<substring of the paired [RES] key>"". Confirm by re-running with" & vbCrLf
+        stm.WriteText "     both armed. Exception: on a NET-armed wait with no stable dom selector, raising that" & vbCrLf
+        stm.WriteText "     action's minStableMs to measured gap + margin is a valid per-action fallback." & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
         stm.WriteText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
