@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.5
+' Version: 1.6
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Foreground message box: declared with hWnd=0 (no owner) so the dialog is an
@@ -172,8 +172,7 @@ Public Sub Main03()
     Dim url As String: url = "https://world.jorudan.co.jp/mln/en/"
     bidi.ExecuteNavigateAndGetStatus url
     ' ==========================================
-    ' Start Recording AFTER navigation: redirect-heavy initial navs flood subscribed events
-    ' faster than the blocking nav call can drain them (freeze risk); post-nav suffices.
+    ' Produces discovery_log.txt: a noise-filtered event log for idle-wait tuning and LLM automation prompts.
     bidi.StartDiscoveryLog
     ' ==========================================
     ' Departure: Tokyo
@@ -332,15 +331,10 @@ Public Sub Main07()
     caps.EnableBiDiMode
     .OpenBrowser caps
     Set bidi = New BiDiCommandWrapper
-    
-    '(Option)Change the incoming receive limit to 4 MB(default 2MB).
-    'bidi.GetSocket.MaxIncomingSize = 4& * 1024& * 1024&
-    
     bidi.ConnectTo driver.GetWebSocketUrl
     
     ' ==========================================
-    ' Start recording before navigation when initial-load diagnostics are needed.
-    ' MaxIncomingSize guards against event-flood freezes; tune it if oversized messages appear.
+    ' Produces discovery_log.txt: a noise-filtered event log for idle-wait tuning and LLM automation prompts.
     bidi.StartDiscoveryLog
     ' ==========================================
 
@@ -427,10 +421,6 @@ Public Sub Main08()
         
         .OpenBrowser caps
         Dim bidi As New BiDiCommandWrapper
-        
-        '(Option)Change the incoming receive limit to 4 MB(default 2MB).
-        bidi.GetSocket.MaxIncomingSize = 4& * 1024& * 1024&
-        
         bidi.ConnectTo .GetWebSocketUrl
         ' ==========================================
         ' Resource Blocking (Images, Ads, Analytics, Fonts)
@@ -448,15 +438,14 @@ Public Sub Main08()
         bidi.AddIdleIgnoreNetworkPattern "*generate_204*"
         bidi.AddIdleIgnoreNetworkPattern "GetAsyncData"
         
+        ' ==========================================
+        ' Produces discovery_log.txt: a noise-filtered event log for idle-wait tuning and LLM automation prompts.
+        bidi.StartDiscoveryLog
+        ' ==========================================
+        
         ' Navigation
         Dim url As String: url = "https://www.google.com/travel/flights"
         bidi.ExecuteNavigateAndGetStatus url
-        
-        ' ==========================================
-        ' Start recording before navigation when initial-load diagnostics are needed.
-        ' MaxIncomingSize guards against event-flood freezes; tune it if oversized messages appear.
-        bidi.StartDiscoveryLog
-        ' ==========================================
         
         ' STEP 0: Set Ticket Type (Custom Dropdown)
         ' Bypasses obfuscated class names by targeting W3C ARIA semantics.
@@ -545,7 +534,11 @@ Public Sub Main08()
     End With
 End Sub
 
-' Recorder
+' Network Discovery Recorder
+' Records the API / navigation events fired during manual page
+' interaction for a fixed duration, then saves them to
+' discovery_log.txt. Used for reconnaissance before writing automation.
+
 Sub Main09()
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
@@ -555,20 +548,11 @@ Sub Main09()
     ' Browser startup settings
     Dim caps As WebCapabilities: Set caps = .CreateCapabilities
     caps.AddArguments "--start-maximized"
-    ' ==========================================
     ' Enable BiDi (Mandatory)
     caps.EnableBiDiMode
-    ' ==========================================
-      
     ' Open
     .OpenBrowser caps
-    ' ==========================================
     Dim bidi As New BiDiCommandWrapper
-    ' ==========================================
-    
-    '(Option)Change the incoming receive limit to 4 MB(default 2MB).
-    'bidi.GetSocket.MaxIncomingSize = 4& * 1024& * 1024&
-        
     bidi.ConnectTo .GetWebSocketUrl
 
     ' Navigate to Page
@@ -630,8 +614,7 @@ Public Sub Main10()
     bidi.AddIdleIgnoreNetworkPattern "www.facebook.com/tr/"
 
     ' ==========================================
-    ' Start recording before navigation when initial-load diagnostics are needed.
-    ' MaxIncomingSize guards against event-flood freezes; tune it if oversized messages appear.
+    ' Produces discovery_log.txt: a noise-filtered event log for idle-wait tuning and LLM automation prompts.
     bidi.StartDiscoveryLog
     ' ==========================================
     

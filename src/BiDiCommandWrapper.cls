@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.5
+' Version: 1.6
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -45,7 +45,8 @@ Option Explicit
 '   All timing args : SanitizeMs (entry guard; supplies defaults when waitNetworkIdle is on)
 '
 ' [STATE OWNERSHIP]  Mutate via the owner only; do not duplicate.
-'   Request ids / inflight count : BiDiSocketCommunicator (socket_), NOT this class
+'   Request ids     : BiDiSocketCommunicator (socket_), NOT this class
+'   Inflight counts : this class (JS idle probe: inflightFetchCount / inflightXhrCount)
 '   Main context / realm cache   : this class (m_mainContextId, m_cachedRealmIds)
 '   Event subscriptions          : m_activeSubscriptions (delta-subscribe)
 '   Recorder state               : m_isRecording + ProcessRecorderQueue
@@ -181,6 +182,23 @@ Private m_sigVisXPath As String             ' armed target (diagnostics only)
 Private m_sigLostWarned As Boolean          ' one-shot [SPA-SIGNAL-LOST] warning guard
 Private m_lastProbeQuietMs As Double        ' last polled domQuiet; quietAtHit for net hits
 
+' --- Settle-to-render carryover NOTICE (log-only; ANDs NOTHING into consensus) ---
+' A lightweight, adjacent-wait-only heads-up -- NOT an owner-attribution engine.
+' Two independent signals, deliberately kept simple (no gap math, no counts, no
+' pairing): a wait that reaches STABLE while a tracked json/API it saw has no
+' content render is flagged [SPA-CONSENSUS-SUSPECT] ("this wait is not clean"),
+' and it arms a ONE-SHOT hint for the IMMEDIATELY next wait only. If that next
+' wait then shows a content render, a single [SPA-CARRYOVER-NOTE] fires ("this
+' render MAY belong to the previous action"). The hint never survives past one
+' wait, so stale correlations to unrelated later renders are structurally
+' impossible. Confirming the actual owner + gap is left to an armed re-run.
+Private m_unresolvedJsonThisWait As Boolean       ' this wait saw a tracked json/API, no content render yet
+Private m_unresolvedJsonFirstKeyThisWait As String ' first such json's key (SUSPECT line only; NOT used by NOTE)
+Private m_unresolvedJsonFirstSecThisWait As Double ' first such json's arrival relTime (SUSPECT line only)
+Private m_hasCarryoverHintForNextWait As Boolean  ' reservation: hand a one-shot NOTE arm to the NEXT wait
+Private m_carryoverNoteArmedThisWait As Boolean   ' this wait may emit ONE carryover note (consumed from the reservation)
+Private m_carryoverNoteEmittedThisWait As Boolean ' this wait already emitted its one note (1-per-wait cap)
+
 ' Error Codes & Enumerations
 Private Const ERR_BIDI_PROTOCOL As Long = vbObjectError + 1001
 Private Const ERR_JS_EXCEPTION As Long = vbObjectError + 1002
@@ -232,9 +250,8 @@ Private Sub Class_Initialize()
     Set m_validatedContexts = New Dictionary
     Set m_blockingPatterns = New Collection
     
-    ' --- 2. Request ID Seeding ---
+    ' --- 2. Request ID Ownership ---
     ' Request ID generation is managed by BiDiSocketCommunicator.
-    ' Inflight tracking is managed by BiDiSocketCommunicator.
 
     ' --- 3. State Reset ---
     m_waitStackDepth = 0
@@ -338,8 +355,8 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
     ' and the browser returns a synthetic net::ERR_BLOCKED_BY_CLIENT to the
     ' page without firing any client-side intercept event we need to handle
     ' here. Blocked requests surface in the standard network.* event stream
-    ' (typically as network.fetchError) and are untracked via the normal path
-    ' below, so no CDP-specific event dispatching is required.
+    ' (typically as network.fetchError) and are classified by the normal
+    ' network event path below, so no CDP-specific intercept dispatching is required.
 
     Select Case method
         ' --- BROWSER CONSOLE LOGS ---
@@ -659,8 +676,8 @@ Public Function ExecuteIsUrlContains(ByVal partialUrl As String, _
     
     ' Subscribe to navigation events required for monitoring.
     '    network.fetchError is included so blocked requests (errored out with
-    '    ERR_BLOCKED_BY_CLIENT from Network.setBlockedURLs) untrack the inflight
-    '    counter and surface as [BLOCK] log lines via DispatchGlobalEvents.
+    '    ERR_BLOCKED_BY_CLIENT from Network.setBlockedURLs) surface as [BLOCK]
+    '    log lines via DispatchGlobalEvents.
     Me.ExecuteSessionSubscribe Array("network.responseCompleted", "network.fetchError", "browsingContext.load", "browsingContext.fragmentNavigated")
     
     Dim waitCtx As New Dictionary
@@ -769,11 +786,12 @@ End Function
 '
 ' B) Standard BiDi network.addIntercept + failRequest:
 '   (3) Answering intercepts on the single shared socket starves the consensus
-'       engine. The drain that responds to intercepts consumes the
-'       responseCompleted/fetchError events needed to untrack inflight requests,
-'       leaving phantom inflight that never settles (forces the minStableMs*2
-'       Hard-Sync) and triggers an input-rebind retry storm. Verified against
-'       Google Flights.
+'       engine: this class serialises all traffic through one synchronous
+'       SendAndReceive (a single in-flight command at a time), so the drain that
+'       responds to intercepts monopolises that socket and blocks the idle-probe
+'       poll (script.callFunction) the consensus engine depends on -- stalling
+'       settlement (forces the minStableMs*2 Hard-Sync) and triggering an
+'       input-rebind retry storm. Verified against Google Flights.
 '   (4) failRequest on parser-blocking subresources stalls window.load.
 '
 ' Network.setBlockedURLs avoids all of the above: it blocks at the network
@@ -1812,16 +1830,6 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
               "Last Error: " & localErrDesc
 End Function
 
-' --- LogTransmission is retained for retry-context logging ---
-' Note: primary REQ/RES logging is handled by socket_.SendCommand.
-'       This helper is kept for recovery-phase diagnostic logging where
-'       the retry attempt number is needed for analysis.
-Private Sub LogTransmission(ByVal method As String, ByVal id As Long, ByVal Msg As String, ByVal prefix As String, ByVal attempt As Long)
-    Dim displayMsg As String: displayMsg = Msg
-    If Len(displayMsg) > 500 Then displayMsg = Left$(displayMsg, 497) & "..."
-    socket_.LogEvent method & " (ID: " & id & ", Attempt: " & attempt & ")", displayMsg, "[" & prefix & "]"
-End Sub
-
 ' INTERNAL HELPER: IsContextLostError (STRICT VERSION)
 Private Function IsContextLostError(ByVal response As String) As Boolean
     ' Early Exit: If the word "result" exists at the root, it is a protocol SUCCESS.
@@ -2211,6 +2219,10 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     ' is therefore stored in SECONDS, and every relTime calculation below subtracts
     ' it from (NowMs()/1000) so the displayed offset is in seconds (e.g. "1.23s").
     m_recorderStartTime = socket_.NowMs() / 1000
+    ' [Carryover notice] Fresh run: drop every carryover-notice field (all are
+    ' class-level and survive across StartDiscoveryLog on a reused instance).
+    m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
+    m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
     m_excludeResources = excludeImagesAndCss
     Set m_recSuppByKey = New Dictionary
     m_droppedHeadCount = 0
@@ -2279,6 +2291,7 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
         stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HIT timestamps are event-accurate; dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
         stm.WriteText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
+        stm.WriteText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
         stm.WriteText "Using ONLY the data in this log, produce three things for THIS site:" & vbCrLf
@@ -2309,24 +2322,27 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "     render gap the gate absorbed; for dom HITs use section 3 instead (a dom HIT is itself a" & vbCrLf
         stm.WriteText "     mutation, so its quietAtHit is structurally near zero and proves nothing)." & vbCrLf
         stm.WriteText vbCrLf
-        stm.WriteText "3) Settle-to-render gap detection (response settled, render landed later)" & vbCrLf
-        stm.WriteText "   - Pairing rule: within one wait, if EXACTLY ONE idle=track json/API [RES] precedes the" & vbCrLf
-        stm.WriteText "     render marker, pair them provisionally. Zero such [RES] -> client-side render, skip." & vbCrLf
-        stm.WriteText "     Two or more -> AMBIGUOUS: list the candidates, do not compute a gap." & vbCrLf
-        stm.WriteText "   - Render marker: gated wait -> the dom [SPA-SIGNAL-HIT]; ungated wait -> the LAST" & vbCrLf
-        stm.WriteText "     [SPA-ACT] before [SPA-STABLE]." & vbCrLf
-        stm.WriteText "   - gap = marker time - paired [RES] time. A negative gap = drain-delayed logging ->" & vbCrLf
-        stm.WriteText "     indeterminate, do not flag." & vbCrLf
-        stm.WriteText "   - Verdict: gap > minStableMs + 300ms (poll-jitter guard) -> SUSPECTED. Between minStableMs" & vbCrLf
-        stm.WriteText "     and +300ms -> MARGINAL. At or below minStableMs -> safe, no flag. CONFIRMED is reserved" & vbCrLf
-        stm.WriteText "     for runs with net AND dom both armed (HIT-to-HIT diff, no pairing guess)." & vbCrLf
-        stm.WriteText "   - Ungated early-consensus check: a json/API [RES] between a [SPA-WAIT-END] STABLE and the" & vbCrLf
-        stm.WriteText "     next [SPA-WAIT-BEGIN] -> MARGINAL. Trust its position, not its timestamp (drain delay)." & vbCrLf
-        stm.WriteText "   - On SUSPECTED/MARGINAL: do NOT raise minStableMs on ungated waits. Propose concrete gates" & vbCrLf
-        stm.WriteText "     from observed lines: bidi.ArmContentSignal ""<xpath seen in [SPA-ACT]>"" and/or" & vbCrLf
-        stm.WriteText "     bidi.ArmNetworkSignal ""<substring of the paired [RES] key>"". Confirm by re-running with" & vbCrLf
-        stm.WriteText "     both armed. Exception: on a NET-armed wait with no stable dom selector, raising that" & vbCrLf
-        stm.WriteText "     action's minStableMs to measured gap + margin is a valid per-action fallback." & vbCrLf
+        stm.WriteText "3) Settle-to-render suspicion check (early-STABLE warning; the tool pre-computes this)" & vbCrLf
+        stm.WriteText "   - The tool already emits two advisory markers; you do NOT re-derive them by pairing:" & vbCrLf
+        stm.WriteText "     [SPA-CONSENSUS-SUSPECT] = this wait hit STABLE while a tracked json/API it saw produced" & vbCrLf
+        stm.WriteText "       no content render -> treat that STABLE as possibly premature (NOT clean for capture)." & vbCrLf
+        stm.WriteText "     [SPA-CARRYOVER-NOTE] = the immediately next wait then showed a content render that MAY be" & vbCrLf
+        stm.WriteText "       the previous action's delayed paint. It is a heads-up, not an attribution." & vbCrLf
+        stm.WriteText "   - Deliberately NOT provided (do not attempt to compute or demand them): an exact settle-to-" & vbCrLf
+        stm.WriteText "     render gap, an owner pairing (which json produced which render), or an AMBIGUOUS/CONFIRMED" & vbCrLf
+        stm.WriteText "     verdict. The markers only assert 'this run is not clean', never 'this render belongs to X'." & vbCrLf
+        stm.WriteText "   - The check is adjacent-wait only: a hint lives for exactly ONE following wait, so a SUSPECT" & vbCrLf
+        stm.WriteText "     with no NOTE in the very next wait is not chased further. Absence of a NOTE is not 'safe'." & vbCrLf
+        stm.WriteText "   - What to do with a SUSPECT/NOTE (do NOT just raise minStableMs on an ungated wait):" & vbCrLf
+        stm.WriteText "     re-run with an explicit gate from observed lines to confirm and to get the real timing --" & vbCrLf
+        stm.WriteText "       bidi.ArmContentSignal ""<a targeted xpath seen in [SPA-ACT], e.g. //*[@id='table-body']>""" & vbCrLf
+        stm.WriteText "       and/or bidi.ArmNetworkSignal ""<substring of the SUSPECT's firstJson key>""." & vbCrLf
+        stm.WriteText "     With net+content armed, the HITs give a much cleaner measurement than ungated inference" & vbCrLf
+        stm.WriteText "     (net HIT is event-accurate; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
+        stm.WriteText "     without guessing. Fallback: on a net-armed wait with no stable dom" & vbCrLf
+        stm.WriteText "     selector, raising THAT action's minStableMs to (measured gap + margin) is valid per-action." & vbCrLf
+        stm.WriteText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
+        stm.WriteText "     PREVIOUS action's late paint. Prefer a value-identifying selector for the expected content." & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
         stm.WriteText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
@@ -2554,6 +2570,21 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             LogLine = "[" & relTime & "] [RES] " & resStatus & " [" & mime & "] | id=" & ShortId(resId) & _
                       " | key=" & resKey & " | idle=" & IIf(IsIdleIgnored(resUrl), "skip", "track")
 
+            ' [Carryover notice] A tracked json/API arrived WHILE a wait is active.
+            ' Mark this wait as having unresolved render activity (simple bool -- we
+            ' do not count or pair). Record the FIRST such response's key/sec for the
+            ' SUSPECT line only; the NOTE never uses it. Responses between waits
+            ' (m_waitStackDepth = 0) are not latched. Recording-gated.
+            If m_isRecording And m_waitStackDepth > 0 And Not IsIdleIgnored(resUrl) Then
+                If InStr(1, LCase$(mime), "json") > 0 Then
+                    If Not m_unresolvedJsonThisWait Then
+                        m_unresolvedJsonFirstKeyThisWait = resKey
+                        m_unresolvedJsonFirstSecThisWait = (socket_.NowMs() / 1000) - m_recorderStartTime
+                    End If
+                    m_unresolvedJsonThisWait = True
+                End If
+            End If
+
         Case "network.fetchError"
             ' Surface failed requests in the discovery log. Two sub-cases:
             '   (a) Blocker hit: URL matches one of our installed patterns.
@@ -2598,6 +2629,13 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             ' opaque auth blob (e.g. Okta stateHandle, ~9k chars) collapses to its
             ' host+path instead of bloating the log.
             LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeEndpointKey(CStr(params("url")))
+
+            ' [Carryover notice] A hard navigation voids every carryover signal:
+            ' the old document, its unresolved response, and any pending hint are
+            ' gone. In-page (pushState) SPA transitions produce no browsingContext.load,
+            ' so they do NOT clear here -- the desired asymmetry.
+            m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
+            m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
 
         Case "log.entryAdded"
             If Not params.Exists("level") Then Exit Sub
@@ -2861,41 +2899,6 @@ Private Function QuerySpaProbe(Optional ByVal contextId As String = "") As Dicti
     On Error GoTo 0
 End Function
 
-' PROCEDURE: RecoverSpaProbe
-'  Nukes the state cache and re-injects the probe into the fresh context.
-Private Sub RecoverSpaProbe(ByVal contextId As String)
-    Dim targetId As String: targetId = contextId
-    Dim isMainTarget As Boolean
-
-    ' Determine if we are recovering the main context (empty or matching current main)
-    isMainTarget = (targetId = "" Or targetId = m_mainContextId)
-
-    ' WHY: resolve empty contextId to mainContextId BEFORE cache operations.
-    If targetId = "" Then targetId = m_mainContextId
-
-    If Not m_cachedRealmIds Is Nothing Then
-        If targetId <> "" And m_cachedRealmIds.Exists(targetId) Then
-            m_cachedRealmIds.Remove targetId
-        End If
-    End If
-    ' Force a full tree refresh to handle cases where the tab navigated to
-    ' a completely different origin or the internal BiDi context mapping was lost.
-    ' We capture the result of the discovery to get the most current ID.
-    Dim refreshedMainId As String: refreshedMainId = UpdateMainContextId(True, True)
-    
-    ' 3. ID Synchronization
-    ' If we were targeting the main context, we must use the refreshed ID.
-    ' Otherwise, StartSpaIdleProbe would target a stale/dead context ID.
-    If isMainTarget Then
-        targetId = refreshedMainId
-    End If
-    ' Re-inject. StartSpaIdleProbe will now target the confirmed active context.
-    ' This ensures the SPA monitoring script is active on the new page state.
-    StartSpaIdleProbe targetId
-    
-    If m_debugMode Then Debug.Print "BiDi: Recovery completed for context: " & targetId
-End Sub
-
 ' ==========================================================================
 ' COMPLETION-SIGNAL GATE (ArmContentSignal / ArmNetworkSignal / ArmVisibilitySignal)
 ' ==========================================================================
@@ -3102,6 +3105,29 @@ Private Sub ConsumeSignalArms(Optional ByVal contextId As String = "")
     On Error GoTo 0
 End Sub
 
+' [INTERNAL] IsContentRenderPath -- true if a DOM: (childList) mutation path is a
+'  TARGETED content render rather than root-level overlay churn. domPath is the
+'  part AFTER the "DOM:" prefix. childList mutations at the html/body/head root
+'  (script injection, notification/spinner/overlay mount) surface on real logs as
+'  "DOM:/html[1]/body[1]" and must NOT clear the settle-to-render carryover latch;
+'  a genuine render mutates a NESTED node. Two acceptance rules:
+'    - an ancestor-ID anchor (gX's ancestor-ID form, e.g. //*[@id='table-body'])
+'      is by construction a specific nested element -> always a content render;
+'    - otherwise require full-path depth >= 3 (html / body / <something deeper>).
+'  So "/html[1]/body[1]" (depth 2) is rejected; "//*[@id='table-body']" and
+'  "/html[1]/body[1]/div[3]/table[1]" (depth 4) are accepted.
+Private Function IsContentRenderPath(ByVal domPath As String) As Boolean
+    Dim p As String: p = Trim$(domPath)
+    If Len(p) = 0 Then IsContentRenderPath = False: Exit Function
+    If InStr(p, "[@id=") > 0 Then IsContentRenderPath = True: Exit Function
+    Dim segs() As String, i As Long, depth As Long
+    segs = Split(p, "/")
+    For i = LBound(segs) To UBound(segs)
+        If Len(segs(i)) > 0 Then depth = depth + 1
+    Next
+    IsContentRenderPath = (depth >= 3)
+End Function
+
 ' [INTERNAL] ResetSignalState -- clears every gate flag (no browser round-trip).
 Private Sub ResetSignalState()
     m_sigDomArmed = False: m_sigDomSeen = False: m_sigDomXPath = ""
@@ -3216,6 +3242,18 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     ' sync), pre-ack it: stableStart above is fresh, so no reset is needed and
     ' none is performed -- the arm-to-hit window is honored without penalty.
     waitCtx.Add "sigNetAcked", m_sigNetSeen
+
+    ' [Carryover notice] Start-of-wait state transitions:
+    '  (1) Consume the reservation from the previous wait into a ONE-SHOT arm that
+    '      is valid for THIS wait only, then clear the reservation immediately --
+    '      this is what limits any carryover note to the single adjacent wait.
+    '  (2) Reset this-wait unresolved-json tracking (it is per-wait by definition).
+    m_carryoverNoteArmedThisWait = m_hasCarryoverHintForNextWait
+    m_carryoverNoteEmittedThisWait = False
+    m_hasCarryoverHintForNextWait = False
+    m_unresolvedJsonThisWait = False
+    m_unresolvedJsonFirstKeyThisWait = ""
+    m_unresolvedJsonFirstSecThisWait = 0#
     
     ' [Tier1 Diagnostics] Record the EFFECTIVE wait parameters in force for this
     ' action (not the compile-time CONFIG defaults) so the discovery log shows
@@ -3302,6 +3340,37 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                     Dim relTime As String
                     relTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
                     m_recorderLogs.Add "[" & relTime & "] [SPA-ACT] " & logSummary
+                End If
+
+                ' [Carryover notice] Scan for a content render -- a non-ignored
+                ' DOM: (childList) entry that is a TARGETED nested mutation (not
+                ' root-level churn like DOM:/html[1]/body[1], which IsContentRenderPath
+                ' rejects). ATTR:/PROP: are toggles, not renders. Every DOM: entry
+                ' here already passed the browser-side ignore filter (iN in the probe).
+                Dim ce As Variant, renderXPath As String: renderXPath = ""
+                For Each ce In changes
+                    If Left$(CStr(ce), 4) = "DOM:" Then
+                        If IsContentRenderPath(Mid$(CStr(ce), 5)) Then
+                            renderXPath = CStr(ce): Exit For
+                        End If
+                    End If
+                Next
+                If Len(renderXPath) > 0 Then
+                    ' (a) This wait produced a content render -> its own json (if any)
+                    '     is considered resolved; do not flag it at STABLE.
+                    m_unresolvedJsonThisWait = False
+                    ' (b) If the PREVIOUS wait left a one-shot hint, this adjacent
+                    '     render MAY be that earlier action's delayed paint. Emit a
+                    '     single, non-committal NOTE -- no owner claim, no gap.
+                    If m_carryoverNoteArmedThisWait And Not m_carryoverNoteEmittedThisWait And m_isRecording Then
+                        Dim rt As String
+                        rt = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+                        m_recorderLogs.Add "[" & rt & "] [SPA-CARRYOVER-NOTE]" & _
+                            " reason=prev-wait-unresolved-json | render=" & renderXPath & _
+                            " | note=this-render-may-belong-to-the-previous-action"
+                        m_carryoverNoteEmittedThisWait = True
+                        m_carryoverNoteArmedThisWait = False
+                    End If
                 End If
             End If
         End If
@@ -3398,6 +3467,24 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                 Dim successRelTime As String
                 successRelTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
                 m_recorderLogs.Add "[" & successRelTime & "] [SPA-STABLE] Consensus reached (minStableMs=" & minStableMs & ")"
+
+                ' [Carryover notice] Consensus reached while this wait saw a tracked
+                ' json/API but NO content render: the response settled yet nothing
+                ' rendered before STABLE -- this wait is NOT clean. Emit a SUSPECT
+                ' (a suspicion, not a gate; consensus already fired, behaviour is
+                ' unchanged) and reserve a ONE-SHOT carryover hint for the IMMEDIATELY
+                ' next wait only. The firstJson key/sec is shown HERE (SUSPECT) so the
+                ' carryover NOTE can stay a pure, non-committal heads-up.
+                ' Caveat: characterData renders (textContent rewrite, not childList)
+                ' emit no DOM: entry and can false-fire this; the confirming half is
+                ' an armed re-run, not this line.
+                If m_unresolvedJsonThisWait Then
+                    m_recorderLogs.Add "[" & successRelTime & "] [SPA-CONSENSUS-SUSPECT]" & _
+                        " reason=track-json-no-content-render" & _
+                        " | firstJson=" & m_unresolvedJsonFirstKeyThisWait & "@" & Format(m_unresolvedJsonFirstSecThisWait, "0.00") & "s" & _
+                        " | note=next-content-render-may-be-stale"
+                    m_hasCarryoverHintForNextWait = True
+                End If
             End If
             
             EvaluateSpaIdleCondition = True ' Stability confirmed
@@ -4049,11 +4136,11 @@ CleanExit:
         On Error GoTo 0
 
         If errNum = 504 And Len(inflightDetail) > 0 Then
-            ' --- HALT: 504 timeout with pending requests blocking consensus ---
+            ' --- HALT: 504 timeout with pending fetch/XHR activity blocking consensus ---
             ' Output to Immediate Window and raise non-absorbable error.
             Debug.Print String(60, "=")
             Debug.Print "[" & Format(Now, "hh:mm:ss") & "] CONSENSUS HALT"
-            Debug.Print "  Pending Requests:" & inflightDetail
+            Debug.Print "  Pending Fetch/XHR:" & inflightDetail
             Debug.Print String(60, "=")
             
             Dim haltMsg As String
@@ -4142,6 +4229,12 @@ Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
                        " | fetch=" & inflFetch & _
                        " | xhr=" & inflXhr & _
                        IIf(Len(sigEndDesc) > 0, " | signal=" & sigEndDesc, "")
+
+    ' [Carryover notice] Wait end: retire this wait's one-shot note arm. (The next
+    ' BEGIN re-establishes armed/emitted from the reservation, so this is defensive
+    ' -- it guarantees the arm never outlives its single wait even on odd paths.)
+    m_carryoverNoteArmedThisWait = False
+    m_carryoverNoteEmittedThisWait = False
 End Sub
 
 
@@ -4835,14 +4928,6 @@ Public Function ExecuteEnableGlobalShadowUnlocker() As String
     End If
 End Function
 
-' FUNCTION: GetNextRequestId
-'  Delegated to Communicator. This stub is retained for backward compatibility
-'          with any external callers (e.g., PostScript's manual payload construction).
-'          Internal callers (ExecuteBiDiCommand) now use socket_.SendCommand directly.
-Private Function GetNextRequestId() As Long
-    GetNextRequestId = socket_.GetNextRequestId()
-End Function
-
 ' [PHASE] TryPreparePhase
 '  Prepares the environment before an interaction.
 '              Ensures the SPA probe is active and refreshes the context tree if needed.
@@ -5015,10 +5100,11 @@ Public Sub PostScript(ByVal js As String, _
     params.Add "target", targetDic
     params.Add "awaitPromise", True
 
-    '    Fixed reserved ID (POST_SCRIPT_ID = 2, reserved band 1..99). GetNextRequestId
-    '    issues only command-band IDs (>= 100), so id 2 cannot collide with a normal
-    '    request. The browser's reply to this id is swallowed on the Communicator side
-    '    (SendAndReceive / GetMessage), so it never reaches the recorder/event stream.
+    '    Fixed reserved ID (POST_SCRIPT_ID = 2, reserved band 1..99). The Communicator's
+    '    GetNextRequestId (socket_) issues only command-band IDs (>= 100), so id 2 cannot
+    '    collide with a normal request. The browser's reply to this id is swallowed on the
+    '    Communicator side (SendAndReceive / GetMessage), so it never reaches the
+    '    recorder/event stream.
     Dim requestDic As New Dictionary
     requestDic.Add "id", POST_SCRIPT_ID
     requestDic.Add "method", "script.callFunction"

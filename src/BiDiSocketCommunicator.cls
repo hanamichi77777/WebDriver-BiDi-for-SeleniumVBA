@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.5
+' Version: 1.6
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -481,8 +481,10 @@ Public Function SendMessage(ByVal Msg As String, Optional ByVal allowRecovery As
     Disconnect keepErrorState:=True
     
     ' INVARIANT (NO RESEND): protocol compliance
-    ' W3C WebDriver BiDi mandates unique request IDs. Resending an identical JSON payload
-    ' after a socket drop violates the protocol and corrupts the inflight request map.
+    ' W3C WebDriver BiDi request IDs must remain unique within the session.
+    ' Resending an identical JSON payload after a socket drop may reuse an ID
+    ' that the peer is still tracking, so we never replay it on the recovered
+    ' connection.
     ' We heal the connection here, but strictly return False so the upper layer
     ' handles the failure (e.g., re-generating the ID or raising an exception).
     ' Best-effort sends (allowRecovery:=False) skip healing entirely.
