@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.3
+' Version: 1.4
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -188,6 +188,8 @@ Private m_nextRequestId As Long
 Private m_nextSystemPingId As Long ' heartbeat id rotation cursor [3..99]
 Private m_consecutiveSoftTimeouts As Long ' consecutive soft timeouts on the current connection
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging (mirrors Wrapper constant)
+Private Const DEFAULT_MAX_INCOMING_SIZE As Long = 2097152 ' 2MB: receive-side assembly cap (runtime-tunable via MaxIncomingSize)
+Private m_MaxIncomingSize As Long ' Receive-side cap; oversized messages are discarded with identity diagnostics
 
 ' Initialization & Termination
 Private Sub Class_Initialize()
@@ -203,6 +205,7 @@ Private Sub Class_Initialize()
     m_BufferSize = DEFAULT_BUFFER_SIZE
     ReDim m_ReceiveBuffer(m_BufferSize - 1)
     m_MaxBufferSize = MAX_BUFFER_SIZE
+    m_MaxIncomingSize = DEFAULT_MAX_INCOMING_SIZE
 
     Set m_EventBuffer = New Collection
     
@@ -283,6 +286,13 @@ Public Property Get State() As BiDiSocketState: State = m_State: End Property
 Public Property Let AutoReconnect(ByVal v As Boolean): m_AutoReconnect = v: End Property
 Public Property Get AutoReconnect() As Boolean: AutoReconnect = m_AutoReconnect: End Property
 Public Property Get ConsecutiveInternalErrors() As Long: ConsecutiveInternalErrors = m_consecutiveInternalErrors: End Property
+' MaxIncomingSize: receive-side assembly cap in bytes. Floor guard: values below
+' MAX_MSG_SIZE would discard legitimate command responses, so they are clamped.
+Public Property Let MaxIncomingSize(ByVal v As Long)
+    If v < MAX_MSG_SIZE Then v = MAX_MSG_SIZE
+    m_MaxIncomingSize = v
+End Property
+Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_MaxIncomingSize: End Property
 Public Property Get DroppedEventsCount() As Long: DroppedEventsCount = m_DroppedEventsCount: End Property
 
 Private Sub SetState(ByVal NewState As BiDiSocketState)
@@ -1007,6 +1017,12 @@ Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
     Dim hasValidData As Boolean
     ' Counter to track fragment throughput
     Dim fragmentCount As Long: fragmentCount = 0
+    ' Receive-side cap bookkeeping. NOTE: discardMode is call-local by design.
+    ' If a deadline exit interrupts a discard, the next call re-engages discard
+    ' on its first write (stream size is already at the cap), so the mechanism
+    ' self-heals; only totalBytes then reflects the current call, not the message.
+    Dim totalBytes As Long
+    Dim discardMode As Boolean
 
     If m_InStream.Position = 0 Then
         PrepareStream m_InStream, adTypeBinary
@@ -1031,17 +1047,29 @@ Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
 
         If bytesRead > 0 Then
             hasValidData = True
-            
-            If bytesRead = m_BufferSize Then
-                m_InStream.Write m_ReceiveBuffer
-            Else
-                Dim chunk() As Byte
-                chunk = m_ReceiveBuffer
-                ReDim Preserve chunk(bytesRead - 1)
-                m_InStream.Write chunk
-                Erase chunk
+            totalBytes = totalBytes + bytesRead
+
+            If Not discardMode Then
+                If m_InStream.Size + bytesRead > m_MaxIncomingSize Then
+                    ' Cap exceeded: stop writing, keep draining fragments until the
+                    ' MESSAGE frame closes the boundary. The retained head is used
+                    ' for identity diagnostics in CleanExit.
+                    discardMode = True
+                    Trace ">>> [WinHttp] Incoming message exceeded MaxIncomingSize (" & _
+                          m_MaxIncomingSize & "). Discard mode engaged.", True
+                Else
+                    If bytesRead = m_BufferSize Then
+                        m_InStream.Write m_ReceiveBuffer
+                    Else
+                        Dim chunk() As Byte
+                        chunk = m_ReceiveBuffer
+                        ReDim Preserve chunk(bytesRead - 1)
+                        m_InStream.Write chunk
+                        Erase chunk
+                    End If
+                End If
             End If
-            
+
             MaybeGrowBuffer bytesRead
         End If
 
@@ -1081,8 +1109,14 @@ Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
             GoTo CleanExit
         End If
 
-        ' Yield control with allowDoEvents:=False during fragment assembly for precision
-        YieldExecution 1, False
+        ' NO SLEEP HERE (deliberate). This is a synchronous WinHttp session
+        ' (WinHttpOpen dwFlags=0): WinHttpWebSocketReceive blocks internally until
+        ' data arrives or the 100ms receive timeout fires (12002 -> exit above),
+        ' so Receive itself paces the loop. A former "YieldExecution 1, False"
+        ' here cost ~15.6ms per fragment (kernel32 Sleep(1) rounds up to the
+        ' system timer quantum; no timeBeginPeriod in this process), turning a
+        ' 12.6MB / 8KB = ~1,540-fragment assembly into a ~24s UI freeze.
+        ' UI responsiveness is handled by the Mod-20 DoEvents guard above.
     Loop
 
 CleanExit:
@@ -1092,16 +1126,32 @@ CleanExit:
         m_InStream.Position = 0
         m_InStream.Type = adTypeText
         m_InStream.Charset = "UTF-8"
-        ReadFromWire = m_InStream.ReadText
+
+        If discardMode Then
+            ' IDENTITY DIAGNOSTICS for oversized messages:
+            '   HEAD300           -> shows the leading JSON ("method"/"id") of the giant
+            '   fusionMarkers(}{) -> 0  = genuine single message
+            '                        >0 = multiple messages fused into one frame
+            Dim headText As String: headText = m_InStream.ReadText
+            Dim fusionCount As Long
+            fusionCount = (Len(headText) - Len(Replace(headText, "}{", ""))) \ 2
+            Trace ">>> [WinHttp] OVERSIZED MESSAGE DISCARDED. thisCallBytes=" & totalBytes & _
+                  " retainedChars=" & Len(headText) & _
+                  " fusionMarkers(}{)=" & fusionCount & _
+                  " HEAD300=[" & Left$(headText, 300) & "]", True
+            ReadFromWire = ""
+        Else
+            ReadFromWire = m_InStream.ReadText
+
+            Dim isSuspicious As Boolean
+            isSuspicious = (InStr(1, ReadFromWire, """error"":", vbTextCompare) > 0) Or _
+                           (InStr(1, ReadFromWire, "chrome-error", vbTextCompare) > 0)
+
+            If isSuspicious Then m_consecutiveInternalErrors = m_consecutiveInternalErrors + 1
+            Trace ">>> [WinHttp] Message assembled. Length: " & Len(ReadFromWire), isSuspicious
+        End If
 
         PrepareStream m_InStream, adTypeBinary
-        
-        Dim isSuspicious As Boolean
-        isSuspicious = (InStr(1, ReadFromWire, """error"":", vbTextCompare) > 0) Or _
-                       (InStr(1, ReadFromWire, "chrome-error", vbTextCompare) > 0)
-        
-        If isSuspicious Then m_consecutiveInternalErrors = m_consecutiveInternalErrors + 1
-        Trace ">>> [WinHttp] Message assembled. Length: " & Len(ReadFromWire), isSuspicious
     End If
     
     GoTo FinalCleanup
@@ -1403,20 +1453,32 @@ Public Sub YieldExecution(Optional ByVal ms As Long = 1, Optional ByVal allowDoE
 End Sub
 
 ' Leaves breadcrumbs in both the external file and the Immediate Window.
+' CRITICAL PASS-THROUGH: isCritical=True bypasses the DEBUG_MODE gate for the
+' FILE log only (production incident monitoring, e.g. oversized-message
+' diagnostics whose root cause is still unconfirmed). Immediate Window output
+' and the substring-based detection (Return Code/failed/error) remain
+' DEBUG_MODE-only, so production log volume is limited to explicitly
+' flagged exceptional events.
 Public Sub Trace(ByVal Msg As String, Optional ByVal isCritical As Boolean = False)
-    If Not DEBUG_MODE Then Exit Sub
+    If Not DEBUG_MODE And Not isCritical Then Exit Sub
     
     Dim logMsg As String: logMsg = "[" & Format(Now, "hh:mm:ss") & "] " & Msg
     
-    ' Only print the message itself to the Immediate Window
-    Debug.Print logMsg
+    ' Only print the message itself to the Immediate Window (debug builds only)
+    If DEBUG_MODE Then Debug.Print logMsg
     
     ' Detection Logic
+    ' WHY: the substring probes are gated on DEBUG_MODE so that production
+    ' file logging is driven solely by the caller's explicit isCritical flag,
+    ' not by incidental keywords in high-volume messages.
     Dim shouldLogToFile As Boolean
-    shouldLogToFile = isCritical Or _
-                      (InStr(1, Msg, "Return Code", vbTextCompare) > 0) Or _
-                      (InStr(1, Msg, "failed", vbTextCompare) > 0) Or _
-                      (InStr(1, Msg, "error", vbTextCompare) > 0)
+    shouldLogToFile = isCritical
+    If DEBUG_MODE Then
+        shouldLogToFile = shouldLogToFile Or _
+                          (InStr(1, Msg, "Return Code", vbTextCompare) > 0) Or _
+                          (InStr(1, Msg, "failed", vbTextCompare) > 0) Or _
+                          (InStr(1, Msg, "error", vbTextCompare) > 0)
+    End If
 
     If shouldLogToFile Then
         Dim localDir As String: localDir = WebShared.getFullLocalPath(ThisWorkbook.Path)

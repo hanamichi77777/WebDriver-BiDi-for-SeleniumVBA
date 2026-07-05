@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.3
+' Version: 1.4
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Foreground message box: declared with hWnd=0 (no owner) so the dialog is an
@@ -172,7 +172,8 @@ Public Sub Main03()
     Dim url As String: url = "https://world.jorudan.co.jp/mln/en/"
     bidi.ExecuteNavigateAndGetStatus url
     ' ==========================================
-    ' Start Recording AFTER navigation (subscribing to beforeRequestSent before a blocking nav can stall requests); post-nav is enough for noise discovery.
+    ' Start Recording AFTER navigation: redirect-heavy initial navs flood subscribed events
+    ' faster than the blocking nav call can drain them (freeze risk); post-nav suffices.
     bidi.StartDiscoveryLog
     ' ==========================================
     ' Departure: Tokyo
@@ -330,19 +331,25 @@ Public Sub Main07()
     Set caps = .CreateCapabilities
     caps.EnableBiDiMode
     .OpenBrowser caps
-    Set bidi = New BiDiCommandWrapper: bidi.ConnectTo driver.GetWebSocketUrl
+    Set bidi = New BiDiCommandWrapper
+    
+    '(Option)Change the incoming receive limit to 4 MB(default 2MB).
+    'bidi.GetSocket.MaxIncomingSize = 4& * 1024& * 1024&
+    
+    bidi.ConnectTo driver.GetWebSocketUrl
+    
+    ' ==========================================
+    ' Start recording before navigation when initial-load diagnostics are needed.
+    ' MaxIncomingSize guards against event-flood freezes; tune it if oversized messages appear.
+    bidi.StartDiscoveryLog
+    ' ==========================================
 
     ' Register auto-clicker for the consent banner before navigation
     bidi.ExecuteRegisterAutoClickerByXPath "//button[@id='truste-consent-button']"
     
     ' NavigateTo Page
     bidi.ExecuteNavigateAndGetStatus targetUrl
-       
-    ' ==========================================
-    ' Start Recording AFTER navigation (subscribing to beforeRequestSent before a blocking nav can stall requests); post-nav is enough for noise discovery.
-    bidi.StartDiscoveryLog
-    ' ==========================================
-    
+        
     ' Execute Click in Shadow DOM
     bidi.ExecuteShadowClick "#utility-sign-in button"
             
@@ -420,6 +427,10 @@ Public Sub Main08()
         
         .OpenBrowser caps
         Dim bidi As New BiDiCommandWrapper
+        
+        '(Option)Change the incoming receive limit to 4 MB(default 2MB).
+        bidi.GetSocket.MaxIncomingSize = 4& * 1024& * 1024&
+        
         bidi.ConnectTo .GetWebSocketUrl
         ' ==========================================
         ' Resource Blocking (Images, Ads, Analytics, Fonts)
@@ -442,7 +453,8 @@ Public Sub Main08()
         bidi.ExecuteNavigateAndGetStatus url
         
         ' ==========================================
-        ' Start Recording AFTER navigation (subscribing to beforeRequestSent before a blocking nav can stall requests); post-nav is enough for noise discovery.
+        ' Start recording before navigation when initial-load diagnostics are needed.
+        ' MaxIncomingSize guards against event-flood freezes; tune it if oversized messages appear.
         bidi.StartDiscoveryLog
         ' ==========================================
         
@@ -495,6 +507,8 @@ Public Sub Main08()
         
         Dim depDateFieldXPath As String
         depDateFieldXPath = "//input[@aria-label='Departure']"
+        ' One-shot gate: wait until the calendar picker API returns.
+        bidi.ArmNetworkSignal "GetCalendarPicker"
         bidi.ExecuteClickByXPath depDateFieldXPath
         
         Dim retDateXPath As String
@@ -508,6 +522,10 @@ Public Sub Main08()
         ' STEP 4: Click Search Button
         Dim searchXPath As String
         searchXPath = "//button[@aria-label='Search']"
+        
+        ' One-shot gate: the click's SPA wait cannot go STABLE until a response
+        ' matching "GetShoppingResults" arrives (prevents pre-render consensus).
+        bidi.ArmNetworkSignal "GetShoppingResults"
         bidi.ExecuteClickByXPath searchXPath
         
         ' ==========================================
@@ -545,9 +563,14 @@ Sub Main09()
     ' Open
     .OpenBrowser caps
     ' ==========================================
-    Dim bidi As New BiDiCommandWrapper: bidi.ConnectTo .GetWebSocketUrl
+    Dim bidi As New BiDiCommandWrapper
     ' ==========================================
+    
+    '(Option)Change the incoming receive limit to 4 MB(default 2MB).
+    'bidi.GetSocket.MaxIncomingSize = 4& * 1024& * 1024&
         
+    bidi.ConnectTo .GetWebSocketUrl
+
     ' Navigate to Page
     Dim url As String: url = "https://note.com/"
     bidi.ExecuteNavigateAndGetStatus url
@@ -586,4 +609,53 @@ Sub Main09()
     .CloseBrowser: .Shutdown
     
 End With
+End Sub
+
+'ArmContentSignal demo -- gate the SPA wait on the actual #table-body rewrite, not on apparent quiet.
+Public Sub Main10()
+    Dim driver As New WebDriver
+    Dim caps As WebCapabilities
+    Dim bidi As BiDiCommandWrapper
+    Dim targetUrl As String: targetUrl = "https://www.scrapethissite.com/pages/ajax-javascript/#2010"
+
+    With driver
+    .StartEdge
+    Set caps = .CreateCapabilities
+    caps.EnableBiDiMode
+    .OpenBrowser caps
+    Set bidi = New BiDiCommandWrapper: bidi.ConnectTo driver.GetWebSocketUrl
+    
+    ' First pass: remove from idle judgment only.
+    bidi.AddIdleIgnoreNetworkPattern "www.scrapethissite.com/cdn-cgi/rum"
+    bidi.AddIdleIgnoreNetworkPattern "www.facebook.com/tr/"
+
+    ' ==========================================
+    ' Start recording before navigation when initial-load diagnostics are needed.
+    ' MaxIncomingSize guards against event-flood freezes; tune it if oversized messages appear.
+    bidi.StartDiscoveryLog
+    ' ==========================================
+    
+    ' NavigateTo Page
+    bidi.ExecuteNavigateAndGetStatus targetUrl
+    
+    ' One-shot gate: the click's SPA wait cannot go STABLE until the existing
+    ' #table-body subtree is rewritten (bridges the XHR-settle-to-render gap).
+    bidi.ArmContentSignal "//*[@id='table-body']"
+    bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2015']"
+    
+    bidi.ArmContentSignal "//*[@id='table-body']"
+    bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2014']"
+    
+    ' ==========================================
+    ' Stop and Save AFTER the wait is finished
+    Dim logPath As String
+    logPath = .ResolvePath(".\") & "\discovery_log.txt"
+    bidi.StopAndSaveDiscoveryLog logPath
+    ' ==========================================
+
+    ' Cleanup
+    bidi.Shutdown: Set bidi = Nothing
+    .CloseBrowser: .Shutdown
+
+    End With
 End Sub

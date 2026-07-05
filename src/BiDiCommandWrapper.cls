@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.3
+' Version: 1.4
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -24,6 +24,11 @@ Option Explicit
 '   - Anti-Freeze Alert Handling
 '   - AI-Ready Discovery Recorder
 '   - Advanced Wait Strategies (Network Idle, DOM Stability, SPA Idle)
+'   - Completion-Signal Gate (ArmContentSignal / ArmNetworkSignal /
+'     ArmVisibilitySignal): opt-in AND-condition on the SPA consensus that
+'     holds the wait open until a caller-designated completion signal
+'     (target-subtree DOM mutation, API response, or element visibility)
+'     has arrived, then re-measures a full minStableMs quiet window.
 '
 ' ==========================================================================
 ' AI NAVIGATION MAP  (upper layer; transport lives in BiDiSocketCommunicator)
@@ -45,6 +50,10 @@ Option Explicit
 '   Event subscriptions          : m_activeSubscriptions (delta-subscribe)
 '   Recorder state               : m_isRecording + ProcessRecorderQueue
 '   Idle filters                 : AddIdleIgnoreSelector / AddIdleIgnoreNetworkPattern
+'   Completion-signal gate       : m_sig* via ArmContentSignal / ArmNetworkSignal /
+'                                  ArmVisibilitySignal / DisarmSignal. One-shot:
+'                                  consumed (ConsumeSignalArms) when the next
+'                                  SPA-idle wait ends, whatever the outcome.
 '
 ' [INVARIANTS]  Breaking these = deadlock, zombie UI lock, or protocol violation.
 '   UI LOCK        : m_waitStackDepth owns Application.Interactive; lock at depth 1 and
@@ -150,6 +159,28 @@ Private m_excludeResources As Boolean
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_droppedHeadCount As Long          ' count of oldest timeline lines evicted by the MAX_LOG_SIZE ring buffer (0 = none)
 
+' --- Completion-Signal Gate (ArmContentSignal / ArmNetworkSignal / ArmVisibilitySignal) ---
+' One-shot, opt-in gate ANDed into the SPA consensus: while any *Armed flag is
+' True and its *Seen latch is False, EvaluateSpaIdleCondition cannot declare
+' STABLE. A signal hit sets the latch, resets the consensus window
+' (ctx("stableStart")), and thereby guarantees a full minStableMs observation
+' window AFTER the signal (closes the settle-to-render gap for net/vis hits).
+' All flags are consumed at the end of the next SPA-idle wait (ConsumeSignalArms).
+' dom/vis latches live browser-side in __vbaIdleProbe (monotonic sigCount /
+' visSeen); the net latch lives here (DispatchGlobalEvents matches
+' network.responseCompleted BEFORE any recorder noise/idle filtering).
+Private m_sigDomArmed As Boolean            ' ArmContentSignal active (existing-element rewrite)
+Private m_sigDomSeen As Boolean             ' latched: target-subtree mutation observed
+Private m_sigDomXPath As String             ' armed target (diagnostics only)
+Private m_sigNetArmed As Boolean            ' ArmNetworkSignal active (API response arrival)
+Private m_sigNetSeen As Boolean             ' latched: matching responseCompleted observed
+Private m_sigNetPattern As String           ' armed URL pattern (UrlMatchesPattern notation)
+Private m_sigVisArmed As Boolean            ' ArmVisibilitySignal active (new-element appearance)
+Private m_sigVisSeen As Boolean             ' latched: target became visible
+Private m_sigVisXPath As String             ' armed target (diagnostics only)
+Private m_sigLostWarned As Boolean          ' one-shot [SPA-SIGNAL-LOST] warning guard
+Private m_lastProbeQuietMs As Double        ' last polled domQuiet; quietAtHit for net hits
+
 ' Error Codes & Enumerations
 Private Const ERR_BIDI_PROTOCOL As Long = vbObjectError + 1001
 Private Const ERR_JS_EXCEPTION As Long = vbObjectError + 1002
@@ -209,6 +240,7 @@ Private Sub Class_Initialize()
     m_waitStackDepth = 0
     m_consecutiveCdpFailures = 0
     m_isProcessingQueue = False
+    ResetSignalState  ' Completion-signal gate starts disarmed
 
     ' --- 4. Diagnostics ---
     ' DebugMode defaults On (developer protocol/action trace -> Immediate window).
@@ -343,6 +375,29 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
 
         ' --- NETWORK REQUEST END (Success or Error) ---
         Case "network.responseCompleted", "network.fetchError"
+            ' --- [Signal Gate] ArmNetworkSignal matching ---
+            ' Matched on EVERY responseCompleted, and deliberately BEFORE the
+            ' recorder's noise/idle filtering (FormatAndStoreLog below), so a
+            ' pattern that also sits in an ignore/suppress list still fires.
+            ' One-shot latch: after the first hit the armed pattern is closed;
+            ' repeated responses to the same endpoint neither re-log nor re-match.
+            ' Any status latches (a 500 on the awaited endpoint still opens the
+            ' gate); the status is logged so the caller can judge the outcome.
+            ' The timestamp here is event-accurate (not poll-quantized), unlike
+            ' dom/vis hits which are detected on the ~100ms poll.
+            If method = "network.responseCompleted" And m_sigNetArmed And Not m_sigNetSeen Then
+                Dim sigUrl As String: sigUrl = GetPathString(json, "params.response.url")
+                If Len(sigUrl) > 0 Then
+                    If UrlMatchesPattern(sigUrl, m_sigNetPattern) Then
+                        m_sigNetSeen = True
+                        Dim sigStatus As String: sigStatus = GetPathString(json, "params.response.status")
+                        LogSignalLine "[SPA-SIGNAL-HIT] type=net | key=" & NormalizeEndpointKey(sigUrl) & _
+                                      " | status=" & sigStatus & _
+                                      " | quietAtHit=" & Format(m_lastProbeQuietMs, "0") & "ms"
+                    End If
+                End If
+            End If
+
             ' BLOCK VISIBILITY: Network.setBlockedURLs ends a request silently
             ' -- there is no dedicated "blocked" event. The request lands here
             ' as network.fetchError, but the chromium-bidi mapping currently
@@ -1878,6 +1933,10 @@ Public Sub ClearState()
     ' fetchError events as blocker-induced.
     Set m_blockingPatterns = New Collection
     
+    ' Reset the completion-signal gate. Browser-side observers die with the
+    ' page/connection; only the local flags need clearing here.
+    ResetSignalState
+
     ' Reset HUD fingerprint cache so the next UpdateWaitTelemetry re-emits the payload.
     m_lastHudKey = ""
     m_lastHudCtx = ""
@@ -2218,6 +2277,8 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "LEGEND | per-request latency (dur=) and [REQ]/[REQ-OPEN] lines are NOT recorded BY DESIGN: network.beforeRequestSent is not subscribed (its event flood destabilizes input on heavy SPAs), so request-start times do not exist in this log." & vbCrLf
         stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
         stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
+        stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HIT timestamps are event-accurate; dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
+        stm.WriteText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
         stm.WriteText "Using ONLY the data in this log, produce two things for THIS site:" & vbCrLf
@@ -2242,6 +2303,11 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "   - Long elapsed caused by slow server responses is NOT a threshold problem; do not raise" & vbCrLf
         stm.WriteText "     minStableMs for that. Infer server latency from the timestamp gaps between consecutive" & vbCrLf
         stm.WriteText "     [RES]/[NAV] lines (per-request dur is not recorded; see LEGEND)." & vbCrLf
+        stm.WriteText "   - Gated waits ([SPA-WAIT-BEGIN] carries signal=): a TIMEOUT with signal=..:miss is NOT a" & vbCrLf
+        stm.WriteText "     threshold problem -- do not suggest raising minStableMs for it; fix the armed selector/" & vbCrLf
+        stm.WriteText "     pattern or the action instead. Flag every [SPA-SIGNAL-HIT] with quietAtHit > minStableMs:" & vbCrLf
+        stm.WriteText "     each is a settle-to-render gap where the gate's timer reset prevented the premature" & vbCrLf
+        stm.WriteText "     consensus an ungated wait would have reached." & vbCrLf
         stm.WriteText vbCrLf
         stm.WriteText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
         stm.WriteText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
@@ -2811,6 +2877,286 @@ Private Sub RecoverSpaProbe(ByVal contextId As String)
     If m_debugMode Then Debug.Print "BiDi: Recovery completed for context: " & targetId
 End Sub
 
+' ==========================================================================
+' COMPLETION-SIGNAL GATE (ArmContentSignal / ArmNetworkSignal / ArmVisibilitySignal)
+' ==========================================================================
+' WHY THIS EXISTS: the SPA consensus (netIdle AND domStable) is a NEGATIVE
+' condition -- "nothing is happening" -- and on sites with a settle-to-render
+' gap (XHR returns in ~200ms, the framework paints ~1.4s later) the gap itself
+' looks like quiet, so the wait can pass BEFORE the content the action was
+' supposed to produce ever appears. The gate adds an opt-in POSITIVE condition:
+' the caller names the completion evidence, and the consensus additionally
+' requires that evidence to have arrived (signalGateOpen) before STABLE.
+'
+' THREE SIGNAL TYPES = three shapes of completion evidence:
+'   ArmContentSignal    -- an EXISTING element gets rewritten (edge-trigger on a
+'                          scoped MutationObserver; the target must exist at arm
+'                          time, else immediate error).
+'   ArmNetworkSignal    -- a specific API response arrives (event-trigger on
+'                          network.responseCompleted; robust identifier, but
+'                          arrival is not render -- the post-hit quiet window
+'                          covers the residual gap up to minStableMs).
+'   ArmVisibilitySignal -- a NEW element becomes visible (level-trigger,
+'                          latched; the target must NOT already be visible at
+'                          arm time, else immediate error).
+' The fourth completion shape, "known target state, simple appearance", stays
+' with ExecuteIsElementVisible -- a standalone state query, not a gate.
+'
+' SEMANTICS (shared by all types):
+'   - A hit opens the gate AND resets the consensus window, guaranteeing at
+'     least minStableMs of observed quiet AFTER the signal.
+'   - Latches are live from the moment of arming (a hit landing between Arm
+'     and the wait is captured, not lost).
+'   - One-shot: consumed when the next SPA-idle wait ends (any outcome).
+'   - Multiple types may be armed together; the gate is their AND. Note that
+'     AND inherits every armed type's precondition -- only combine when EVERY
+'     armed signal is guaranteed to occur.
+'   - No dedicated timeout: the wait's existing maxTimeoutMs is the single
+'     deadline. Gated waits hold until the signal arrives, so size the
+'     per-operation maxTimeoutMs for the signal's worst case plus the tail.
+'
+' USAGE:
+'   bidi.ArmContentSignal "//*[@id='table-body']"
+'   bidi.ExecuteClickByXPath tabXPath          ' gate applies to this click's sync wait
+'
+'   bidi.ArmNetworkSignal "GetShoppingResults" ' UrlMatchesPattern notation
+'   bidi.ExecuteClickByXPath searchButtonXPath
+'
+' CAUTION: the arm is consumed by the FIRST SPA-idle wait that follows it. Do
+' not insert another synchronizing call (e.g. ExecuteIsElementVisible with
+' waitNetworkIdle:=True) between Arm and the intended action, or the gate will
+' bind to the wrong wait and time out.
+' ==========================================================================
+
+' [PUBLIC] ArmContentSignal
+'  Arms a DOM-rewrite completion signal on an EXISTING element's subtree.
+'  Fail-fast guards (both directions of misclassification fail loudly at arm
+'  time, never silently at wait time):
+'    target not found -> error. "Element that appears after the action" is the
+'    ArmVisibilitySignal / ExecuteIsElementVisible territory, not this method's.
+'    invalid XPath    -> error.
+'  includeAttributes: default False. Content rewrites are childList/characterData;
+'  attribute churn (spinner class flips, aria toggles) is exactly the noise the
+'  original accident hid behind, so it does not count as a signal unless opted in.
+Public Sub ArmContentSignal(ByVal signalXPath As String, _
+                            Optional ByVal includeAttributes As Boolean = False, _
+                            Optional ByVal contextId As String = "")
+    If Len(Trim$(signalXPath)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", "signalXPath is empty."
+    End If
+
+    Dim js As String
+    js = "var p=window.__vbaIdleProbe;if(!p||!p.armDomSignal)return -9;" & _
+         "return p.armDomSignal(" & JsStringLiteral(signalXPath) & "," & _
+         LCase$(CStr(includeAttributes)) & ");"
+
+    Dim rc As Long: rc = InvokeProbeArm(js, contextId)
+
+    Select Case rc
+        Case 0
+            If m_sigDomArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=dom | overwrite=true (previous dom arm replaced)"
+            m_sigDomArmed = True: m_sigDomSeen = False: m_sigDomXPath = signalXPath
+            m_sigLostWarned = False
+            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | xpath=" & signalXPath
+        Case -1
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=not-found | xpath=" & signalXPath
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
+                "ArmContentSignal: target element not found at arm time: " & signalXPath & vbCrLf & _
+                "This method watches an EXISTING element for rewrites. To wait for an element " & _
+                "that appears only after the action, use ArmVisibilitySignal instead."
+        Case -2
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=invalid-xpath | xpath=" & signalXPath
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
+                "ArmContentSignal: invalid XPath expression: " & signalXPath
+        Case Else
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=probe-unavailable | xpath=" & signalXPath
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
+                "ArmContentSignal: SPA probe unavailable in the target context (rc=" & rc & ")."
+    End Select
+End Sub
+
+' [PUBLIC] ArmNetworkSignal
+'  Arms an API-arrival completion signal. urlPattern uses the SAME notation as
+'  AddIdleIgnoreNetworkPattern / resource blocking (UrlMatchesPattern: no '*' =
+'  case-insensitive substring; with '*' = contains-glob), so one notation works
+'  across the whole class. Matching runs on every network.responseCompleted,
+'  BEFORE any recorder noise/idle filtering -- a pattern that also sits in an
+'  ignore list still fires. Any status latches; status is logged for the caller.
+'  LIMIT: arrival is not render. If the site's response-to-paint gap exceeds
+'  minStableMs, combine with ArmContentSignal or raise minStableMs per-operation.
+Public Sub ArmNetworkSignal(ByVal urlPattern As String)
+    If Len(Trim$(urlPattern)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ArmNetworkSignal", "urlPattern is empty."
+    End If
+
+    ' Ensure responseCompleted events actually flow even when the discovery
+    ' recorder is off (ConnectTo subscribes only log/navigation events).
+    ' Delta-subscribe (m_activeSubscriptions) makes this a no-op when already
+    ' subscribed. Without this line, arming outside a recording session would
+    ' be a silent never-fires failure -- the worst kind.
+    Me.ExecuteSessionSubscribe Array("network.responseCompleted"), , True
+
+    If m_sigNetArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=net | overwrite=true (previous net arm replaced)"
+    m_sigNetArmed = True: m_sigNetSeen = False: m_sigNetPattern = urlPattern
+    LogSignalLine "[SPA-SIGNAL-ARM] type=net | pattern=" & urlPattern
+End Sub
+
+' [PUBLIC] ArmVisibilitySignal
+'  Arms an element-appearance completion signal (level-trigger, latched: once
+'  visible, later occlusion/spinner overlays cannot re-close the gate).
+'  Fail-fast guard: target ALREADY visible at arm time -> error, because the
+'  gate would open on the first poll and the wait would silently degrade to an
+'  ungated one -- reproducing the exact accident class this gate prevents. If
+'  the target is already visible, the completion evidence you actually want is
+'  its REWRITE: use ArmContentSignal.
+'  COST NOTE: the XPath is re-evaluated once per poll (~100ms) until the latch;
+'  after the latch, evaluation stops. Dom/net arms carry no per-poll cost.
+Public Sub ArmVisibilitySignal(ByVal signalXPath As String, _
+                               Optional ByVal contextId As String = "")
+    If Len(Trim$(signalXPath)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", "signalXPath is empty."
+    End If
+
+    Dim js As String
+    js = "var p=window.__vbaIdleProbe;if(!p||!p.armVisSignal)return -9;" & _
+         "return p.armVisSignal(" & JsStringLiteral(signalXPath) & ");"
+
+    Dim rc As Long: rc = InvokeProbeArm(js, contextId)
+
+    Select Case rc
+        Case 0
+            If m_sigVisArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=vis | overwrite=true (previous vis arm replaced)"
+            m_sigVisArmed = True: m_sigVisSeen = False: m_sigVisXPath = signalXPath
+            m_sigLostWarned = False
+            LogSignalLine "[SPA-SIGNAL-ARM] type=vis | xpath=" & signalXPath
+        Case -3
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=already-visible | xpath=" & signalXPath
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
+                "ArmVisibilitySignal: target is ALREADY visible at arm time: " & signalXPath & vbCrLf & _
+                "Waiting for the appearance of something already visible is meaningless and " & _
+                "would open the gate instantly. To wait for this element's content to be " & _
+                "REWRITTEN, use ArmContentSignal instead."
+        Case -2
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=invalid-xpath | xpath=" & signalXPath
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
+                "ArmVisibilitySignal: invalid XPath expression: " & signalXPath
+        Case Else
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=probe-unavailable | xpath=" & signalXPath
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
+                "ArmVisibilitySignal: SPA probe unavailable in the target context (rc=" & rc & ")."
+    End Select
+End Sub
+
+' [PUBLIC] DisarmSignal
+'  Explicit all-type disarm for abnormal-flow recovery (e.g. the planned action
+'  was skipped after arming). Normal flows never need this: arms are consumed
+'  automatically when the next SPA-idle wait ends. One method for all types on
+'  purpose -- there is no scenario where partial disarming is safer than full.
+Public Sub DisarmSignal(Optional ByVal contextId As String = "")
+    Dim wasArmed As Boolean
+    wasArmed = (m_sigDomArmed Or m_sigNetArmed Or m_sigVisArmed)
+
+    ResetSignalState
+
+    ' Best-effort browser-side observer teardown; a dead context is fine (the
+    ' observer died with it).
+    On Error Resume Next
+    Call CallScript("var p=window.__vbaIdleProbe;if(p&&p.disarmSignal)p.disarmSignal();return 0;", _
+                    Nothing, ResolveTargetContext(contextId), False, False, 5000, True)
+    On Error GoTo 0
+
+    If wasArmed Then LogSignalLine "[SPA-SIGNAL-DISARM] scope=all | by=user"
+End Sub
+
+' [INTERNAL] ConsumeSignalArms -- one-shot consumption at SPA-wait end.
+'  Called by MasterWaitEngine (WaitMode_SpaIdle only) AFTER WriteSpaWaitEnd, on
+'  every outcome. Silent by design: the END line's signal= field already tells
+'  the story; a per-wait DISARM line would be pure noise.
+Private Sub ConsumeSignalArms(Optional ByVal contextId As String = "")
+    If Not (m_sigDomArmed Or m_sigNetArmed Or m_sigVisArmed) Then Exit Sub
+
+    ResetSignalState
+
+    On Error Resume Next
+    Call CallScript("var p=window.__vbaIdleProbe;if(p&&p.disarmSignal)p.disarmSignal();return 0;", _
+                    Nothing, ResolveTargetContext(contextId), False, False, 5000, True)
+    On Error GoTo 0
+End Sub
+
+' [INTERNAL] ResetSignalState -- clears every gate flag (no browser round-trip).
+Private Sub ResetSignalState()
+    m_sigDomArmed = False: m_sigDomSeen = False: m_sigDomXPath = ""
+    m_sigNetArmed = False: m_sigNetSeen = False: m_sigNetPattern = ""
+    m_sigVisArmed = False: m_sigVisSeen = False: m_sigVisXPath = ""
+    m_sigLostWarned = False
+End Sub
+
+' [INTERNAL] InvokeProbeArm -- shared dom/vis arm plumbing.
+'  Ensures the probe exists (idempotent injection via PrepareProbeForAction),
+'  runs the arm snippet, and returns its rc (-9 when the probe/result is absent).
+Private Function InvokeProbeArm(ByVal jsBody As String, ByVal contextId As String) As Long
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+
+    ' Arming precedes the action, so TryPreparePhase has not run yet for this
+    ' interaction; ensure the probe here (injection is a no-op when installed).
+    Call PrepareProbeForAction(targetCtx)
+
+    Dim strRes As String
+    strRes = CallScript(jsBody, Nothing, targetCtx, False, False, 10000, True)
+
+    Dim v As Variant: v = GetCleanResult(strRes)
+    If IsEmpty(v) Then
+        InvokeProbeArm = -9
+    Else
+        InvokeProbeArm = CLng(v)
+    End If
+End Function
+
+' [INTERNAL] BuildSignalArmDesc -- armed types for [SPA-WAIT-BEGIN] ("dom,net").
+'  Empty string when nothing is armed (the field is then omitted entirely).
+Private Function BuildSignalArmDesc() As String
+    Dim s As String
+    If m_sigDomArmed Then s = "dom"
+    If m_sigNetArmed Then s = s & IIf(Len(s) > 0, ",", "") & "net"
+    If m_sigVisArmed Then s = s & IIf(Len(s) > 0, ",", "") & "vis"
+    BuildSignalArmDesc = s
+End Function
+
+' [INTERNAL] BuildSignalEndDesc -- per-type outcome for [SPA-WAIT-END]
+'  ("net:hit,dom:miss"). Fixed dom,net,vis order; empty when nothing is armed.
+Private Function BuildSignalEndDesc() As String
+    Dim s As String
+    If m_sigDomArmed Then s = "dom:" & IIf(m_sigDomSeen, "hit", "miss")
+    If m_sigNetArmed Then s = s & IIf(Len(s) > 0, ",", "") & "net:" & IIf(m_sigNetSeen, "hit", "miss")
+    If m_sigVisArmed Then s = s & IIf(Len(s) > 0, ",", "") & "vis:" & IIf(m_sigVisSeen, "hit", "miss")
+    BuildSignalEndDesc = s
+End Function
+
+' [INTERNAL] LogSignalLine -- single choke point for [SPA-SIGNAL-*] output.
+'  Timeline (when recording, via the ring-buffered PushTimelineLine) plus the
+'  Immediate window (when DebugMode), so arm failures are diagnosable from the
+'  saved log alone -- the raised error is invisible there.
+Private Sub LogSignalLine(ByVal line As String)
+    If m_isRecording Then
+        Dim relTime As String
+        relTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+        PushTimelineLine "[" & relTime & "] " & line
+    End If
+    If m_debugMode Then Debug.Print "BiDi Signal: " & line
+End Sub
+
+' [INTERNAL] JsStringLiteral -- escapes a VBA string into a double-quoted JS
+'  string literal (backslash, quote, CR/LF). XPaths routinely contain single
+'  quotes ("//*[@id='table-body']"), hence double-quoted output.
+Private Function JsStringLiteral(ByVal s As String) As String
+    Dim t As String
+    t = Replace(s, "\", "\\")
+    t = Replace(t, """", "\""")
+    t = Replace(t, vbCr, "\r")
+    t = Replace(t, vbLf, "\n")
+    JsStringLiteral = """" & t & """"
+End Function
+
 ' PUBLIC SUB: WaitForNetworkIdleSpa
 '  Entry point for deep SPA-aware synchronization.
 '          This version includes Entry Guards to handle 0ms inputs caused by the
@@ -2844,6 +3190,13 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     waitCtx.Add "lastJsIdleDuration", 0#
     waitCtx.Add "lastInflFetch", 0
     waitCtx.Add "lastInflXhr", 0
+    ' [Signal Gate] Ack flag for the network-signal timer reset. A net hit is
+    ' latched asynchronously in DispatchGlobalEvents; the FIRST poll that sees
+    ' the latch resets the consensus window (once per wait). If the hit already
+    ' arrived BEFORE this wait began (fast API between Arm and the action's
+    ' sync), pre-ack it: stableStart above is fresh, so no reset is needed and
+    ' none is performed -- the arm-to-hit window is honored without penalty.
+    waitCtx.Add "sigNetAcked", m_sigNetSeen
     
     ' [Tier1 Diagnostics] Record the EFFECTIVE wait parameters in force for this
     ' action (not the compile-time CONFIG defaults) so the discovery log shows
@@ -2853,8 +3206,15 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     If m_isRecording Then
         Dim beginRelTime As String
         beginRelTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+        ' [Signal Gate] Armed types ride on the BEGIN line (same rationale as the
+        ' effective minStableMs/maxTimeoutMs: per-action truth beats CONFIG
+        ' defaults). Ungated waits omit the field entirely so their lines stay
+        ' byte-identical to the pre-gate format (diff-compatible with old logs).
+        Dim sigArmDesc As String: sigArmDesc = BuildSignalArmDesc()
         m_recorderLogs.Add "[" & beginRelTime & "] [SPA-WAIT-BEGIN] minStableMs=" & minStableMs & _
-                           " | maxTimeoutMs=" & maxTimeoutMs & " | ctx=" & targetCtx
+                           " | maxTimeoutMs=" & maxTimeoutMs & _
+                           IIf(Len(sigArmDesc) > 0, " | signal=" & sigArmDesc, "") & _
+                           " | ctx=" & targetCtx
     End If
 
     ' Execute the high-precision wait engine with SPA Idle mode.
@@ -2900,6 +3260,13 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
     ctx("lastInflFetch") = inflFetch
     ctx("lastInflXhr") = inflXhr
 
+    ' --- [Signal Gate] Track the last polled DOM-quiet duration so an
+    ' asynchronous net hit (DispatchGlobalEvents) can report quietAtHit --
+    ' the quiet time its timer reset is about to discard. quietAtHit greater
+    ' than minStableMs is direct log evidence that the reset prevented a
+    ' premature consensus (the settle-to-render-gap accident class).
+    m_lastProbeQuietMs = jsIdleDuration
+
     ' --- 3. Activity Logging (Discovery Recorder Integration) ---
     If probe.Exists("changes") Then
         Dim changes As Collection: Set changes = probe("changes")
@@ -2921,6 +3288,61 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
         End If
     End If
 
+    ' --- [Signal Gate] Hit detection, arm-lost detection, and timer resets ---
+    ' All three signal types share one semantic: a hit OPENS the gate AND resets
+    ' the consensus window (ctx("stableStart") = now), guaranteeing a minimum of
+    ' minStableMs of observed quiet AFTER the signal. Without that reset, a wait
+    ' whose DOM went quiet long before the signal (e.g. slow server, quiet page)
+    ' would reach consensus on the very next poll after the hit -- before the
+    ' render the signal announces has had any chance to appear.
+    If m_sigDomArmed Or m_sigVisArmed Then
+        ' Arm-lost detection: probe state (sigArmed/visArmed) lives in the page.
+        ' A navigation destroys it; the JIT re-injected probe reports False while
+        ' the VBA-side flags are still True. Cross-document signal waiting has
+        ' broken semantics, so we do NOT silently re-arm or (worse) silently
+        ' un-gate: the gate STAYS CLOSED (fail-safe -- never passes early) and
+        ' the wait runs to TIMEOUT with signal=..:miss, plus a one-shot
+        ' [SPA-SIGNAL-LOST] line pinpointing the cause.
+        Dim probeSigArmed As Boolean, probeVisArmed As Boolean
+        If probe.Exists("sigArmed") Then probeSigArmed = CBool(probe("sigArmed"))
+        If probe.Exists("visArmed") Then probeVisArmed = CBool(probe("visArmed"))
+        If ((m_sigDomArmed And Not m_sigDomSeen And Not probeSigArmed) Or _
+            (m_sigVisArmed And Not m_sigVisSeen And Not probeVisArmed)) And _
+           Not m_sigLostWarned Then
+            m_sigLostWarned = True
+            LogSignalLine "[SPA-SIGNAL-LOST] reason=probe-reinjected (navigation?) | gate stays closed; expect TIMEOUT signal=miss"
+        End If
+    End If
+    If m_sigDomArmed And Not m_sigDomSeen Then
+        If probe.Exists("sigCount") Then
+            If CLng(probe("sigCount")) > 0 Then
+                m_sigDomSeen = True
+                ctx("stableStart") = currentMs   ' reset: full window after the hit
+                LogSignalLine "[SPA-SIGNAL-HIT] type=dom | count=" & CLng(probe("sigCount")) & _
+                              " | quietAtHit=" & Format(jsIdleDuration, "0") & "ms"
+            End If
+        End If
+    End If
+    If m_sigVisArmed And Not m_sigVisSeen Then
+        If probe.Exists("visSeen") Then
+            If CBool(probe("visSeen")) Then
+                m_sigVisSeen = True
+                ctx("stableStart") = currentMs   ' reset: full window after the hit
+                LogSignalLine "[SPA-SIGNAL-HIT] type=vis | quietAtHit=" & Format(jsIdleDuration, "0") & "ms"
+            End If
+        End If
+    End If
+    If m_sigNetArmed And m_sigNetSeen Then
+        ' Hit already latched (and logged, event-accurate) by DispatchGlobalEvents;
+        ' this poll only performs the once-per-wait timer reset.
+        If ctx.Exists("sigNetAcked") Then
+            If Not CBool(ctx("sigNetAcked")) Then
+                ctx("sigNetAcked") = True
+                ctx("stableStart") = currentMs   ' reset: full window after the hit
+            End If
+        End If
+    End If
+
     ' --- 4. Consensus Evaluation ---
     ' Network Idle: JS fetch/XHR hooks report zero activity (condition 2).
     netIdle = (inflFetch = 0) And (inflXhr = 0)
@@ -2928,8 +3350,25 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
     ' DOM Stability: No mutations within the required threshold.
     activityStable = (jsIdleDuration >= CDbl(minStableMs))
 
+    ' [Signal Gate] Open when nothing is armed (ungated waits are unchanged),
+    ' otherwise every armed type must have latched. AND-composition on purpose:
+    ' the gate inherits the STRICTEST precondition, never the weakest.
+    Dim sigGateOpen As Boolean
+    sigGateOpen = (Not m_sigDomArmed Or m_sigDomSeen) And _
+                  (Not m_sigNetArmed Or m_sigNetSeen) And _
+                  (Not m_sigVisArmed Or m_sigVisSeen)
+
     ' --- 5. Final Consensus Window Check ---
     If netIdle And activityStable Then
+        If Not sigGateOpen Then
+            ' Gate closed: an armed completion signal has not arrived. Deliberately
+            ' do NOT reset stableStart here -- the hit itself resets it, which is
+            ' exactly what guarantees the post-signal observation window. Resetting
+            ' per-poll instead would merely re-derive the same guarantee at higher
+            ' cost; not resetting at the hit would shrink it to one poll interval.
+            EvaluateSpaIdleCondition = False
+            Exit Function
+        End If
         ' Check if the stable state has persisted for the designated window.
         If (currentMs - CDbl(ctx("stableStart"))) >= CDbl(minStableMs) Then
             If m_debugMode Then
@@ -3332,8 +3771,29 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             ' --- SPA Monitoring Probe: Now filters out Sizzle noise ---
             js = js & "(function(){if(window.__vbaSpaProbeInstalled&&window.__vbaIdleProbe)return true;window.__vbaSpaProbeInstalled=true;var selectors=" & selArray & ",ignoreNetwork=" & netArray & ","
             js = js & "p=window.__vbaIdleProbe||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],inflightUrls:new Set()};window.__vbaIdleProbe=p;if(!p.inflightUrls)p.inflightUrls=new Set();"
+            ' --- [Signal Gate] state fields (idempotent: preserved when the probe already exists) ---
+            js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath='';}"
             js = js & "var gX=function(e){if(!e||e.nodeType!==1)return '';var s=[];while(e&&e.nodeType===1){if(e.id){s.unshift('//*[@id=\''+e.id+'\']');return s.join('/')}"
             js = js & "var i=1,b=e.previousSibling;while(b){if(b.nodeType===1&&b.tagName===e.tagName)i++;b=b.previousSibling}s.unshift(e.tagName.toLowerCase()+'['+i+']');e=e.parentNode}return '/'+s.join('/')};"
+
+            ' --- [Signal Gate] browser-side arm/disarm + visibility predicate ---
+            ' vChk mirrors the 'visibility_check' action predicate (GetActionJs) so
+            ' ArmVisibilitySignal and ExecuteIsElementVisible agree on 'visible'.
+            js = js & "p.vChk=function(e){if(!e||!e.isConnected)return false;var s=window.getComputedStyle(e),r=e.getBoundingClientRect();return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0))};"
+            ' armDomSignal(xpath, includeAttrs): rc 0=armed, -1=target not found, -2=bad XPath.
+            ' Scoped observer on the target subtree; sigCount is a MONOTONIC counter
+            ' (never read-and-clear), so the VBA poll is a pure >0 latch check.
+            ' childList+characterData by default; attributes only on request.
+            js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;"
+            js = js & "if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;"
+            js = js & "p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
+            ' armVisSignal(xpath): rc 0=armed, -2=bad XPath, -3=already visible (guard:
+            ' waiting for something already visible would open the gate instantly and
+            ' silently degrade to an ungated wait -- the exact accident this gate exists
+            ' to prevent). Target absence is VALID here (appearance is the signal).
+            js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visXPath=x;p.visArmed=true;p.visSeen=false;return 0};"
+            js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath=''};"
+
             
             ' --- MutationObserver: tracks DOM/attribute changes for SPA idle detection ---
             ' gX(node) computes a full XPath for the changed node.
@@ -3372,7 +3832,12 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             ' Returns JSON snapshot of probe state: active flag, timing, inflight counts,
             ' pending DOM change list, and inflight URLs. Clears changeList after read.
             js = js & "var p=window.__vbaIdleProbe;if(!p)return JSON.stringify({active:false});"
-            js = js & "var res={active:true,now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,inflightUrls:Array.from(p.inflightUrls||[])};"
+            ' [Signal Gate] visibility signal: evaluated per poll ONLY while armed and
+            ' not yet latched; after the latch the XPath evaluation is skipped entirely,
+            ' so the repeated-evaluation cost window is [arm .. first visible] only.
+            js = js & "if(p.visArmed&&!p.visSeen&&p.visXPath){try{var vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
+            js = js & "var res={active:true,now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,inflightUrls:Array.from(p.inflightUrls||[]),"
+            js = js & "sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};"
             js = js & "p.changeList=[];return JSON.stringify(res);"
     End Select
     GetProbeJs = js
@@ -3556,6 +4021,11 @@ CleanExit:
         End If
         On Error Resume Next
         Call WriteSpaWaitEnd(endStatus, mode, ctx, startTick)
+        ' [Signal Gate] One-shot consumption: the arm's lifetime is exactly one
+        ' SPA-idle wait, whatever the outcome. Consuming on TIMEOUT/ERROR too
+        ' prevents a stale arm from permanently gating an unrelated later wait.
+        ' Must run AFTER WriteSpaWaitEnd (which reads the flags for signal=).
+        If mode = WaitMode_SpaIdle Then ConsumeSignalArms CStr(ctx("contextId"))
         Err.Clear
         On Error GoTo 0
 
@@ -3583,6 +4053,8 @@ CleanExit:
     If success Then
         On Error Resume Next
         Call WriteSpaWaitEnd("STABLE", mode, ctx, startTick)
+        ' [Signal Gate] One-shot consumption (see the error-path twin above).
+        If mode = WaitMode_SpaIdle Then ConsumeSignalArms CStr(ctx("contextId"))
         On Error GoTo 0
     End If
 
@@ -3630,13 +4102,27 @@ Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
     Dim relTime As String
     relTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
 
+    ' [Signal Gate] Per-armed-type outcome (e.g. "net:hit,dom:miss"). Uniform
+    ' type-prefixed notation even for a single armed type, so one parser shape
+    ' covers solo and combined arms. Omitted entirely on ungated waits (line
+    ' stays byte-identical to the pre-gate format). Read at TIMEOUT:
+    '   miss -> the signal never arrived (selector/pattern error, action never
+    '           fired, or the site genuinely produced no change) -- NOT a
+    '           minStableMs problem; raising the threshold cannot fix it.
+    '   hit  -> signal arrived but post-signal quiet never settled (continuous
+    '           site mutation) -- a threshold/site problem, not a signal problem.
+    ' NOTE: must be built BEFORE ConsumeSignalArms clears the flags (call order
+    ' in MasterWaitEngine guarantees this).
+    Dim sigEndDesc As String: sigEndDesc = BuildSignalEndDesc()
+
     m_recorderLogs.Add "[" & relTime & "] [SPA-WAIT-END] " & outcome & _
                        " | elapsedMs=" & Format(ElapsedMs, "0") & _
                        " | domQuietMs=" & Format(domQuietMs, "0") & _
                        " | slackMs=" & Format(slackMs, "0") & _
                        " | minStableMs=" & minStableMs & _
                        " | fetch=" & inflFetch & _
-                       " | xhr=" & inflXhr
+                       " | xhr=" & inflXhr & _
+                       IIf(Len(sigEndDesc) > 0, " | signal=" & sigEndDesc, "")
 End Sub
 
 
