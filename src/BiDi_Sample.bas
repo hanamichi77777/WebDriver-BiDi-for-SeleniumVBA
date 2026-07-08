@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.6
+' Version: 1.7
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Foreground message box: declared with hWnd=0 (no owner) so the dialog is an
@@ -489,24 +489,21 @@ Public Sub Main08()
         bidi.ExecuteClickByXPath destSuggestXPath, minStableMs:=1000
         
         ' STEP 3: Select Dates
-        ' Calendar opens automatically after destination is selected.
+        ' Calendar opens automatically after destination selection.
         ' Strategy:
-        '   - Pick first available date as departure
-        '   - Pick 7th available date as return
+        '   - Pick the first available departure date
+        '   - Pick the seventh available date as the return date
         
-        Dim depDateFieldXPath As String
-        depDateFieldXPath = "//input[@aria-label='Departure']"
-        ' One-shot gate: wait until the calendar picker API returns.
+        ' Arm completion signals for the fare calendar:
+        '   - Wait for the GetCalendarPicker request to complete
+        '   - Wait until fare cells (data-gs) become visible
+        ' This ensures the calendar prices have been rendered before proceeding.
         bidi.ArmNetworkSignal "GetCalendarPicker"
-        bidi.ExecuteClickByXPath depDateFieldXPath
+        bidi.ArmVisibilitySignal "//div[@data-gs]"
+        bidi.ExecuteClickByXPath "//input[@aria-label='Departure']"
         
-        Dim retDateXPath As String
-        retDateXPath = "(//div[@role='gridcell' and @aria-hidden='false'])[8]//div[@role='button']"
-        bidi.ExecuteClickByXPath retDateXPath
-        
-        Dim doneXPath As String
-        doneXPath = "//button[contains(., 'Done')]"
-        bidi.ExecuteClickByXPath doneXPath
+        bidi.ExecuteClickByXPath "(//div[@role='gridcell' and @aria-hidden='false'])[8]//div[@role='button']"
+        bidi.ExecuteClickByXPath "//button[contains(., 'Done')]"
         
         ' STEP 4: Click Search Button
         Dim searchXPath As String
@@ -623,10 +620,10 @@ Public Sub Main10()
     
     ' One-shot gate: the click's SPA wait cannot go STABLE until the existing
     ' #table-body subtree is rewritten (bridges the XHR-settle-to-render gap).
-'    bidi.ArmContentSignal "//*[@id='table-body']"
+    bidi.ArmContentSignal "//*[@id='table-body']"
     bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2015']"
     
-'    bidi.ArmContentSignal "//*[@id='table-body']"
+    bidi.ArmContentSignal "//*[@id='table-body']"
     bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2014']"
     
     ' ==========================================

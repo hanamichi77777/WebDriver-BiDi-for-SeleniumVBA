@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.6
+' Version: 1.7
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -151,12 +151,12 @@ Private m_isRecording As Boolean
 Private m_recorderStartTime As Double
 Private m_excludeResources As Boolean
 ' [AI-Log] Suppression bookkeeping for the discovery log.
-' NOTE: Per-request lifecycle tracking (dur= / [REQ] / [REQ-OPEN]) was REMOVED.
-' It required network.beforeRequestSent, which is deliberately NOT subscribed
-' (its per-request-initiation flood destabilizes the single-threaded input loop
-' on Wiz-style SPAs -- see StartDiscoveryLog). Without that event a request-start
-' timestamp never exists, so dur= could only ever have printed "?". The pending
-' maps were therefore dead state; the log LEGEND now matches this reality.
+' NOTE: network.beforeRequestSent is subscribed (in StartDiscoveryLog) and emits
+' the [REQ] start marker, paired to [RES] on the shared id. Its per-request
+' flood once produced oversized inbound frames that broke receive assembly; the
+' MaxIncomingSize cap now discards those cleanly, so the subscription is safe to
+' keep on permanently. Handling is recording-only (FormatAndStoreLog) and never
+' wired to consensus. dur= is not computed: start/end latency pairing is out of scope.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_droppedHeadCount As Long          ' count of oldest timeline lines evicted by the MAX_LOG_SIZE ring buffer (0 = none)
 
@@ -2210,8 +2210,9 @@ End Function
 
 ' Discovery & Recorder API
 ' Call this AFTER navigation; post-nav capture is enough for noise discovery.
-' beforeRequestSent is deliberately NOT subscribed: its per-request-initiation
-' flood destabilizes the single-threaded input loop on Wiz-style SPAs.
+' beforeRequestSent IS subscribed here to emit [REQ] start lines (recording-only,
+' never wired to consensus). Its flood once caused oversized inbound frames; the
+' MaxIncomingSize cap now absorbs them, so the subscription is safe to keep on.
 Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = True)
     Set m_recorderLogs = New Collection
     m_isRecording = True
@@ -2229,11 +2230,15 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     ' Include network.fetchError so blocked requests (Network.setBlockedURLs
     ' returns ERR_BLOCKED_BY_CLIENT through this event) are visible in the
     ' discovery log.
-    Dim events(3) As String
+    ' network.beforeRequestSent emits [REQ] start lines (recording-only, handled
+    ' by FormatAndStoreLog, never wired to consensus). Kept on permanently: the
+    ' MaxIncomingSize cap absorbs the oversized frames its flood once caused.
+    Dim events(4) As String
     events(0) = "network.responseCompleted"
     events(1) = "network.fetchError"
     events(2) = "browsingContext.load"
     events(3) = "browsingContext.domContentLoaded"
+    events(4) = "network.beforeRequestSent"
     Me.ExecuteSessionSubscribe events
 
     Debug.Print "BiDi Recorder: Started. (Filter Resources: " & excludeImagesAndCss & ")"
@@ -2253,8 +2258,9 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
 
     ' [AI-Log] Append the end-of-run summary to the timeline tail: a tally of
     ' suppressed (filtered) events by endpoint so nothing is hidden without a
-    ' trace. (Open-request flushing was removed along with the dur=/[REQ]
-    ' machinery -- see the NOTE at the m_recSuppByKey declaration.)
+    ' trace. (Open-request flushing was removed along with the dur=
+    ' machinery -- see the NOTE at the m_recSuppByKey declaration. [REQ] start
+    ' lines themselves are emitted; only per-request latency is not computed.)
     AppendSuppressedSummary
     
     ' Save logic
@@ -2286,7 +2292,7 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         End If
         ' [AI-Log] Legend so a reader can interpret fields without external context.
         stm.WriteText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
-        stm.WriteText "LEGEND | per-request latency (dur=) and [REQ]/[REQ-OPEN] lines are NOT recorded BY DESIGN: network.beforeRequestSent is not subscribed (its event flood destabilizes input on heavy SPAs), so request-start times do not exist in this log." & vbCrLf
+        stm.WriteText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). [REQ] pairs with [RES] on the shared id. Per-request latency (dur=) is not computed." & vbCrLf
         stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
         stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
         stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HIT timestamps are event-accurate; dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
@@ -2522,7 +2528,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
     Dim method As String: method = json("method")
 
     Select Case method
-        Case "network.responseCompleted", "network.fetchError", "browsingContext.load", "browsingContext.domContentLoaded", "log.entryAdded"
+        Case "network.responseCompleted", "network.fetchError", "browsingContext.load", "browsingContext.domContentLoaded", "log.entryAdded", "network.beforeRequestSent"
         Case Else
             Exit Sub
     End Select
@@ -2560,9 +2566,9 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                 End If
             End If
 
-            ' [AI-Log] dur= intentionally NOT reported: request-start times would
-            ' require network.beforeRequestSent, which is deliberately not
-            ' subscribed (see StartDiscoveryLog / the m_recSuppByKey NOTE).
+            ' [AI-Log] dur= not reported: even with the [REQ] start marker
+            ' present, start/end pairing for latency is out of scope (see the
+            ' m_recSuppByKey NOTE and StartDiscoveryLog).
 
             Dim resStatus As String: resStatus = ""
             If res.Exists("status") Then resStatus = CStr(res("status"))
@@ -2584,6 +2590,27 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                     m_unresolvedJsonThisWait = True
                 End If
             End If
+
+        Case "network.beforeRequestSent"
+            ' [AI-Log] Request-start marker. Same key normalization
+            ' and noise filter as [RES] so [REQ]/[RES] pair on the shared id.
+            ' No dur= is computed -- this is the start line only.
+            If Not params.Exists("request") Then Exit Sub
+            If Not IsObject(params("request")) Then Exit Sub
+            Dim reqObj As Object: Set reqObj = params("request")
+            If Not reqObj.Exists("url") Then Exit Sub
+            Dim reqUrl As String: reqUrl = CStr(reqObj("url"))
+            If m_excludeResources Then
+                If IsNoiseUrl(reqUrl) Then BumpSuppressed NormalizeEndpointKey(reqUrl): Exit Sub
+            End If
+            Dim reqId As String: reqId = ""
+            If reqObj.Exists("request") Then reqId = CStr(reqObj("request"))
+            Dim reqMethod As String: reqMethod = ""
+            If reqObj.Exists("method") Then reqMethod = CStr(reqObj("method"))
+            ' IIf on IsIdleIgnored: read-only predicate, no side effects.
+            LogLine = "[" & relTime & "] [REQ] " & reqMethod & " | id=" & ShortId(reqId) & _
+                      " | key=" & NormalizeEndpointKey(reqUrl) & _
+                      " | idle=" & IIf(IsIdleIgnored(reqUrl), "skip", "track")
 
         Case "network.fetchError"
             ' Surface failed requests in the discovery log. Two sub-cases:

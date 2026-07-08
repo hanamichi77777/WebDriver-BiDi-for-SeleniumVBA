@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.6
+' Version: 1.7
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -758,7 +758,7 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
                 ' Async events or pongs: Queue for GetMessage processing
                 ' BiDi events (network.beforeRequestSent etc.) have no "id" field,
                 ' so the old condition (inId <> "") silently discarded them.
-                ' Losing these one-shot events degraded SPA idle detection accuracy.
+                ' Losing these one-shot events degraded recorder/[REQ] completeness.
                 ' Discard reserved-band system replies (rotating heartbeat pongs,
                 ' PostScript reply) via a single band check.
                 If Not IsReservedSystemId(inId) Then
