@@ -43,9 +43,9 @@ The validation code is contained in the `Main07` procedure.
 
 ---
 
-## 📂 Procedure Overview (Sample Module: `A_01_BiDi_Sample`)
+## 📂 Procedure Overview (Sample Module: `BiDi_Sample`)
 
-### 1. Main01: Enhanced Select Box & Extension Injection & Recording
+### 1. Main01: Enhanced Select Box & Extension Injection
 This procedure focuses on handling elements that trigger complex JavaScript state changes.
 * **Dynamic Extension Injection:** Utilizes the WebDriver BiDi `ExecuteWebExtensionInstall` command to load extensions directly into the browser session from a local path. This enables the runtime "bypass injection" of extensions without cluttering the system registry. *(Note: Please ensure that the Google Translate Chrome extension is installed on your PC in advance.)*
 * **Smart Selection:** Utilizes `ExecuteSelectValueByXPath`. This command can be configured to wait for the browser's "Idle" state immediately after selection, ensuring subsequent UI updates are fully rendered before proceeding.
@@ -58,7 +58,7 @@ Designed for Single-Page Application (SPA) environments that utilize infinite sc
 
 ### 3. Main03: Performance Optimization via CDP-over-BiDi Bridge
 This procedure demonstrates how to make automation up to 5x faster by controlling the network layer using a hybrid protocol approach.
-* **Hybrid Protocol Bridge:** Utilizes `ExecuteEnableResourceBlocking` to filter out heavy resources like images, ad scripts, and tracking beacons before navigation.
+* **Hybrid Protocol Bridge:** Utilizes `ExecuteEnableResourceBlocking` to filter out heavy resources like ad scripts, analytics, and tracking beacons before navigation.
 * **Post-Navigation Idleness Probe:** Injects `window.__vbaIdleProbe` to ensure the environment is quiescent before entering data, maximizing execution speed and reliability.
 
 ### 4. Main04: Event-Driven URL Monitoring
