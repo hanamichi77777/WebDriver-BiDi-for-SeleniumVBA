@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.1
+' Version: 2.2
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator

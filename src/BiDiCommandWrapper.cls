@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.1
+' Version: 2.2
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -1416,7 +1416,7 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
         ' AMBIGUOUS OUTCOME: a soft timeout (604) / connection loss (600) means the trusted
         ' pointer click may ALREADY have fired. Falling back to a JS click here would
         ' double-click, so re-raise instead of falling through.
-        If tcErrNum = 604 Or tcErrNum = 600 Then Err.Raise tcErrNum, tcErrSrc, tcErrDesc
+        If IsAmbiguousOutcome(tcErrNum) Then Err.Raise tcErrNum, tcErrSrc, tcErrDesc
         ' On-target but pointer failed for a NON-ambiguous reason (element moved, etc.):
         ' the trusted click did not fire, so the node-click fallback below is safe.
     Else
@@ -1796,7 +1796,7 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
         ' risk a DOUBLE action (click / keystroke / navigation), so stop and propagate.
         ' Context-lost (ERR_BIDI_PROTOCOL) and send-failures (601) are deliberately NOT
         ' covered: they prove the action did not run, so their recovery retry stays intact.
-        If Not allowAmbiguousRetry And (localErrNum = 604 Or localErrNum = 600) Then Exit Do
+        If Not allowAmbiguousRetry And IsAmbiguousOutcome(localErrNum) Then Exit Do
 
         ' --- RECOVERY LOGIC ---
         ' If we haven't exhausted our retries, attempt to heal the environment.
@@ -3726,6 +3726,20 @@ End Function
 ' INTERNAL JS HELPER: GetActionJs
 '  Provides centralized JavaScript snippets for all browser actions.
 '              Ensures the SPA watchdog is reset immediately before execution.
+' TRUE for errors where a command may have executed but its outcome is unknown, so a
+' non-idempotent action must NOT be re-run:
+'   604 - soft/hard receive timeout (sent, no response)
+'   600 - connection lost while waiting (sent, then dropped)
+'   517 - Safety Shell watchdog timeout. CRITICAL: Promise.race does NOT cancel the losing
+'         _tk(), so the browser-side JS keeps running and may still perform the click /
+'         keystroke AFTER we stop waiting -- re-running would double the action.
+Private Function IsAmbiguousOutcome(ByVal errNum As Long) As Boolean
+    Select Case errNum
+        Case 604, 600, 517
+            IsAmbiguousOutcome = True
+    End Select
+End Function
+
 ' TRUE for action keys whose JS mutates page state and is NOT safely repeatable
 ' (a re-run could double the effect): clicks, text entry, selections. Read-only /
 ' idempotent keys (visibility_check, lazy_scroll) return False so their retry is kept.
@@ -4457,7 +4471,7 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
         ' non-idempotent action, a soft timeout (604) / connection loss (600) after
         ' dispatch may mean the browser already performed it. Do NOT re-run -- propagate
         ' instead of risking a double click / keystroke. Read-only keys are excluded.
-        If IsStateChangingActionKey(jsKey) And (status = 604 Or status = 600) Then Exit Do
+        If IsStateChangingActionKey(jsKey) And IsAmbiguousOutcome(status) Then Exit Do
         
         ' For transient protocol errors (Context Lost, Socket issues), wait and retry.
         retryCount = retryCount + 1
@@ -4592,7 +4606,7 @@ Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As Str
                         ' Map the specific VBA_TIMEOUT token to a dedicated Error 517
                         If shellMsg = "VBA_TIMEOUT" Then
                             Err.Raise 517, "BiDi:SafetyTimeout:" & methodName, _
-                                "Execution cancelled by browser-side Safety Shell (Watchdog triggered)."
+                                "Safety Shell timeout: the wrapper stopped waiting, but the browser-side task may still be running."
                         Else
                             Err.Raise ERR_ACTION_FAILED, "BiDi:SafetyTimeout:" & methodName, shellMsg
                         End If
