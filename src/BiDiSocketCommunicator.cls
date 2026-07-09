@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.7
+' Version: 1.8
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -151,6 +151,7 @@ Private m_consecutiveInternalErrors As Long
 ' --- Robustness Semaphores & Timestamps ---
 Private m_isReading As Boolean
 Private m_isReadingSince As Double ' Tracks the timestamp of the last read lock
+Private m_discardActive As Boolean ' TRUE iff m_InStream holds a partially-discarded oversized message (persists across ReadFromWire calls; cleared only where m_InStream is truncated)
 Private m_isSendReceiving As Boolean ' True when a command sequence is active
 Private m_isRecovering As Boolean ' Re-entrancy lock for AttemptRecovery
 Private m_lastHeartbeatLogTime As Double ' Throttles heartbeat logging cadence
@@ -663,6 +664,7 @@ Private Sub InternalCleanup()
     ' Reset module-scoped semaphores and throttle state.
     m_isRecovering = False
     m_lastHeartbeatLogTime = 0
+    m_discardActive = False ' input stream truncated above: drop any partial-discard latch
     
     On Error GoTo 0
 End Sub
@@ -1019,12 +1021,15 @@ Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
     Dim hasValidData As Boolean
     ' Counter to track fragment throughput
     Dim fragmentCount As Long: fragmentCount = 0
-    ' Receive-side cap bookkeeping. NOTE: discardMode is call-local by design.
-    ' If a deadline exit interrupts a discard, the next call re-engages discard
-    ' on its first write (stream size is already at the cap), so the mechanism
-    ' self-heals; only totalBytes then reflects the current call, not the message.
+    ' Receive-side cap bookkeeping. Discard state is held in the module-level
+    ' m_discardActive latch (NOT call-local): a 12002/deadline exit can interrupt
+    ' an oversized message mid-discard, and the latch keeps discard engaged across
+    ' calls until the MESSAGE boundary truncates m_InStream -- mirroring how a normal
+    ' partial message persists via the retained stream + non-zero Position. The latch
+    ' is cleared ONLY where m_InStream is truncated (CleanExit finished block,
+    ' StreamErrorHandler, InternalCleanup, ForceClose), so 'empty stream yet still
+    ' discarding' cannot occur. totalBytes stays call-local (current call only).
     Dim totalBytes As Long
-    Dim discardMode As Boolean
 
     If m_InStream.Position = 0 Then
         PrepareStream m_InStream, adTypeBinary
@@ -1051,12 +1056,12 @@ Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
             hasValidData = True
             totalBytes = totalBytes + bytesRead
 
-            If Not discardMode Then
+            If Not m_discardActive Then
                 If m_InStream.Size + bytesRead > m_MaxIncomingSize Then
                     ' Cap exceeded: stop writing, keep draining fragments until the
                     ' MESSAGE frame closes the boundary. The retained head is used
                     ' for identity diagnostics in CleanExit.
-                    discardMode = True
+                    m_discardActive = True
                     Trace ">>> [WinHttp] Incoming message exceeded MaxIncomingSize (" & _
                           m_MaxIncomingSize & "). Discard mode engaged.", True
                 Else
@@ -1129,7 +1134,7 @@ CleanExit:
         m_InStream.Type = adTypeText
         m_InStream.Charset = "UTF-8"
 
-        If discardMode Then
+        If m_discardActive Then
             ' IDENTITY DIAGNOSTICS for oversized messages:
             '   HEAD300           -> shows the leading JSON ("method"/"id") of the giant
             '   fusionMarkers(}{) -> 0  = genuine single message
@@ -1154,6 +1159,7 @@ CleanExit:
         End If
 
         PrepareStream m_InStream, adTypeBinary
+        m_discardActive = False ' MESSAGE boundary reached: stream truncated, latch cleared
     End If
     
     GoTo FinalCleanup
@@ -1166,6 +1172,7 @@ StreamErrorHandler:
     m_InStream.mode = adModeReadWrite
     m_InStream.Open
     PrepareStream m_InStream, adTypeBinary
+    m_discardActive = False ' stream rebuilt empty: no partial/discard data survives
     Resume FinalCleanup
 
 FinalCleanup:
@@ -1692,6 +1699,7 @@ Public Sub ForceClose()
     m_isSendReceiving = False
     m_isReading = False
     m_isReadingSince = 0
+    m_discardActive = False
     
     ' Skip WinHttpWebSocketClose (no close frame, no timeout).
     ' Directly release all WinHttp handles.

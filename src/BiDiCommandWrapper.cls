@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.7
+' Version: 1.8
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -4808,6 +4808,14 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     ' resource release is best-effort. If detach/forceClose fails (connection already
     ' dropped), we still want to fall through and null out socket_ rather than raise.
     On Error Resume Next
+    
+    ' Teardown path (ForceClose): the CDP detach below must fail fast. A dead-but-
+    ' connected socket (peer gone, hWebSocket_ still non-zero) would otherwise let
+    ' the detach send failure trigger AttemptRecovery's exponential backoff (up to
+    ' ~31s), freezing Excel during Class_Terminate. Disabling reconnect only when
+    ' ForceClose=True is safe: that path nulls socket_ below, so the flag change
+    ' never leaks to a socket the caller intends to keep (ForceClose=False).
+    If ForceClose Then socket_.AutoReconnect = False
     
     ' --- 1. CDP Session Detachment ---
     If m_cdpSessionId <> "" Then
