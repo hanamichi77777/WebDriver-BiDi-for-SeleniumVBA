@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.0
+' Version: 2.1
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Foreground message box: declared with hWnd=0 (no owner) so the dialog is an
@@ -75,7 +75,7 @@ Public Sub Main01()
     str = .FindElementByXPath("//input[@id='nameField']").GetProperty("value")
 
     If str = "Success: Response Received!" Then
-        msgText = "Successfully waited until the document switched." & Chr(10) & "See the discovery_log.txt"
+        msgText = "Successfully waited until the document switched."
         msgCaption = "Verification Complete"
         MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
     Else
@@ -154,7 +154,7 @@ Public Sub Main03()
     .OpenBrowser caps
      Dim bidi As New BiDiCommandWrapper: bidi.ConnectTo .GetWebSocketUrl
     ' ==========================================
-    ' Resource Blocking (Images, Ads, Analytics, Fonts)
+    ' Resource Blocking (Ads, Analytics, Tracking beacons)
     ' ==========================================
     Dim blockList As Variant
     blockList = Array( _
@@ -378,7 +378,7 @@ Public Sub Main08()
 ' TARGET  :
 '   https://www.google.com/travel/flights
 ' SCENARIO :
-'   Sapporo -> Paris, round trip, then click Search
+'   Sapporo -> Paris, one way, then click Search
 ' NOTE :
 '   Google Flights uses Wiz/Lit-driven comboboxes that spawn multiple <input>
 '   elements on activation -> a hidden store input, a surface trigger input, and
@@ -424,7 +424,7 @@ Public Sub Main08()
         Dim bidi As New BiDiCommandWrapper
         bidi.ConnectTo .GetWebSocketUrl
         ' ==========================================
-        ' Resource Blocking (Images, Ads, Analytics, Fonts)
+        ' Resource Blocking (Ads, Analytics, Tracking beacons)
         ' ==========================================
         Dim blockList As Variant
         blockList = Array( _
@@ -489,11 +489,10 @@ Public Sub Main08()
         destSuggestXPath = "//*[@role='listbox' and not(@aria-hidden='true')]//li[@role='option' and contains(@aria-label, 'Paris')][1]"
         bidi.ExecuteClickByXPath destSuggestXPath, minStableMs:=1000
         
-        ' STEP 3: Select Dates
+        ' STEP 3: Select Departure Date (one way -> no return date)
         ' Calendar opens automatically after destination selection.
         ' Strategy:
-        '   - Pick the first available departure date
-        '   - Pick the seventh available date as the return date
+        '   - Pick a single departure date (the 8th available date cell)
         
         ' Arm completion signals for the fare calendar:
         '   - Wait for the GetCalendarPicker request to complete
