@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.8
+' Version: 1.9
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Foreground message box: declared with hWnd=0 (no owner) so the dialog is an
@@ -345,6 +345,7 @@ Public Sub Main07()
     bidi.ExecuteNavigateAndGetStatus targetUrl
         
     ' Execute Click in Shadow DOM
+    bidi.ArmNetworkSignal "metadata/application"
     bidi.ExecuteShadowClick "#utility-sign-in button"
             
     ' Execute Input on Sign-In page

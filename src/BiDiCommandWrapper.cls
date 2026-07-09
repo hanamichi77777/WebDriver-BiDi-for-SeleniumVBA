@@ -1023,7 +1023,7 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
     params.Add "wait", bidiWaitLevel
     
     Dim strRes As String
-    strRes = ExecuteBiDiCommand("browsingContext.navigate", params)
+    strRes = ExecuteBiDiCommand("browsingContext.navigate", params, allowAmbiguousRetry:=False)
     Dim navJson As Object: Set navJson = ValidateProtocolResponse(strRes, "browsingContext.navigate")
 
     ' WHY: cross-origin CDP session invalidation.
@@ -1139,7 +1139,8 @@ Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
         If keySafetyMs < 20000 Then keySafetyMs = 20000
         
         ExecuteInputValueByXPath = CallScript( _
-            GetActionJs("input_keys"), args, targetCtx, False, False, keySafetyMs)
+            GetActionJs("input_keys"), args, targetCtx, False, False, keySafetyMs, _
+            allowAmbiguousRetry:=False)
         If m_debugMode Then Debug.Print "BiDi: Action 'input_keys' completed."
     End If
 End Function
@@ -1262,7 +1263,7 @@ Private Function PerformSetFiles(ByVal contextId As String, _
     
     ' Dispatch via the standard wrapper (gets retry / context recovery for free).
     Dim strRes As String
-    strRes = ExecuteBiDiCommand("input.setFiles", params)
+    strRes = ExecuteBiDiCommand("input.setFiles", params, allowAmbiguousRetry:=False)
     
     ' Optional: wait for the page to settle after the attachment registers
     '    (file picker close, network probe for inline upload, etc.).
@@ -1341,7 +1342,7 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
 
     ' Dispatch via the standard wrapper (gets retry / context recovery for free).
     Dim strRes As String
-    strRes = ExecuteBiDiCommand("input.performActions", params)
+    strRes = ExecuteBiDiCommand("input.performActions", params, allowAmbiguousRetry:=False)
 
     ' Optional: wait for the page to settle after the input burst.
     If waitNetworkIdle Then
@@ -1400,17 +1401,24 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
         params.Add "context", contextId: params.Add "actions", sources
 
         Dim res As String, trustedOk As Boolean
+        Dim tcErrNum As Long, tcErrDesc As String, tcErrSrc As String
         On Error Resume Next
         Err.Clear
-        res = ExecuteBiDiCommand("input.performActions", params)
-        trustedOk = (Err.Number = 0)
+        res = ExecuteBiDiCommand("input.performActions", params, allowAmbiguousRetry:=False)
+        tcErrNum = Err.Number: tcErrDesc = Err.description: tcErrSrc = Err.source
+        trustedOk = (tcErrNum = 0)
         On Error GoTo 0
         If trustedOk Then
             If m_debugMode Then Debug.Print "BiDi: TRUSTED click (on-target)."
             PerformTrustedClick = res
             Exit Function
         End If
-        ' On-target but pointer failed (rare/race) -> fall through to node click.
+        ' AMBIGUOUS OUTCOME: a soft timeout (604) / connection loss (600) means the trusted
+        ' pointer click may ALREADY have fired. Falling back to a JS click here would
+        ' double-click, so re-raise instead of falling through.
+        If tcErrNum = 604 Or tcErrNum = 600 Then Err.Raise tcErrNum, tcErrSrc, tcErrDesc
+        ' On-target but pointer failed for a NON-ambiguous reason (element moved, etc.):
+        ' the trusted click did not fire, so the node-click fallback below is safe.
     Else
         ' --- Covered/hidden: a coordinate click would hit the wrong (front)
         '     element, so do NOT fire a trusted pointer here. ---
@@ -1423,7 +1431,8 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
 
     ' Node-addressed untrusted JS click: always hits the correct target.
     ' Handles both "trusted unreachable" and "covered/hidden".
-    PerformTrustedClick = CallScript(GetActionJs("click"), args, contextId, True, , timeout)
+    PerformTrustedClick = CallScript(GetActionJs("click"), args, contextId, True, , timeout, _
+                                     allowAmbiguousRetry:=False)
 End Function
 
 ' Add: scroll + center hit-test. 'hit=1' if target (or descendant) is topmost.
@@ -1732,7 +1741,8 @@ End Function
 
 Private Function ExecuteBiDiCommand(ByVal method As String, _
                                      ByRef params As Dictionary, _
-                                     Optional ByVal Silent As Boolean = False) As String
+                                     Optional ByVal Silent As Boolean = False, _
+                                     Optional ByVal allowAmbiguousRetry As Boolean = True) As String
     
     ' Guard: Ensure the communication socket is available.
     If socket_ Is Nothing Then Err.Raise 91, "ExecuteBiDiCommand", "Socket object is not set."
@@ -1779,6 +1789,14 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
         ' If the error is an explicit action failure (e.g., Element not found),
         ' do NOT attempt recovery. Stop the loop and propagate the error immediately.
         If localErrNum = ERR_ACTION_FAILED Then Exit Do
+
+        ' --- AMBIGUOUS-OUTCOME GUARD (non-idempotent callers pass allowAmbiguousRetry:=False) ---
+        ' A soft timeout (604) or connection-loss (600) means the command was SENT but its
+        ' outcome is unknown -- the browser may have already executed it. Re-sending would
+        ' risk a DOUBLE action (click / keystroke / navigation), so stop and propagate.
+        ' Context-lost (ERR_BIDI_PROTOCOL) and send-failures (601) are deliberately NOT
+        ' covered: they prove the action did not run, so their recovery retry stays intact.
+        If Not allowAmbiguousRetry And (localErrNum = 604 Or localErrNum = 600) Then Exit Do
 
         ' --- RECOVERY LOGIC ---
         ' If we haven't exhausted our retries, attempt to heal the environment.
@@ -3701,6 +3719,16 @@ End Function
 ' INTERNAL JS HELPER: GetActionJs
 '  Provides centralized JavaScript snippets for all browser actions.
 '              Ensures the SPA watchdog is reset immediately before execution.
+' TRUE for action keys whose JS mutates page state and is NOT safely repeatable
+' (a re-run could double the effect): clicks, text entry, selections. Read-only /
+' idempotent keys (visibility_check, lazy_scroll) return False so their retry is kept.
+Private Function IsStateChangingActionKey(ByVal key As String) As Boolean
+    Select Case LCase$(key)
+        Case "click", "input", "input_keys", "select", "select_text", "shadow_click"
+            IsStateChangingActionKey = True
+    End Select
+End Function
+
 Private Function GetActionJs(ByVal actionType As String) As String
     Dim js As String: js = ""
     
@@ -3826,7 +3854,8 @@ Public Function CallScript(ByVal js As String, _
                            Optional ByVal awaitPromise As Boolean = False, _
                            Optional ByVal forceRealmTarget As Boolean = False, _
                            Optional ByVal safetyTimeoutMs As Long = 10000, _
-                           Optional ByVal Silent As Boolean = False) As String
+                           Optional ByVal Silent As Boolean = False, _
+                           Optional ByVal allowAmbiguousRetry As Boolean = True) As String
     
     Dim params As New Dictionary, targetDic As New Dictionary
     If args Is Nothing Then Set args = New Collection
@@ -3859,7 +3888,7 @@ Public Function CallScript(ByVal js As String, _
     params.Add "awaitPromise", True
     
     ' Execute command with the Silent flag
-    Dim rawRes As String: rawRes = ExecuteBiDiCommand("script.callFunction", params, Silent)
+    Dim rawRes As String: rawRes = ExecuteBiDiCommand("script.callFunction", params, Silent, allowAmbiguousRetry)
     Dim json As Object: Set json = ValidateProtocolResponse(rawRes, "script.callFunction")
     Dim procObj As Object: Set procObj = UnwrapSafetyShell(json, "script.callFunction")
     CallScript = WebJsonConverter.ConvertToJson(procObj)
@@ -4416,6 +4445,12 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
         ' --- RETRY DECISION LOGIC ---
         ' If status indicates a fatal failure (e.g., Element Not Found), abort retries.
         If status = ERR_ACTION_FAILED Then Exit Do
+
+        ' Ambiguous-timeout guard (mirrors ExecuteBiDiCommand's layer-1 guard): for a
+        ' non-idempotent action, a soft timeout (604) / connection loss (600) after
+        ' dispatch may mean the browser already performed it. Do NOT re-run -- propagate
+        ' instead of risking a double click / keystroke. Read-only keys are excluded.
+        If IsStateChangingActionKey(jsKey) And (status = 604 Or status = 600) Then Exit Do
         
         ' For transient protocol errors (Context Lost, Socket issues), wait and retry.
         retryCount = retryCount + 1
@@ -4809,16 +4844,19 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     ' dropped), we still want to fall through and null out socket_ rather than raise.
     On Error Resume Next
     
-    ' Teardown path (ForceClose): the CDP detach below must fail fast. A dead-but-
-    ' connected socket (peer gone, hWebSocket_ still non-zero) would otherwise let
-    ' the detach send failure trigger AttemptRecovery's exponential backoff (up to
-    ' ~31s), freezing Excel during Class_Terminate. Disabling reconnect only when
-    ' ForceClose=True is safe: that path nulls socket_ below, so the flag change
-    ' never leaks to a socket the caller intends to keep (ForceClose=False).
-    If ForceClose Then socket_.AutoReconnect = False
-    
     ' --- 1. CDP Session Detachment ---
-    If m_cdpSessionId <> "" Then
+    ' ForceClose is the emergency/teardown path: skip the synchronous detach entirely.
+    ' goog:cdp.detachSession runs through SendAndReceive, whose synchronous
+    ' WinHttpWebSocketReceive can block against a TCP-alive but frame-silent peer
+    ' (suspended/hung browser) -- freezing Excel during Class_Terminate for the full
+    ' timeout window (and its retries). The reconnect-only guard could not prevent this:
+    ' the detach SEND succeeds, only the response wait hangs. The CDP session is bound
+    ' to the BiDi session and dies with the socket that socket_.ForceClose tears down
+    ' below, so an explicit detach here is unnecessary; just drop the local id. A caller
+    ' that wants a graceful, acknowledged detach uses Shutdown ForceClose:=False.
+    If ForceClose Then
+        m_cdpSessionId = ""
+    ElseIf m_cdpSessionId <> "" Then
         Dim params As New Dictionary
         params.Add "session", m_cdpSessionId
         ExecuteBiDiCommand "goog:cdp.detachSession", params, True
@@ -5052,7 +5090,7 @@ Private Function TryExecutePhase(ByVal ctx As String, _
     If key = "click" And m_useTrustedClick Then
         outResult = PerformTrustedClick(ctx, args, timeout)
     Else
-        outResult = CallScript(GetActionJs(key), args, ctx, await, , timeout)
+        outResult = CallScript(GetActionJs(key), args, ctx, await, , timeout, allowAmbiguousRetry:=Not IsStateChangingActionKey(key))
     End If
     
     ' Capture any error occurred during transmission or script execution.
