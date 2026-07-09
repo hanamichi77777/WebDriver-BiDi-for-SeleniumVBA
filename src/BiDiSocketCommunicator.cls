@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.9
+' Version: 2.0
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -1723,6 +1723,19 @@ Public Sub ForceClose()
         WinHttpCloseHandle hSession_
         hSession_ = 0
     End If
+
+    ' Purge the input stream so a reused instance never carries stale fragments into the
+    ' next connection's first message. Connect -> InternalCleanup already truncates on
+    ' reconnect, so this is defense-in-depth; it also keeps ForceClose consistent with
+    ' InternalCleanup and with the m_discardActive invariant cleared above.
+    If Not m_InStream Is Nothing Then
+        If m_InStream.State = adStateOpen Then
+            m_InStream.Position = 0
+            m_InStream.SetEOS
+            m_InStream.Type = adTypeBinary
+        End If
+    End If
+
     Set m_EventBuffer = New Collection
     SetState StateDisconnected
     On Error GoTo 0

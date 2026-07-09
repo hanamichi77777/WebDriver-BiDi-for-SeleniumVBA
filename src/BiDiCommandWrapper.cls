@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 1.8
+' Version: 2.0
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -1802,9 +1802,16 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
         ' If we haven't exhausted our retries, attempt to heal the environment.
         If retryCount < MAX_CONTEXT_RECOVERY_RETRIES And Not m_isRecovering Then
             
-            ' Pre-recovery check: If the underlying socket is dead, no point in retrying.
-            If Not socket_.IsConnected Then
-                Debug.Print "BiDi [FATAL]: Socket connection lost. Aborting command retries."
+            ' Pre-recovery check: fast-fail ONLY when recovery is genuinely impossible --
+            ' the socket is down AND auto-reconnect is disabled. With auto-reconnect on
+            ' (the default self-healing config) do NOT abort here: the recovery path below
+            ' and SendCommand/SendAndReceive on the retry drive AttemptRecovery, so a
+            ' transient drop or post-hard-timeout state can still heal within this command.
+            ' State-changing commands are already protected from double execution by the
+            ' ambiguous-outcome guard above, so letting recovery proceed cannot re-fire a
+            ' click/keystroke/navigation.
+            If Not socket_.IsConnected And Not socket_.AutoReconnect Then
+                Debug.Print "BiDi [FATAL]: Socket down and auto-reconnect disabled. Aborting command retries."
                 Exit Do
             End If
             
