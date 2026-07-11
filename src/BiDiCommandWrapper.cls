@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.3
+' Version: 2.4
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -3332,6 +3332,21 @@ Private Function BuildSignalEndDesc() As String
     BuildSignalEndDesc = s
 End Function
 
+' [INTERNAL] BuildSignalPendingDesc -- armed-but-not-yet-latched types ("net",
+'  "dom,vis"). Empty when the gate is fully open OR nothing is armed. Used by the
+'  HUD to distinguish a real consensus-blocking wait ("Awaiting signal") from a
+'  genuine Stable: the consensus (EvaluateSpaIdleCondition) AND-gates on these
+'  same flags, but UpdateWaitTelemetry keyed only off DOM-quiet time and so
+'  rendered a misleading green while the gate was still closed. A frozen HUD then
+'  reads correctly by colour: amber = blocked awaiting a signal that never came.
+Private Function BuildSignalPendingDesc() As String
+    Dim s As String
+    If m_sigDomArmed And Not m_sigDomSeen Then s = "dom"
+    If m_sigNetArmed And Not m_sigNetSeen Then s = s & IIf(Len(s) > 0, ",", "") & "net"
+    If m_sigVisArmed And Not m_sigVisSeen Then s = s & IIf(Len(s) > 0, ",", "") & "vis"
+    BuildSignalPendingDesc = s
+End Function
+
 ' [INTERNAL] LogSignalLine -- single choke point for [SPA-SIGNAL-*] output.
 '  Timeline (when recording, via the ring-buffered PushTimelineLine) plus the
 '  Immediate window (when DebugMode), so arm failures are diagnosable from the
@@ -5025,13 +5040,43 @@ Private Sub UpdateWaitTelemetry(ByVal mode As waitMode, ByRef ctx As Dictionary)
         Case WaitMode_SpaIdle
             Dim idleTime As Double: idleTime = (socket_.NowMs() - CDbl(ctx("stableStart"))) / 1000
             Dim targetIdle As Double: targetIdle = CLng(ctx("minStableMs")) / 1000
-            
+
+            ' [Signal Gate] Types armed but not yet latched. Empty when the gate
+            ' is fully open OR nothing is armed (ungated waits behave as before).
+            ' NOTE: dom/vis seen-flags are set by EvaluateSpaIdleCondition, which
+            ' runs AFTER this telemetry in the poll loop, so a dom/vis hit clears
+            ' here one poll (~interval) late. The net flag is set during the event
+            ' drain earlier in the same poll, so net is reported without lag.
+            Dim sigPending As String: sigPending = BuildSignalPendingDesc()
+
+            ' A net hit sets m_sigNetSeen during the event drain, but the window
+            ' reset (stableStart) is applied one poll later in EvaluateSpaIdleCondition
+            ' (guarded by ctx("sigNetAcked")). In that gap idleTime still reflects the
+            ' PRE-hit quiet -> a spurious green "Stable" would flash between the amber
+            ' wait and the post-hit render window. Treat "net seen, reset not yet
+            ' acked" as still-synchronizing to suppress it (dom/vis latch and reset in
+            ' the same function, so they need no equivalent guard).
+            Dim netResetPending As Boolean
+            netResetPending = m_sigNetArmed And m_sigNetSeen
+            If netResetPending And ctx.Exists("sigNetAcked") Then netResetPending = Not CBool(ctx("sigNetAcked"))
+
             ' Determine HUD color and text based on STATE, not COUNTER.
             If idleTime < targetIdle Then
-                colorCode = "#FF4444" ' Red (Busy)
+                colorCode = "#FF4444" ' Red (Busy: DOM/network still churning)
+                Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Synchronizing..."
+            ElseIf Len(sigPending) > 0 Then
+                ' DOM window satisfied (would be green) but a completion signal has
+                ' NOT arrived: consensus is BLOCKED, not stable. Amber makes this
+                ' state -- previously indistinguishable from Stable -- visible, so a
+                ' frozen HUD pins the blocking phase by colour.
+                colorCode = "#FFAA00" ' Amber (Gated: awaiting signal)
+                Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Awaiting signal (" & sigPending & ")"
+            ElseIf netResetPending Then
+                ' Net hit latched but its window reset lands next poll: not stable yet.
+                colorCode = "#FF4444" ' Red (post-hit reset imminent)
                 Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Synchronizing..."
             Else
-                colorCode = "#00FF00" ' Green (Stable)
+                colorCode = "#00FF00" ' Green (Stable: gate open or ungated)
                 Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Stable"
             End If
     End Select

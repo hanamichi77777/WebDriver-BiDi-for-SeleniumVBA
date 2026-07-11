@@ -39,29 +39,44 @@ The validation code is contained in the `Main07` procedure.
 * **Edge / Chrome**
 * *Firefox is not supported due to functional limitations.*
 
+## Installation
+
+Setup and import instructions are available in the **[Wiki](https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA/wiki)**.
+
+## Scope and Limitations
+
+* **SPA completion is inferred, not guaranteed.** The default idle consensus is based on observed network activity, Fetch/XHR counters, DOM mutations, and a quiet window. It cannot prove the target application's internal logical completion or rule out future delayed work.
+* **Use explicit completion signals for important actions.** When a specific DOM rewrite or network response marks completion, arm `ArmContentSignal` and/or `ArmNetworkSignal` immediately before the action. A targeted signal is safer than relying on quietness alone.
+* **The WebSocket transport is synchronous.** In the rare case that the TCP connection remains open while the peer returns no frames, the underlying WinHTTP receive call may not return control to VBA, so VBA-side timeout logic cannot intervene.
+* **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
+* **Resource blocking changes page behavior.** `ExecuteEnableResourceBlocking` should be limited to resources known to be unnecessary. Blocking application code, authentication endpoints, or content APIs can break the target page.
+* **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
+* **The Global Shadow DOM Unlocker modifies page behavior.** It overrides `attachShadow` during the browser session so closed shadow roots can be exposed as open. Pages that intentionally depend on closed-shadow semantics may behave differently.
+* **Third-party sites can change without notice.** Selectors, network endpoints, Shadow DOM structures, and SPA behavior used by the samples may require updates after the target site changes.
+
 ---
 
 ## 📂 Procedure Overview (Sample Module: `BiDi_Sample`)
 
 ### 1. Main01: Enhanced Select Box & Extension Injection
 This procedure focuses on handling elements that trigger complex JavaScript state changes.
-* **Dynamic Extension Injection:** Utilizes the WebDriver BiDi `ExecuteWebExtensionInstall` command to load extensions directly into the browser session from a local path. This enables the runtime "bypass injection" of extensions without cluttering the system registry. *(Note: Please ensure that the Google Translate Chrome extension is installed on your PC in advance.)*
-* **Smart Selection:** Utilizes `ExecuteSelectValueByXPath`. This command can be configured to wait for the browser's "Idle" state immediately after selection, ensuring subsequent UI updates are fully rendered before proceeding.
+* **Dynamic Extension Injection:** Utilizes the WebDriver BiDi `ExecuteWebExtensionInstall` command to load extensions directly into the browser session from a local path. This enables session-scoped extension installation through WebDriver BiDi without permanently registering the extension in the browser profile or system registry. *(Note: Please ensure that the Google Translate Chrome extension is installed on your PC in advance.)*
+* **Smart Selection:** Utilizes `ExecuteSelectValueByXPath`. This command can be configured to wait for the browser's "Idle" state immediately after selection, allowing the monitored activity to reach a stable state before proceeding.
 
 ### 2. Main02: Auto-Scrolling for Lazy Load & Dynamic SPA Synchronization
 Designed for Single-Page Application (SPA) environments that utilize infinite scrolling (lazy loading) like note.com, this procedure ensures reliable interaction with elements dynamically added to the DOM.
 * **Inducing Dynamic Loads via Auto-Scrolling:** By using the ExecuteLazyLoadScroll method, the script repeatedly scrolls to the bottom of the page to forcefully trigger the loading of additional content (e.g., article lists).
 * **Full-Stack Idleness Monitoring:** After navigation and during scrolling, the script injects window.__vbaIdleProbe to monitor the browser's internal state.
-* **Real-Time Traffic Tracking & Synchronization:** The probe continuously tracks inflightXhrCount (active XHR requests) and inflightFetchCount (active Fetch requests). The VBA code waits for these counts to return to zero and for lastMutationTs (the timestamp of the final DOM mutation) to stabilize, guaranteeing that the dynamic feed has finished loading completely.
+* **Real-Time Traffic Tracking & Synchronization:** The probe continuously tracks inflightXhrCount (active XHR requests) and inflightFetchCount (active Fetch requests). The VBA code waits for these counts to return to zero and for lastMutationTs (the timestamp of the final observed DOM mutation) to stabilize, providing a practical indication that the currently observed loading activity has settled.
 
 ### 3. Main03: Performance Optimization via CDP-over-BiDi Bridge
-This procedure demonstrates how to make automation up to 5x faster by controlling the network layer using a hybrid protocol approach.
+This procedure demonstrates how resource blocking can significantly reduce page-loading overhead by controlling the network layer through a hybrid protocol approach.
 * **Hybrid Protocol Bridge:** Utilizes `ExecuteEnableResourceBlocking` to filter out heavy resources like ad scripts, analytics, and tracking beacons before navigation.
 * **Post-Navigation Idleness Probe:** Injects `window.__vbaIdleProbe` to ensure the environment is quiescent before entering data, maximizing execution speed and reliability.
 
 ### 4. Main04: Event-Driven URL Monitoring
 Bypasses the "flaky" nature of login redirections by moving away from polling.
-* **Event vs. Polling:** Uses `ExecuteIsUrlContains` to hook into the browser's internal navigation events. The script wakes up instantly the millisecond the URL matches the target, ensuring no time is wasted waiting for fixed intervals.
+* **Event vs. Polling:** Uses `ExecuteIsUrlContains` to hook into the browser's internal navigation events. The script reacts to matching navigation events without relying on a fixed sleep interval, avoiding unnecessary delay from coarse polling.
 
 ### 5. Main05: Asynchronous DOM Mutation & State Validation
 Focuses on synchronizing with elements that are delayed or generated via AJAX, ensuring the script does not outpace the UI updates.
@@ -81,7 +96,7 @@ Targeting heavy JavaScript platforms (e.g., ServiceNow), this procedure implemen
 ### 8. Main08: Heavy SPA Stress Test & Advanced Combobox Handling
 Designed as a stress test targeting highly reactive SPAs (e.g., Google Flights) to manage complex React/Wiz-controlled comboboxes and heavy background network traffic.
 * **Multi-Phase Input Synchronization:** Implements a robust, per-character input routine (`ExecuteInputValueByXPath`) that waits for field activation, detects React/Wiz double DOM replacements, and safely clears values to ensure dynamic suggestion dropdowns trigger correctly.
-* **Telemetry Noise Filtering:** Utilizes `AddIdleIgnoreNetworkPattern` to continuously ignore background tracking and telemetry requests (like `/log?` or `ogs.google.com`), allowing the internal idleness probe to accurately determine when the page is truly stable.
+* **Telemetry Noise Filtering:** Utilizes `AddIdleIgnoreNetworkPattern` to continuously ignore background tracking and telemetry requests (like `/log?` or `ogs.google.com`), allowing the internal idleness probe to more accurately estimate when relevant page activity has settled.
 * **Semantic ARIA Targeting:** Bypasses obfuscated class names and layout shifts by relying on W3C ARIA attributes (e.g., `@role='combobox'`, `@aria-label`) to reliably locate and interact with changing UI elements.
 
 ### 9. Main09: Discovery Log & Diagnostic Recording
@@ -100,7 +115,7 @@ This procedure demonstrates the completion-signal gate (`ArmContentSignal`), whi
 
 ---
 ### 🔗 External Links
-* [Midium - Article by hanamichi77777](https://medium.com/@hanamichi77777/webdriver-bidi-for-seleniumvba-ee4687887d03)
+* [Medium - Article by hanamichi77777](https://medium.com/@hanamichi77777/webdriver-bidi-for-seleniumvba-ee4687887d03)
 
 ### [Reference Materials]
 * **WebSocket communication related with VBA:** [ZeroInstall BrowserDriver for VBA (@kabkabkab)](https://qiita.com/kabkabkab/items/d187fd1622fede038cce)
