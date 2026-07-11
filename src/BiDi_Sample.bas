@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.2
+' Version: 2.3
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Foreground message box: declared with hWnd=0 (no owner) so the dialog is an

@@ -4,9 +4,7 @@
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
 
-It was developed based on **"ZeroInstall BrowserDriver for VBA"** by @kabkabkab, replacing the original CDP-based connection with WebDriver BiDi over WebSocket communication.
-
-This project is not intended to replace SeleniumVBA, Playwright, Puppeteer, or Selenium itself.  
+It is not intended to replace SeleniumVBA, Playwright, Puppeteer, or Selenium itself.  
 Instead, it focuses on extending SeleniumVBA with WebDriver BiDi capabilities, especially for modern third-party SPA sites where no explicit completion signal is available.
 
 Modern SPAs such as React, Vue.js, and enterprise web applications often update the DOM asynchronously after network responses have completed. This makes traditional VBA automation fragile, because "request completed" does not always mean "page is ready."

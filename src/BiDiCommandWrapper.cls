@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.2
+' Version: 2.3
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -270,7 +270,10 @@ End Sub
 ' METHOD: ConnectTo
 '  Connects to the WebSocket and subscribes to prompt events.
 Public Sub ConnectTo(ByVal webSocketUrl As String)
-    Me.ClearState
+    ' INVARIANT: validate BEFORE ClearState. Wiping Wrapper state first and only then
+    ' discovering the URL is empty (or the socket is already connected) would leave the
+    ' Wrapper cleared while the live socket/browser keeps its real subscriptions --
+    ' a transport/Wrapper desync. All fail-fast checks therefore precede ClearState.
     
     ' WHY: fail fast on an empty URL. The most common cause is forgetting to call
     ' caps.EnableBiDiMode before OpenBrowser, which leaves GetWebSocketUrl empty.
@@ -279,6 +282,15 @@ Public Sub ConnectTo(ByVal webSocketUrl As String)
             "webSocketUrl is empty. Call caps.EnableBiDiMode BEFORE driver.OpenBrowser, " & _
             "then pass driver.GetWebSocketUrl to ConnectTo."
     End If
+    
+    ' Already-connected guard: reconnecting over a live socket would ClearState while
+    ' the socket stays up (Connect() returns False on StateConnected/Connecting).
+    If socket_.State = StateConnected Or socket_.State = StateConnecting Then
+        Err.Raise ERR_CONNECT_FAILED, "BiDiCommandWrapper:ConnectTo", _
+            "The BiDi socket is already connected. Call Shutdown before reconnecting."
+    End If
+    
+    Me.ClearState
 
     ' WHY: AttemptAutoConnect returns False on failure instead of raising, so the
     ' result must be checked here; otherwise failure surfaces later inside the first
@@ -605,18 +617,25 @@ Public Function ExecuteCreateContext(Optional ByVal createType As BiDiContextTyp
     params.Add "type", typeStr
     
     Dim strRes As String
-    strRes = ExecuteBiDiCommand("browsingContext.create", params)
+    strRes = ExecuteBiDiCommand("browsingContext.create", params, allowAmbiguousRetry:=False)
     
-    ' Parse once and extract ID using the new path getter
+    ' Validate + parse: surface a create error JSON instead of returning "".
     Dim json As Object
-    Set json = WebJsonConverter.ParseJson(strRes)
+    Set json = ValidateProtocolResponse(strRes, "browsingContext.create")
     ExecuteCreateContext = GetPathString(json, "result.context")
 End Function
 
 Public Function ExecuteCloseContext(ByVal contextId As String) As String
     Dim params As New Dictionary
     params.Add "context", contextId
-    ExecuteCloseContext = ExecuteBiDiCommand("browsingContext.close", params)
+    Dim closeRes As String
+    closeRes = ExecuteBiDiCommand("browsingContext.close", params, _
+                                  allowAmbiguousRetry:=False, allowRecoveryRetry:=False)
+    ' Validate BEFORE ClearState: a close that returned an error JSON must NOT wipe
+    ' Wrapper state (main context / caches / subscriptions / CDP) while the tab is
+    ' still alive, which would desync the Wrapper from the live socket/browser.
+    ValidateProtocolResponse closeRes, "browsingContext.close"
+    ExecuteCloseContext = closeRes
     If contextId = m_mainContextId Then ClearState
 End Function
 
@@ -637,7 +656,8 @@ Public Function ExecuteHandleUserPrompt(ByVal Accept As Boolean, Optional ByVal 
     If Len(userText) > 0 Then params.Add "userText", userText
 
     On Error Resume Next
-    ExecuteHandleUserPrompt = ExecuteBiDiCommand("browsingContext.handleUserPrompt", params)
+    ExecuteHandleUserPrompt = ExecuteBiDiCommand("browsingContext.handleUserPrompt", params, _
+                                allowAmbiguousRetry:=False, allowContextRetarget:=(targetCtx = m_mainContextId))
     Dim capturedErr As Long: capturedErr = Err.Number
     Dim capturedDesc As String: capturedDesc = Err.description
     Dim capturedSrc As String: capturedSrc = Err.source
@@ -719,34 +739,49 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     Else: modeStr = "none"
     End If
 
+    Dim navigationAccepted As Boolean: navigationAccepted = False
+    Dim commandFailed As Boolean
     For attempt = 0 To MAX_NAV_RETRIES
         isNavigated = False
+        commandFailed = False
         
-        ' --- PHASE A: Navigation Command ---
-        On Error Resume Next
-        Call ExecuteBrowsingContextNavigate(targetUrl, modeStr, vMinStable, vMaxTimeout, targetCtx)
-        Dim navErr As Long: navErr = Err.Number
-        Dim navDesc As String: navDesc = Err.description
-        Dim navSrc As String: navSrc = Err.source
-        On Error GoTo 0
-        
-        ' CONSENSUS HALT is a deliberate stop signal: never absorb it into the
-        ' retry loop. vbObjectError-based codes are negative, so it would slip
-        ' past the >= 600 check below and be retried as a re-navigation.
-        If navErr = ERR_CONSENSUS_HALT Then
-            Err.Raise navErr, navSrc, navDesc
+        ' --- PHASE A: Navigation Command (issued ONCE) ---
+        ' Once the navigate has committed, retries redo ONLY the PHASE B verification
+        ' below; the navigate is never re-sent, so a transient verify failure can no
+        ' longer re-execute a navigation that already succeeded.
+        If Not navigationAccepted Then
+            On Error Resume Next
+            Call ExecuteBrowsingContextNavigate(targetUrl, modeStr, vMinStable, vMaxTimeout, targetCtx)
+            Dim navErr As Long: navErr = Err.Number
+            Dim navDesc As String: navDesc = Err.description
+            Dim navSrc As String: navSrc = Err.source
+            On Error GoTo 0
+            
+            ' CONSENSUS HALT is a deliberate stop signal: never absorb it.
+            If navErr = ERR_CONSENSUS_HALT Then
+                Err.Raise navErr, navSrc, navDesc
+            End If
+            
+            ' Fatal socket / ambiguous-outcome errors (600+) must not be retried.
+            If navErr >= 600 Then
+                ExecuteNavigateAndGetStatus = "500"
+                Exit Function
+            End If
+            
+            If navErr = 0 Then
+                ' Navigate committed. From here only verification is retried.
+                navigationAccepted = True
+            Else
+                ' navErr in (1..599, non-HALT): the navigate command itself did not
+                ' commit, so a genuine re-navigate on the next attempt is warranted.
+                commandFailed = True
+            End If
         End If
         
-        ' Fatal socket errors (600+) should not be retried
-        If navErr >= 600 Then
-            ExecuteNavigateAndGetStatus = "500"
-            Exit Function
-        End If
-        
-        If navErr = 0 Then
-            ' --- PHASE B: Liveness Verification ---
+        If Not commandFailed Then
+            ' --- PHASE B: Liveness Verification (retryable, no re-navigation) ---
             If Not waitNetworkIdle Then
-                ' Mode "none": Perform quick URL validation since the protocol returns immediately.
+                ' Mode "none": quick URL validation since the protocol returns immediately.
                 On Error Resume Next
                 Dim curUrl As String: curUrl = GetCurrentUrl(targetCtx, True)
                 On Error GoTo 0
@@ -754,17 +789,17 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
                     isNavigated = True
                 End If
             Else
-                ' Mode "complete": Success is implied by a zero navErr after stability sync.
+                ' Mode "complete": success is implied by a committed navigate + best-effort settle.
                 isNavigated = True
             End If
-        End If
-        
-        If isNavigated Then
-            ExecuteNavigateAndGetStatus = "200"
-            Exit Function
+            
+            If isNavigated Then
+                ExecuteNavigateAndGetStatus = "200"
+                Exit Function
+            End If
         End If
 
-        ' Wait for the environment to settle before retry
+        ' Wait for the environment to settle before re-verifying.
         WaitHeartbeat 1000
     Next attempt
     
@@ -981,7 +1016,7 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
             strRes = ExecuteBiDiCommand("session.subscribe", params, Silent)
             lastRes = strRes
 
-            subId = GetPathString(WebJsonConverter.ParseJson(strRes), "result.subscription")
+            subId = GetPathString(ValidateProtocolResponse(strRes, "session.subscribe"), "result.subscription")
             If subId <> "" Then
                 For i = 0 To UBound(finalArr)
                     m_activeSubscriptions(finalArr(i) & ctxId) = subId
@@ -1022,8 +1057,14 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
     params.Add "url", url
     params.Add "wait", bidiWaitLevel
     
+    ' Context-retarget policy: permit recovery to retarget to the refreshed MAIN only
+    ' when this navigation is main-directed. An explicit non-main target (child tab /
+    ' iframe / popup) must never be retargeted, or a context-lost recovery would drive
+    ' the surviving main tab to the wrong URL.
+    Dim allowRetarget As Boolean: allowRetarget = (targetCtx = m_mainContextId)
     Dim strRes As String
-    strRes = ExecuteBiDiCommand("browsingContext.navigate", params, allowAmbiguousRetry:=False)
+    strRes = ExecuteBiDiCommand("browsingContext.navigate", params, _
+                                allowAmbiguousRetry:=False, allowContextRetarget:=allowRetarget)
     Dim navJson As Object: Set navJson = ValidateProtocolResponse(strRes, "browsingContext.navigate")
 
     ' WHY: cross-origin CDP session invalidation.
@@ -1046,18 +1087,35 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
         End If
     End If
 
-    ' Stability Consensus Phase
+    ' Stability Consensus Phase (BEST-EFFORT).
+    ' INVARIANT: the navigate command already committed above, so a failure in the
+    ' post-navigate settle must NOT be reported as a navigation failure -- otherwise
+    ' ExecuteNavigateAndGetStatus would re-send a navigation that already succeeded
+    ' (double download / one-time-URL reuse / duplicate SPA init). Only ERR_CONSENSUS_HALT
+    ' propagates (a network that never settles is a loud stop); every other settle error
+    ' is swallowed, mirroring TrySyncPhase's best-effort contract.
     If LCase(waitMode) = "complete" Then
-        ' Wait for the URL and document state to settle
+        On Error GoTo SettleErr
         Me.WaitForUrlStability targetCtx, 1000, maxTimeoutMs
-        
-        ' Refresh the context tree to ensure mainContextId reflects the current document
         UpdateMainContextId True, True
-        
-        ' Perform deep SPA synchronization
         WaitForNetworkIdleSpa minStableMs, maxTimeoutMs, targetCtx
+        On Error GoTo 0
     End If
     
+    ExecuteBrowsingContextNavigate = strRes
+    Exit Function
+
+SettleErr:
+    If Err.Number = ERR_CONSENSUS_HALT Then
+        Dim haltNum As Long: haltNum = Err.Number
+        Dim haltSrc As String: haltSrc = Err.source
+        Dim haltDesc As String: haltDesc = Err.description
+        On Error GoTo 0
+        Err.Raise haltNum, haltSrc, haltDesc
+    End If
+    ' Navigate committed; the settle failure is advisory only.
+    If m_debugMode Then Debug.Print "BiDi: navigate settle best-effort skip: " & Err.description
+    On Error GoTo 0
     ExecuteBrowsingContextNavigate = strRes
 End Function
 
@@ -1263,7 +1321,10 @@ Private Function PerformSetFiles(ByVal contextId As String, _
     
     ' Dispatch via the standard wrapper (gets retry / context recovery for free).
     Dim strRes As String
-    strRes = ExecuteBiDiCommand("input.setFiles", params, allowAmbiguousRetry:=False)
+    strRes = ExecuteBiDiCommand("input.setFiles", params, _
+                                allowAmbiguousRetry:=False, allowContextRetarget:=(contextId = m_mainContextId))
+    ' Validate: a setFiles error JSON must not pass as success into the SPA wait.
+    ValidateProtocolResponse strRes, "input.setFiles"
     
     ' Optional: wait for the page to settle after the attachment registers
     '    (file picker close, network probe for inline upload, etc.).
@@ -1342,7 +1403,11 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
 
     ' Dispatch via the standard wrapper (gets retry / context recovery for free).
     Dim strRes As String
-    strRes = ExecuteBiDiCommand("input.performActions", params, allowAmbiguousRetry:=False)
+    strRes = ExecuteBiDiCommand("input.performActions", params, _
+                                allowAmbiguousRetry:=False, allowContextRetarget:=(contextId = m_mainContextId))
+    ' A protocol error JSON is returned as-is by ExecuteBiDiCommand (only context-lost
+    ' is a failure), so validate before treating the key input as applied.
+    ValidateProtocolResponse strRes, "input.performActions"
 
     ' Optional: wait for the page to settle after the input burst.
     If waitNetworkIdle Then
@@ -1404,11 +1469,16 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
         Dim tcErrNum As Long, tcErrDesc As String, tcErrSrc As String
         On Error Resume Next
         Err.Clear
-        res = ExecuteBiDiCommand("input.performActions", params, allowAmbiguousRetry:=False)
+        res = ExecuteBiDiCommand("input.performActions", params, _
+                                 allowAmbiguousRetry:=False, allowContextRetarget:=(contextId = m_mainContextId))
         tcErrNum = Err.Number: tcErrDesc = Err.description: tcErrSrc = Err.source
         trustedOk = (tcErrNum = 0)
         On Error GoTo 0
         If trustedOk Then
+            ' ExecuteBiDiCommand only treats context-lost as failure, so a
+            ' performActions error JSON would otherwise pass as a successful click.
+            ' ValidateProtocolResponse raises on non-ignorable protocol errors.
+            ValidateProtocolResponse res, "input.performActions"
             If m_debugMode Then Debug.Print "BiDi: TRUSTED click (on-target)."
             PerformTrustedClick = res
             Exit Function
@@ -1534,7 +1604,8 @@ Private Function ExecuteBrowsingContextLocateNodes(ByVal xpath As String, _
     params.Add "context", targetCtx: params.Add "locator", locator
     
     ' Pass Silent flag down
-    ExecuteBrowsingContextLocateNodes = ExecuteBiDiCommand("browsingContext.locateNodes", params, Silent)
+    ExecuteBrowsingContextLocateNodes = ExecuteBiDiCommand("browsingContext.locateNodes", params, Silent, _
+                                allowContextRetarget:=(targetCtx = m_mainContextId))
 End Function
 
 ' [INTERNAL] GetFindElementSharedIdByXPath
@@ -1625,7 +1696,7 @@ Public Function ExecuteWebExtensionInstall(ByVal extensionPath As String) As Str
     extData.Add "type", "path"
     extData.Add "path", extensionPath
     params.Add "extensionData", extData
-    ExecuteWebExtensionInstall = ExecuteBiDiCommand("webExtension.install", params)
+    ExecuteWebExtensionInstall = ExecuteBiDiCommand("webExtension.install", params, allowAmbiguousRetry:=False)
 End Function
 
 ' [PUBLIC] ExecuteShadowClick
@@ -1742,7 +1813,9 @@ End Function
 Private Function ExecuteBiDiCommand(ByVal method As String, _
                                      ByRef params As Dictionary, _
                                      Optional ByVal Silent As Boolean = False, _
-                                     Optional ByVal allowAmbiguousRetry As Boolean = True) As String
+                                     Optional ByVal allowAmbiguousRetry As Boolean = True, _
+                                     Optional ByVal allowRecoveryRetry As Boolean = True, _
+                                     Optional ByVal allowContextRetarget As Boolean = True) As String
     
     ' Guard: Ensure the communication socket is available.
     If socket_ Is Nothing Then Err.Raise 91, "ExecuteBiDiCommand", "Socket object is not set."
@@ -1791,12 +1864,31 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
         If localErrNum = ERR_ACTION_FAILED Then Exit Do
 
         ' --- AMBIGUOUS-OUTCOME GUARD (non-idempotent callers pass allowAmbiguousRetry:=False) ---
-        ' A soft timeout (604) or connection-loss (600) means the command was SENT but its
-        ' outcome is unknown -- the browser may have already executed it. Re-sending would
-        ' risk a DOUBLE action (click / keystroke / navigation), so stop and propagate.
-        ' Context-lost (ERR_BIDI_PROTOCOL) and send-failures (601) are deliberately NOT
-        ' covered: they prove the action did not run, so their recovery retry stays intact.
-        If Not allowAmbiguousRetry And IsAmbiguousOutcome(localErrNum) Then Exit Do
+        ' A soft timeout (604), connection-loss (600), send-failure (601) or Safety-Shell
+        ' timeout (517) all mean the command was SENT but its outcome is unknown -- the
+        ' browser may have already executed it (all four are in IsAmbiguousOutcome).
+        ' Context-lost (ERR_BIDI_PROTOCOL) is ALSO ambiguous for a state-changing op: a
+        ' click / navigate can SUCCEED and thereby destroy its own document / Realm /
+        ' context, so a context-lost response does NOT prove the action did not run.
+        ' Re-sending any of these risks a DOUBLE action, so non-idempotent callers stop
+        ' and propagate. Idempotent callers (allowAmbiguousRetry:=True) keep self-healing
+        ' on context-lost through the recovery block below.
+        If Not allowAmbiguousRetry And _
+           (IsAmbiguousOutcome(localErrNum) Or localErrNum = ERR_BIDI_PROTOCOL) Then Exit Do
+
+        ' --- RECOVERY-RETRY GUARD (non-retargetable callers pass allowRecoveryRetry:=False) ---
+        ' browsingContext.close targets a SPECIFIC context that is being destroyed. The
+        ' recovery block below rewrites params("context") to the refreshed MAIN context,
+        ' so ANY retry -- ambiguous (604/600) OR context-lost (ERR_BIDI_PROTOCOL) -- would
+        ' re-issue the command against the WRONG context (e.g. close the surviving tab).
+        ' Callers that must never be retargeted disable recovery retry entirely.
+        If Not allowRecoveryRetry Then Exit Do
+
+        ' --- CONTEXT-RETARGET GUARD (explicit non-main callers pass allowContextRetarget:=False) ---
+        ' If retargeting to MAIN is forbidden and the failure is a context-lost, both
+        ' options are wrong: retrying hits the same dead context, and retargeting would
+        ' hijack the surviving main tab. Stop and surface the error to the caller.
+        If Not allowContextRetarget And localErrNum = ERR_BIDI_PROTOCOL Then Exit Do
 
         ' --- RECOVERY LOGIC ---
         ' If we haven't exhausted our retries, attempt to heal the environment.
@@ -1832,7 +1924,9 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
             
             ' If context refresh succeeded, update the IDs within the original 'params' dictionary.
             If recoveryErr = 0 Then
-                If m_mainContextId <> "" Then Call UpdateContextAndRealm(params, m_mainContextId)
+                ' Retarget params("context") to the refreshed MAIN only when permitted.
+                ' Explicit non-main targets keep their original context (see guard above).
+                If m_mainContextId <> "" And allowContextRetarget Then Call UpdateContextAndRealm(params, m_mainContextId)
                 m_isRecovering = False
                 retryCount = retryCount + 1
             Else
@@ -2079,7 +2173,8 @@ Private Function GetScriptRealmId(Optional ByVal contextId As String = "", _
     Dim jsonRes As String
     On Error Resume Next
     ' RELAY: Pass the Silent flag to suppress REQ/RES logs for realm discovery
-    jsonRes = ExecuteBiDiCommand("script.getRealms", params, Silent)
+    jsonRes = ExecuteBiDiCommand("script.getRealms", params, Silent, _
+                                allowContextRetarget:=(targetCtx = m_mainContextId))
     Dim realmErr As Long: realmErr = Err.Number
     Dim realmErrDesc As String: realmErrDesc = Err.description
     On Error GoTo 0
@@ -2190,7 +2285,7 @@ Public Sub ExecuteRegisterAutoClickerByXPath(ByVal xpath As String, _
     Dim params As New Dictionary: params.Add "functionDeclaration", sourceJs
     
     ' Execute silently. Returns "" on failure; script ID on success.
-    Dim strRes As String: strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True)
+    Dim strRes As String: strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True, allowAmbiguousRetry:=False)
     Dim scriptId As String
     scriptId = GetPathString(WebJsonConverter.ParseJson(strRes), "result.script")
     
@@ -2412,15 +2507,23 @@ End Sub
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
     If seconds <= 0 Then Exit Sub
 
-    ' --- UI LOCKING ---
-    ' Disable user interaction to prevent entering "Cell Edit Mode" during recording.
-    Application.Interactive = False
-    Application.Cursor = xlWait
+    ' INVARIANT: arm the error handler and validate the socket BEFORE locking the UI.
+    ' If socket_ is Nothing (e.g. after Shutdown), socket_.NowMs() raises error 91; with
+    ' the handler armed first and no UI lock yet, ErrorHandler -> Cleanup restores the UI
+    ' (Application.Interactive = True) instead of leaving Excel permanently unusable.
+    On Error GoTo ErrorHandler
+
+    If socket_ Is Nothing Then
+        Err.Raise 91, "BiDi:RecordEventsForSeconds", "Socket object is not available."
+    End If
 
     Dim startMs As Double: startMs = socket_.NowMs()
     Dim durationMs As Double: durationMs = CDbl(seconds) * 1000#
 
-    On Error GoTo ErrorHandler
+    ' --- UI LOCKING ---
+    ' Disable user interaction to prevent entering "Cell Edit Mode" during recording.
+    Application.Interactive = False
+    Application.Cursor = xlWait
 
     Do While (socket_.NowMs() - startMs) < durationMs
         ' Process the incoming WebSocket message queue
@@ -3641,7 +3744,8 @@ Private Sub StartSpaIdleProbe(Optional ByVal contextId As String = "")
     p.Add "awaitPromise", False
 
     ' Execute the injection silently
-    Call ExecuteBiDiCommand("script.evaluate", p, True)
+    Call ExecuteBiDiCommand("script.evaluate", p, True, _
+                            allowContextRetarget:=(targetCtx = m_mainContextId))
 End Sub
 
 ' JavaScript Error Decoder (Enhanced Debugging)
@@ -3735,7 +3839,7 @@ End Function
 '         keystroke AFTER we stop waiting -- re-running would double the action.
 Private Function IsAmbiguousOutcome(ByVal errNum As Long) As Boolean
     Select Case errNum
-        Case 604, 600, 517
+        Case 604, 601, 600, 517
             IsAmbiguousOutcome = True
     End Select
 End Function
@@ -3819,7 +3923,7 @@ Private Function GetActionJs(ByVal actionType As String) As String
             ' wrapper is a function expression (BiDi executes it). Cf. ShadowUnlocker.
             js = js & "function(){const x={{XPATH}},t={{TIMEOUT}},s=Date.now();"
             js = js & "const f=()=>{const e=document.evaluate(x,document,null,9,null).singleNodeValue;"
-            js = js & "if(e&&(e.offsetWidth>0||e.offsetHeight>0)){e.click();e.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
+            js = js & "if(e&&(e.offsetWidth>0||e.offsetHeight>0)){e.click();"
             js = js & "console.log('BiDi-AutoClicker: Target clicked');return 1}return 0};"
             js = js & "if(f())return;const o=new MutationObserver(()=>{if(f()||(Date.now()-s>t))o.disconnect()});"
             js = js & "o.observe(document.body||document,{childList:1,subtree:1,attributes:1});}"
@@ -3909,7 +4013,8 @@ Public Function CallScript(ByVal js As String, _
     params.Add "awaitPromise", True
     
     ' Execute command with the Silent flag
-    Dim rawRes As String: rawRes = ExecuteBiDiCommand("script.callFunction", params, Silent, allowAmbiguousRetry)
+    Dim rawRes As String: rawRes = ExecuteBiDiCommand("script.callFunction", params, Silent, allowAmbiguousRetry, _
+                                allowContextRetarget:=(resolvedCtx = m_mainContextId))
     Dim json As Object: Set json = ValidateProtocolResponse(rawRes, "script.callFunction")
     Dim procObj As Object: Set procObj = UnwrapSafetyShell(json, "script.callFunction")
     CallScript = WebJsonConverter.ConvertToJson(procObj)
@@ -5014,7 +5119,7 @@ Public Function ExecuteEnableGlobalShadowUnlocker() As String
     params.Add "functionDeclaration", js
 
     ' Execute command silently. GetPathString handles empty/error results gracefully.
-    Dim strRes As String: strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True)
+    Dim strRes As String: strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True, allowAmbiguousRetry:=False)
     ExecuteEnableGlobalShadowUnlocker = GetPathString(WebJsonConverter.ParseJson(strRes), "result.script")
     
     If m_debugMode And ExecuteEnableGlobalShadowUnlocker <> "" Then

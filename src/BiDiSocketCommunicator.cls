@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.2
+' Version: 2.3
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -133,8 +133,6 @@ Private Const MAX_BUFFER_SIZE As Long = 10485760 ' 10MB
 Private Const DEFAULT_TIMEOUT_MS As Long = 30000
 Private Const DEFAULT_POLLING_INTERVAL_MS As Long = 100
 Private Const KEEPALIVE_INTERVAL_MS As Long = 15000
-Private Const HEARTBEAT_INTERVAL_MS As Long = 20000
-Private Const ENABLE_HEARTBEAT_LOGGING As Boolean = True
 
 ' --- State & Handle Variables ---
 Private hSession_ As LongPtr
@@ -154,7 +152,6 @@ Private m_isReadingSince As Double ' Tracks the timestamp of the last read lock
 Private m_discardActive As Boolean ' TRUE iff m_InStream holds a partially-discarded oversized message (persists across ReadFromWire calls; cleared only where m_InStream is truncated)
 Private m_isSendReceiving As Boolean ' True when a command sequence is active
 Private m_isRecovering As Boolean ' Re-entrancy lock for AttemptRecovery
-Private m_lastHeartbeatLogTime As Double ' Throttles heartbeat logging cadence
 
 Public Enum BiDiSocketState
     StateDisconnected = 0
@@ -661,9 +658,8 @@ Private Sub InternalCleanup()
         End If
     End If
     
-    ' Reset module-scoped semaphores and throttle state.
+    ' Reset module-scoped semaphores and latches.
     m_isRecovering = False
-    m_lastHeartbeatLogTime = 0
     m_discardActive = False ' input stream truncated above: drop any partial-discard latch
     
     On Error GoTo 0
@@ -919,18 +915,10 @@ Public Function GetMessage() As String
     m_lastPollTime = nowT
 
     ' [SMART HEARTBEAT]
-    ' Send a ping, but throttle LOG output to every 20 seconds.
-    ' This keeps the pipe open at 100ms speed without the console spam.
-    Dim isLoggingTime As Boolean
-    isLoggingTime = (nowT - m_lastHeartbeatLogTime >= HEARTBEAT_INTERVAL_MS Or m_lastHeartbeatLogTime = 0)
-    
+    ' Send a silent keep-alive ping every poll cycle to hold the pipe open at
+    ' 100ms cadence. The pong is swallowed below; no console/file logging.
     Dim pingId As Long: pingId = GetNextSystemPingId()
     Dim pingCmd As String: pingCmd = "{""id"":" & pingId & ", ""method"":""session.status"", ""params"":{}}"
-
-    If ENABLE_HEARTBEAT_LOGGING And isLoggingTime Then
-        m_lastHeartbeatLogTime = nowT
-        Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [HB-REQ] session.status (Keep-alive active)"
-    End If
 
     If Not SendMessage(pingCmd) Then Exit Function
 
@@ -945,12 +933,8 @@ Public Function GetMessage() As String
         ' Reserved band: heartbeat pong (rotating [3..99]) or PostScript reply (2).
         ' All are swallowed so they never reach the recorder/event stream.
         If inId <> CStr(POST_SCRIPT_REPLY_ID) Then
-            ' Heartbeat pong: connection proven healthy.
+            ' Heartbeat pong: connection proven healthy -> clear any retry backoff.
             If m_RetryCount > 0 Then m_RetryCount = 0
-            ' Only log the response if we logged the request
-            If ENABLE_HEARTBEAT_LOGGING And isLoggingTime Then
-                Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [HB-RES] session.status (Connection healthy)"
-            End If
         End If
         GetMessage = ""
     Else
