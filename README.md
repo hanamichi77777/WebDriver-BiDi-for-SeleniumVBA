@@ -15,14 +15,16 @@ Since this project assumes concurrent use of classic SeleniumVBA methods and BiD
 
 ## Discovery Log
 
-The Discovery Log is designed for third-party SPA sites where the automation code cannot access an internal "ready" or "completed" flag.
+The Discovery Log is designed for third-party SPA sites where the automation code cannot access an internal “ready” or “completed” flag.
 
-It records network responses, DOM mutation bursts, suppressed background noise, and stability margins such as `slackMs`.
+It records network responses, DOM mutation bursts, suppressed background noise, and stability margins such as slackMs.
 
 This makes it easier to determine which requests should be tracked, which requests should be ignored, which resources may be safely blocked, and whether the current wait thresholds are appropriate for the target site.
 
-In other words, the Discovery Log is not just an execution log.  
-It is a diagnostic tool for discovering what should be waited for when automating unknown third-party SPAs.
+The structured log can also be provided to an AI assistant for analysis. By examining the sequence and timing of network activity, DOM updates, and stability decisions, the AI can help identify likely completion signals, recommend suitable network or content signals to arm, suggest noise-filtering or resource-blocking rules, and propose adjustments to the wait strategy.
+
+In other words, the Discovery Log is not just an execution log.
+It is a diagnostic tool for discovering what should be waited for—and for helping AI devise practical synchronization solutions—when automating unknown third-party SPAs.
 
 ## Validation Benchmark
 
@@ -51,7 +53,6 @@ Setup and import instructions are available in the **[Wiki](https://github.com/h
 * **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
 * **Resource blocking changes page behavior.** `ExecuteEnableResourceBlocking` should be limited to resources known to be unnecessary. Blocking application code, authentication endpoints, or content APIs can break the target page.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
-* **The Global Shadow DOM Unlocker modifies page behavior.** It overrides `attachShadow` during the browser session so closed shadow roots can be exposed as open. Pages that intentionally depend on closed-shadow semantics may behave differently.
 
 ---
 
@@ -102,7 +103,6 @@ Designed as a stress test targeting highly reactive SPAs (e.g., Google Flights) 
 A specialized tool for reverse-engineering and debugging complex automation scenarios.
 * **Event Stream:** Uses `StartDiscoveryLog` to capture a raw feed of every browser event, including network requests, console logs, and DOM changes (with an option to exclude image/css noise).
 * **Analysis:** Records activity using `RecordEventsForSeconds` for a specified duration and saves it via `StopAndSaveDiscoveryLog` for post-mortem analysis.
- >💡 **Tip:** By providing this log to an AI, you can identify **noisy request URLs** and get recommendations for the **optimal idle time**.
 
 ### 10. Main10: Completion-Signal Gate & Bridging the Settle-to-Render Gap
 This procedure demonstrates the completion-signal gate (`ArmContentSignal`), which injects the operator's knowledge of "what marks done" into the idle consensus — closing the class of failures where an XHR settles quickly but the corresponding DOM paint lands noticeably later.
@@ -110,7 +110,6 @@ This procedure demonstrates the completion-signal gate (`ArmContentSignal`), whi
 * **One-Shot Consumption:** Each armed signal is consumed exactly once at wait end, so it never leaks into an unrelated subsequent wait. This is why the sample re-arms before every click: one signal, one wait.
 * **Fail-Fast Arming:** `ArmContentSignal` raises immediately if the declared target does not exist at arm time, so a mistyped XPath surfaces as an instant error instead of a silently meaningless wait.
 * **Noise Filtering as a Prerequisite:** Registers background telemetry (`cdn-cgi/rum`, Facebook tracking) with `AddIdleIgnoreNetworkPattern` first, so the consensus engine judges idleness only from traffic that actually matters.
-* **Pre-Navigation Recording:** Starts the Discovery Log before navigation to capture initial-load diagnostics. The receive-side `MaxIncomingSize` cap (tunable via `GetSocket.MaxIncomingSize`, default 2 MB) guards against event-flood freezes if oversized messages appear on heavy pages.
 
 ---
 ### 🔗 External Links
