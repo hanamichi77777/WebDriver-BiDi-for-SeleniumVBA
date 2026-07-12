@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.4
+' Version: 2.5
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -730,6 +730,9 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     Dim vMaxTimeout As Long: vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim attempt As Long
+    ' MAX_NAV_RETRIES bounds total navigate attempts. A COMMITTED navigate is never
+    ' re-sent; re-navigation happens only for provable non-commit transport failures
+    ' (IsRetryableNavFailure). In mode "none" it also bounds the liveness re-check.
     Const MAX_NAV_RETRIES As Long = 2
     
     Dim isNavigated As Boolean
@@ -740,15 +743,13 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     End If
 
     Dim navigationAccepted As Boolean: navigationAccepted = False
-    Dim commandFailed As Boolean
     For attempt = 0 To MAX_NAV_RETRIES
         isNavigated = False
-        commandFailed = False
         
-        ' --- PHASE A: Navigation Command (issued ONCE) ---
-        ' Once the navigate has committed, retries redo ONLY the PHASE B verification
-        ' below; the navigate is never re-sent, so a transient verify failure can no
-        ' longer re-execute a navigation that already succeeded.
+        ' --- PHASE A: Navigation Command ---
+        ' Re-sent only for explicitly classified network failures (IsRetryableNavFailure).
+        ' Once accepted, it is never re-sent, so a transient PHASE B verify failure can
+        ' no longer re-execute a navigation that already succeeded.
         If Not navigationAccepted Then
             On Error Resume Next
             Call ExecuteBrowsingContextNavigate(targetUrl, modeStr, vMinStable, vMaxTimeout, targetCtx)
@@ -762,45 +763,52 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
                 Err.Raise navErr, navSrc, navDesc
             End If
             
-            ' Fatal socket / ambiguous-outcome errors (600+) must not be retried.
-            If navErr >= 600 Then
+            ' A committed navigation is never re-sent. Selected Chromium network
+            ' failures that normally indicate no usable document was committed may be
+            ' retried under the navigation-recovery policy below. These failures do NOT
+            ' prove the server received no request or performed no processing: the reset
+            ' can occur after the request was sent. This retry is therefore intended for
+            ' ordinary page navigation, NOT one-time or side-effecting URLs. Gated by
+            ' MESSAGE, not Err.Number, because ERR_BIDI_PROTOCOL cannot separate a
+            ' network failure from a post-commit context loss.
+            If navErr <> 0 Then
+                If IsRetryableNavFailure(navDesc) Then
+                    WaitHeartbeat 1000
+                    GoTo NextNavAttempt   ' re-navigate next iteration (not accepted yet)
+                End If
+                ' Every other error is terminal: Err.Number alone cannot prove the
+                ' browser failed to accept or begin the navigation; re-sending an
+                ' ambiguous / post-commit failure risks a double navigation.
                 ExecuteNavigateAndGetStatus = "500"
                 Exit Function
             End If
             
-            If navErr = 0 Then
-                ' Navigate committed. From here only verification is retried.
-                navigationAccepted = True
-            Else
-                ' navErr in (1..599, non-HALT): the navigate command itself did not
-                ' commit, so a genuine re-navigate on the next attempt is warranted.
-                commandFailed = True
-            End If
+            ' Navigate committed. From here only PHASE B verification is retried.
+            navigationAccepted = True
         End If
         
-        If Not commandFailed Then
-            ' --- PHASE B: Liveness Verification (retryable, no re-navigation) ---
-            If Not waitNetworkIdle Then
-                ' Mode "none": quick URL validation since the protocol returns immediately.
-                On Error Resume Next
-                Dim curUrl As String: curUrl = GetCurrentUrl(targetCtx, True)
-                On Error GoTo 0
-                If Not (InStr(1, curUrl, "chrome-error", vbTextCompare) > 0 Or curUrl = "") Then
-                    isNavigated = True
-                End If
-            Else
-                ' Mode "complete": success is implied by a committed navigate + best-effort settle.
+        ' --- PHASE B: Liveness Verification (retryable, no re-navigation) ---
+        If Not waitNetworkIdle Then
+            ' Mode "none": quick URL validation since the protocol returns immediately.
+            On Error Resume Next
+            Dim curUrl As String: curUrl = GetCurrentUrl(targetCtx, True)
+            On Error GoTo 0
+            If Not (InStr(1, curUrl, "chrome-error", vbTextCompare) > 0 Or curUrl = "") Then
                 isNavigated = True
             End If
-            
-            If isNavigated Then
-                ExecuteNavigateAndGetStatus = "200"
-                Exit Function
-            End If
+        Else
+            ' Mode "complete": success is implied by a committed navigate + best-effort settle.
+            isNavigated = True
+        End If
+        
+        If isNavigated Then
+            ExecuteNavigateAndGetStatus = "200"
+            Exit Function
         End If
 
         ' Wait for the environment to settle before re-verifying.
         WaitHeartbeat 1000
+NextNavAttempt:
     Next attempt
     
     ExecuteNavigateAndGetStatus = "500"
@@ -3857,6 +3865,28 @@ Private Function IsAmbiguousOutcome(ByVal errNum As Long) As Boolean
         Case 604, 601, 600, 517
             IsAmbiguousOutcome = True
     End Select
+End Function
+
+' TRUE for selected Chromium network failures for which retrying an ORDINARY page
+' navigation is considered acceptable. This does NOT prove the request never reached
+' the server; a reset can occur after the request was sent. One-time URLs, downloads,
+' or server-side effects must not rely on this automatic retry policy. Context-loss /
+' invalid-argument / JS / ambiguous timeout errors are deliberately excluded and stay
+' terminal.
+Private Function IsRetryableNavFailure(ByVal errDesc As String) As Boolean
+    Dim d As String: d = LCase$(errDesc)
+    Dim codes As Variant
+    codes = Array("connection_reset", "connection_closed", "connection_aborted", _
+                  "connection_refused", "connection_failed", "connection_timed_out", _
+                  "timed_out", "empty_response", "socket_not_connected", _
+                  "address_unreachable", "network_changed")
+    Dim i As Long
+    For i = LBound(codes) To UBound(codes)
+        If InStr(d, "net::err_" & codes(i)) > 0 Then
+            IsRetryableNavFailure = True
+            Exit Function
+        End If
+    Next i
 End Function
 
 ' TRUE for action keys whose JS mutates page state and is NOT safely repeatable

@@ -52,7 +52,6 @@ Setup and import instructions are available in the **[Wiki](https://github.com/h
 * **Resource blocking changes page behavior.** `ExecuteEnableResourceBlocking` should be limited to resources known to be unnecessary. Blocking application code, authentication endpoints, or content APIs can break the target page.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
 * **The Global Shadow DOM Unlocker modifies page behavior.** It overrides `attachShadow` during the browser session so closed shadow roots can be exposed as open. Pages that intentionally depend on closed-shadow semantics may behave differently.
-* **Third-party sites can change without notice.** Selectors, network endpoints, Shadow DOM structures, and SPA behavior used by the samples may require updates after the target site changes.
 
 ---
 
@@ -116,6 +115,3 @@ This procedure demonstrates the completion-signal gate (`ArmContentSignal`), whi
 ---
 ### 🔗 External Links
 * [Medium - Article by hanamichi77777](https://medium.com/@hanamichi77777/webdriver-bidi-for-seleniumvba-ee4687887d03)
-
-### [Reference Materials]
-* **WebSocket communication related with VBA:** [ZeroInstall BrowserDriver for VBA (@kabkabkab)](https://qiita.com/kabkabkab/items/d187fd1622fede038cce)

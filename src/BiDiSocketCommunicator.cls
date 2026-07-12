@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.4
+' Version: 2.5
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
@@ -706,8 +706,12 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     '       sustained socket silence without immediately destroying handles.
     '
     '       Soft Timeout (1x): no matching response within the normal window. Raises
-    '           604 but PRESERVES the connection; the caller (ExecuteBiDiCommand)
-    '           retries as a NEW SendAndReceive call with a new id and fresh deadlines.
+    '           604 but PRESERVES the connection. 604 is an AMBIGUOUS outcome (the
+    '           command was sent, result unknown). Idempotent callers (ExecuteBiDiCommand
+    '           with allowAmbiguousRetry:=True) retry as a NEW SendAndReceive call with a
+    '           new id and fresh deadlines. State-changing callers
+    '           (allowAmbiguousRetry:=False) must NOT re-send; they propagate the
+    '           ambiguous outcome to the caller to avoid a double operation.
     '           Each soft timeout on the same connection increments
     '           m_consecutiveSoftTimeouts; reaching MAX_CONSECUTIVE_SOFT_TIMEOUTS is
     '           judged sustained silence (half-dead socket that still accepts sends)
