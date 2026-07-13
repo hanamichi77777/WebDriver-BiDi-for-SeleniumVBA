@@ -10,14 +10,14 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.5
+' Version: 2.6
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name : BiDiSocketCommunicator
 ' Purpose    : Professional WebSocket Client for WebDriver BiDi (W3C Standard).
 '
 ' [SECURITY & COMPLIANCE - ANALYST REFERENCE]
-' 1. SANDBOXED IPC SCOPE: Strictly restricted to the Local Loopback interface (127.0.0.1).
+' 1. SANDBOXED IPC SCOPE: Strictly restricted to the loopback interface (localhost, 127.0.0.1, [::1]).
 '    Engineered exclusively for Inter-Process Communication (IPC) between the VBA host
 '    and the local WebDriver/Browser instance.
 ' 2. ANTI-RAT DESIGN: This implementation enforces a strict URL validation policy that
@@ -119,8 +119,9 @@ Private Const WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE           As Long = 4
 Private Const NO_ERROR As Long = 0
 ' [BiDi spec compliance] Reserved POSITIVE id band for system traffic (js-uint conformant).
 ' Commands are issued only from [CMD_ID_FLOOR .. ID_MAX]; ids [1..99] never collide with them.
-' Heartbeat pings ROTATE within [3..99] so no duplicate id is ever outstanding (W3C unique-id
-' compliance, same rationale as the NO RESEND invariant). Recognition is band-based:
+' Heartbeat pings ROTATE within [3..99]; provided pongs return within the band cycle, no
+' duplicate ping id is outstanding (W3C unique-id rationale, as in the NO RESEND invariant).
+' Recognition is band-based:
 ' IsReservedSystemId discards every root id below CMD_ID_FLOOR at both receive sites.
 Private Const CMD_ID_FLOOR As Long = 100         ' command ids: [100 .. ID_MAX]
 Private Const ID_MAX As Long = 2000000000        ' wrap ceiling (within VBA Long range)
@@ -432,7 +433,8 @@ End Function
 ' Sends a raw UTF-8 string message through the WebSocket.
 ' allowRecovery:=False makes this a best-effort send: on StateError or send failure
 ' it exits/returns False WITHOUT invoking AttemptRecovery (no backoff wait). Used by
-' PostScript so fire-and-forget can never block teardown or HUD updates.
+' PostScript so fire-and-forget skips the recovery backoff and waits on no reply; the
+' synchronous WinHttpWebSocketSend itself can still block under TCP backpressure.
 Public Function SendMessage(ByVal Msg As String, Optional ByVal allowRecovery As Boolean = True) As Boolean
     If LenB(Msg) = 0 Then Exit Function
     
@@ -509,7 +511,9 @@ Public Function GetNextRequestId() As Long
 End Function
 
 ' Next heartbeat id, rotating within [SYSTEM_PING_ID_MIN .. SYSTEM_PING_ID_MAX].
-' Rotation keeps every outstanding ping id unique (W3C unique-id compliance).
+' Rotation keeps ping ids separate from the command band.
+' Outstanding ping ids remain unique provided replies return within one
+' complete [3..99] rotation cycle.
 Private Function GetNextSystemPingId() As Long
     m_nextSystemPingId = m_nextSystemPingId + 1
     If m_nextSystemPingId > SYSTEM_PING_ID_MAX Then m_nextSystemPingId = SYSTEM_PING_ID_MIN
@@ -665,9 +669,11 @@ Private Sub InternalCleanup()
     On Error GoTo 0
 End Sub
 
-' Sends a JSON message and waits for a specific response ID with a strict hard deadline.
-' Refactored to establish a "High-Purity Loop" that prevents WinHttp state corruption
-' by suppressing DoEvents during the active command-response cycle.
+' Sends a JSON message and waits for a specific response ID.
+' Its soft and hard deadlines are cooperative: they can be evaluated only after
+' ReadFromWire regains control from WinHttpWebSocketReceive.
+' The high-purity loop suppresses DoEvents during the active command-response
+' cycle to prevent WinHttp state corruption.
 Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitTimeMs As Long = 0) As String
     ' Re-entry Guard: Lock the communication channel.
     ' Raise (instead of returning "") so the caller cannot mistake a blocked
@@ -717,19 +723,24 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     '           judged sustained silence (half-dead socket that still accepts sends)
     '           and escalates to StateError. The counter resets on any successfully
     '           matched response and on a fresh Connect.
-    '       Hard Timeout (2x): reachable only WITHIN a single call, when ReadFromWire
-    '           (whose internal deadline is hardDeadline) stays in fragment assembly
-    '           past twice the window. Transitions to StateError immediately.
+    '       Hard Timeout (2x): a cooperative deadline reachable only while
+    '           ReadFromWire continues regaining control, such as during fragmented
+    '           message assembly. Transitions to StateError when evaluated after
+    '           twice the normal window.
     '       On StateError, handles are cleaned up on exit ONLY when AutoReconnect
     '           is enabled (see Cleanup); otherwise they persist until Disconnect.
-    '       LIMITATION (empirically verified): both tiers require ReadFromWire to
-    '           regain control, i.e. frames must still arrive. A peer that is
-    '           TCP-alive but sends nothing (suspended or deadlocked driver: the
-    '           kernel keeps ACKing) blocks WinHttpWebSocketReceive indefinitely;
-    '           NO WinHTTP timeout option applies to synchronous WebSocket
-    '           receives. A KILLED peer does unblock it (TCP reset -> receive
-    '           error). Escaping a silent-but-alive peer would require async
-    '           WinHTTP or a second thread, neither available to VBA.
+    '
+    '       LIMITATION (empirically verified):
+    '           Observed: on a TCP-alive but frame-silent peer,
+    '           WinHttpWebSocketReceive does not return within the intended timeout
+    '           window, so the surrounding deadlines cannot be evaluated until
+    '           Receive returns.
+    '           Likely cause: pre-upgrade WinHttpSetTimeouts values are not honored
+    '           on the completed WebSocket handle, leaving the synchronous receive
+    '           without an effective timeout.
+    '           A killed peer does unblock Receive through a TCP reset/error.
+    '           Escaping a silent-but-alive peer would require asynchronous WinHTTP
+    '           or a second thread, neither available to VBA.
     Dim timeout As Long: timeout = IIf(waitTimeMs > 0, waitTimeMs, m_DefaultTimeout)
     Dim softDeadline As Double: softDeadline = NowMs() + timeout
     Dim hardDeadline As Double: hardDeadline = NowMs() + (timeout * 2)
@@ -899,7 +910,8 @@ ErrorHandler:
 End Function
 
 ' Polling-based BiDi message pump; processes queued events and manages heartbeat.
-' Optimized to prevent Excel UI freezing by using a micro-deadline for socket I/O.
+' The short ReadFromWire deadline is cooperative only: it limits processing after
+' Receive returns, but cannot interrupt a frame-silent synchronous receive.
 Public Function GetMessage() As String
     ' Block heartbeat/ping while a command response is pending in SendAndReceive
     If m_isSendReceiving Then Exit Function
@@ -984,12 +996,14 @@ Public Function GetParsedEvent(Optional ByVal minMsgSize As Long = 10, _
     Set GetParsedEvent = parsed
 End Function
 
-' Reads a WebSocket frame.
-' Refactored to include a Liveness Check (deadlock detection) and strict memory management.
+' Reads a WebSocket frame with strict receive-side memory management.
+' The optional deadline is cooperative and is evaluated only after
+' WinHttpWebSocketReceive returns control.
 Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
     If m_State <> StateConnected And m_State <> StateDisconnecting Then Exit Function
     
-    ' Liveness Check (Deadlock Detection)
+    ' Stale read-lock guard evaluated on re-entry only.
+    ' It cannot detect or interrupt an in-progress WinHttpWebSocketReceive block.
     If m_isReading Then
         If (NowMs() - m_isReadingSince) > 5000 Then
             Debug.Print "[" & Format(Now, "hh:nn:ss") & "] BiDi Warning: Read lock stuck. Force-resetting."
@@ -1104,14 +1118,21 @@ Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
             GoTo CleanExit
         End If
 
-        ' NO SLEEP HERE (deliberate). This is a synchronous WinHttp session
-        ' (WinHttpOpen dwFlags=0): WinHttpWebSocketReceive blocks internally until
-        ' data arrives or the 100ms receive timeout fires (12002 -> exit above),
-        ' so Receive itself paces the loop. A former "YieldExecution 1, False"
-        ' here cost ~15.6ms per fragment (kernel32 Sleep(1) rounds up to the
-        ' system timer quantum; no timeBeginPeriod in this process), turning a
-        ' 12.6MB / 8KB = ~1,540-fragment assembly into a ~24s UI freeze.
-        ' UI responsiveness is handled by the Mod-20 DoEvents guard above.
+        ' NO SLEEP HERE (deliberate). WinHttpWebSocketReceive is synchronous
+        ' and therefore paces the loop while frames continue to arrive.
+        '
+        ' Observed: on a TCP-alive but frame-silent peer, Receive may not return
+        ' within the intended timeout window, so neither this loop's deadline nor
+        ' any surrounding VBA guard can be evaluated until control returns.
+        ' Likely cause: the pre-upgrade WinHttpSetTimeouts values do not provide
+        ' an effective timeout on the completed WebSocket handle.
+        '
+        ' A former "YieldExecution 1, False" here cost ~15.6ms per fragment
+        ' because kernel32 Sleep(1) rounds up to the system timer quantum
+        ' (no timeBeginPeriod in this process), turning a 12.6MB / 8KB =
+        ' ~1,540-fragment assembly into a ~24s UI freeze.
+        ' UI responsiveness while frames are arriving is handled by the
+        ' Mod-20 DoEvents guard above.
     Loop
 
 CleanExit:

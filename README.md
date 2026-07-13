@@ -45,6 +45,40 @@ The validation code is contained in the `Main07` procedure.
 
 Setup and import instructions are available in the **[Wiki](https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA/wiki)**.
 
+## Installing Chrome Extensions through WebDriver BiDi
+
+`Main01` is a minimal demonstration that installs the Google Translate extension into the automation browser after Chrome has started. It does not navigate to a page or demonstrate SPA waiting, so extension-installation problems can be diagnosed independently from page synchronization.
+
+### Why the sample does not use classic startup capabilities
+
+Older Selenium examples often load an unpacked extension at browser startup through ChromeOptions / capabilities, such as `AddExtensions` or the `--load-extension` command-line switch.
+
+For branded Chrome, that startup route is no longer a practical solution for this sample. Chrome removed the `--load-extension` flag in Chrome 137 because it had been abused to load malicious or unwanted software. As a result, a classic SeleniumVBA capability that ultimately depends on that startup mechanism cannot be relied on to install an unpacked extension in current normal Chrome builds.
+
+Instead, this project:
+
+1. starts Chrome with WebDriver BiDi enabled;
+2. connects `BiDiCommandWrapper` to the BiDi WebSocket endpoint; and
+3. sends the standard `webExtension.install` command after the browser session has been created.
+
+The W3C WebDriver BiDi command accepts a local extension directory through `extensionData.type = "path"` and returns the installed extension ID. Browsers may install the extension temporarily so that it is removed when the automation browser shuts down.
+
+### Requirements used by `Main01`
+
+* Google Translate must already be installed in the user's normal Chrome profile so that its unpacked local files are available.
+* `extensionPath` must point to the version directory that directly contains `manifest.json`, not only to the extension-ID directory.
+* The Google Translate extension ID used by the sample is `aapbdbdomjkkjkaonfhkkikfgjllcleb`.
+* Chrome may update the version-number directory. If the sample path no longer exists, replace the version segment with the directory currently present under the Chrome profile.
+* The sample launches Chrome with `--remote-debugging-pipe` and `--enable-unsafe-extension-debugging`, and calls `caps.EnableBiDiMode` before `OpenBrowser`.
+* Enterprise browser policy may prohibit extension installation or the required debugging configuration. Such restrictions cannot be solved by changing SPA wait settings.
+
+`webExtension.install` changes browser state. The wrapper therefore does not blindly retry the command after an ambiguous transport failure, because the first installation may already have succeeded even if its response was not received.
+
+Official references:
+
+* [Chrome Extensions update: removal of `--load-extension` in Chrome 137](https://developer.chrome.com/blog/extension-news-june-2025)
+* [W3C WebDriver BiDi: `webExtension.install`](https://www.w3.org/TR/webdriver-bidi/#command-webExtension-install)
+
 ## Scope and Limitations
 
 * **SPA completion is inferred, not guaranteed.** The default idle consensus is based on observed network activity, Fetch/XHR counters, DOM mutations, and a quiet window. It cannot prove the target application's internal logical completion or rule out future delayed work.
@@ -53,63 +87,104 @@ Setup and import instructions are available in the **[Wiki](https://github.com/h
 * **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
 * **Resource blocking changes page behavior.** `ExecuteEnableResourceBlocking` should be limited to resources known to be unnecessary. Blocking application code, authentication endpoints, or content APIs can break the target page.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
+* **Extension installation depends on browser and policy support.** `Main01` installs an unpacked extension through WebDriver BiDi after startup; the local extension path, Chrome version, ChromeDriver support, and enterprise policy can all affect the result.
 
 ---
 
 ## 📂 Procedure Overview (Sample Module: `BiDi_Sample`)
 
-### 1. Main01: Enhanced Select Box & Extension Injection
-This procedure focuses on handling elements that trigger complex JavaScript state changes.
-* **Dynamic Extension Injection:** Utilizes the WebDriver BiDi `ExecuteWebExtensionInstall` command to load extensions directly into the browser session from a local path. This enables session-scoped extension installation through WebDriver BiDi without permanently registering the extension in the browser profile or system registry. *(Note: Please ensure that the Google Translate Chrome extension is installed on your PC in advance.)*
-* **Smart Selection:** Utilizes `ExecuteSelectValueByXPath`. This command can be configured to wait for the browser's "Idle" state immediately after selection, allowing the monitored activity to reach a stable state before proceeding.
+These procedures are learning and diagnostic examples rather than permanent integration tests for the referenced public websites. Third-party URLs, XPath expressions, ARIA labels, extension folders, and observed network endpoints can change without notice. When adapting a sample, first identify the application's real completion condition, then update selectors, signal patterns, noise rules, and business-level verification accordingly.
 
-### 2. Main02: Auto-Scrolling for Lazy Load & Dynamic SPA Synchronization
-Designed for Single-Page Application (SPA) environments that utilize infinite scrolling (lazy loading) like note.com, this procedure ensures reliable interaction with elements dynamically added to the DOM.
-* **Inducing Dynamic Loads via Auto-Scrolling:** By using the ExecuteLazyLoadScroll method, the script repeatedly scrolls to the bottom of the page to forcefully trigger the loading of additional content (e.g., article lists).
-* **Full-Stack Idleness Monitoring:** After navigation and during scrolling, the script injects window.__vbaIdleProbe to monitor the browser's internal state.
-* **Real-Time Traffic Tracking & Synchronization:** The probe continuously tracks inflightXhrCount (active XHR requests) and inflightFetchCount (active Fetch requests). The VBA code waits for these counts to return to zero and for lastMutationTs (the timestamp of the final observed DOM mutation) to stabilize, providing a practical indication that the currently observed loading activity has settled.
+### 1. Main01: Google Translate Extension Installation through WebDriver BiDi
+This procedure is intentionally limited to one task: installing the unpacked Google Translate extension into the current Chrome automation session.
 
-### 3. Main03: Performance Optimization via CDP-over-BiDi Bridge
-This procedure demonstrates how resource blocking can significantly reduce page-loading overhead by controlling the network layer through a hybrid protocol approach.
-* **Hybrid Protocol Bridge:** Utilizes `ExecuteEnableResourceBlocking` to filter out heavy resources like ad scripts, analytics, and tracking beacons before navigation.
-* **Post-Navigation Idleness Probe:** Injects `window.__vbaIdleProbe` to ensure the environment is quiescent before entering data, maximizing execution speed and reliability.
+* **Runtime installation instead of startup injection:** Calls `ExecuteWebExtensionInstall`, which sends the W3C `webExtension.install` command after Chrome has started. The extension itself is not passed through `caps.AddExtensions` or `--load-extension`.
+* **Why classic capabilities are not used:** Branded Chrome removed the `--load-extension` flag in Chrome 137. Therefore, the traditional startup-capability approach commonly shown in older Selenium examples is not a dependable route for this unpacked-extension scenario in current normal Chrome.
+* **Required browser configuration:** The sample enables BiDi and launches Chrome with `--remote-debugging-pipe` and `--enable-unsafe-extension-debugging` before connecting `BiDiCommandWrapper`.
+* **Local source-path requirement:** `extensionPath` must identify the Google Translate version directory containing `manifest.json`. The version folder can change whenever Chrome updates the extension.
+* **Easy diagnosis:** No navigation or SPA wait is performed. Failures are therefore normally attributable to the local path, the manifest, Chrome/ChromeDriver support, startup arguments, or enterprise browser policy rather than synchronization logic.
+* **Result handling:** The raw BiDi response is written to the Immediate window. Because installation changes browser state, an ambiguous transport failure is not automatically retried.
 
-### 4. Main04: Event-Driven URL Monitoring
-Bypasses the "flaky" nature of login redirections by moving away from polling.
-* **Event vs. Polling:** Uses `ExecuteIsUrlContains` to hook into the browser's internal navigation events. The script reacts to matching navigation events without relying on a fixed sleep interval, avoiding unnecessary delay from coarse polling.
+See [Installing Chrome Extensions through WebDriver BiDi](#installing-chrome-extensions-through-webdriver-bidi) for the complete background and prerequisites.
 
-### 5. Main05: Asynchronous DOM Mutation & State Validation
-Focuses on synchronizing with elements that are delayed or generated via AJAX, ensuring the script does not outpace the UI updates.
-* **Smart Async Interaction:** Utilizes `ExecuteClickByXPath` to interact with AJAX-driven content. The command internally monitors BiDi events to ensure the action is processed during a stable browser state.
-* **Instant State Verification:** Demonstrates how to validate dynamic DOM insertions (e.g., the "Done!" label) immediately after an action, eliminating the need for manual polling loops.
+### 2. Main02: Lazy-Load Scrolling with Best-Effort SPA Quiescence
+This procedure demonstrates controlled scrolling on a page that appends content as the user moves downward.
 
-### 6. Main06: Iframe Context Piercing & Hierarchical Mapping
-Solves the "nested frame" problem found in legacy portals.
-* **Context ID Retrieval:** Executes `GetIframeContextIdByUrl` to reliably map and target deeply nested sub-frames.
-* **Direct Context Targeting:** Instead of using traditional context switching, the script retrieves a unique context ID for the specific frame and passes it directly into interaction commands like `ExecuteClickByXPath`.
+* **Triggering lazy-loaded content:** `ExecuteLazyLoadScroll` repeatedly scrolls the page to provoke additional loading.
+* **Practical completion assessment:** After scrolling, the wrapper evaluates observed Fetch/XHR activity, DOM mutations, and the stable window. This is a best-effort quiescence assessment; it does not prove that an infinite feed has been exhausted or that no future delayed work will occur.
+* **Business-level verification:** After the wait, SeleniumVBA takes a DOM snapshot and counts article links. The count is useful as a manual verification result, not as a fixed expected value for the live site.
+* **What to customize:** Replace the URL and final article XPath. If the site uses a dedicated “load more” response or a stable result container, consider arming an explicit network or content signal instead of relying on quietness alone.
 
-### 7. Main07: SPA Idleness Detection & Shadow DOM Traversal
-Targeting heavy JavaScript platforms (e.g., ServiceNow), this procedure implements a sophisticated "BiDi Probe" system.
-* **Shadow DOM Interaction:** Uses `ExecuteShadowClick` to pierce shadow boundaries and interact with encapsulated web components.
-* **Auto-Clicker Registration:** Utilizes `ExecuteRegisterAutoClickerByXPath` to silently and automatically handle intrusive overlays (like cookie banners) without polluting the main automation logic.
+### 3. Main03: Resource Blocking, Idle-Noise Filtering, and Discovery Log
+This procedure automates a live route-search form while recording evidence that can be used to tune SPA synchronization.
 
-### 8. Main08: Heavy SPA Stress Test & Advanced Combobox Handling
-Designed as a stress test targeting highly reactive SPAs (e.g., Google Flights) to manage complex React/Wiz-controlled comboboxes and heavy background network traffic.
-* **Multi-Phase Input Synchronization:** Implements a robust, per-character input routine (`ExecuteInputValueByXPath`) that waits for field activation, detects React/Wiz double DOM replacements, and safely clears values to ensure dynamic suggestion dropdowns trigger correctly.
-* **Telemetry Noise Filtering:** Utilizes `AddIdleIgnoreNetworkPattern` to continuously ignore background tracking and telemetry requests (like `/log?` or `ogs.google.com`), allowing the internal idleness probe to more accurately estimate when relevant page activity has settled.
-* **Semantic ARIA Targeting:** Bypasses obfuscated class names and layout shifts by relying on W3C ARIA attributes (e.g., `@role='combobox'`, `@aria-label`) to reliably locate and interact with changing UI elements.
+* **Two different traffic controls:** `ExecuteEnableResourceBlocking` prevents matching requests from being sent, while `AddIdleIgnoreNetworkPattern` allows requests to continue but excludes matching background traffic from idle judgment. Blocking is stronger and can change page behavior; ignoring is appropriate for required but continuously noisy telemetry.
+* **Focused diagnostic recording:** `StartDiscoveryLog` begins after initial navigation so the saved log concentrates on field input, suggestion activity, submission, responses, DOM mutations, and the final stability decision.
+* **Action waits remain enabled:** The input and click operations keep their normal post-action waits because route fields and search submission may trigger asynchronous work.
+* **Selector adaptation:** The sample shows both prefix and exact-ID selector forms for the search button. If they resolve to the same live element, keep only one when adapting the code to avoid duplicate submission.
+* **How to diagnose failure:** Inspect the Discovery Log before adding fixed delays. Determine whether the problem is an incorrect selector, relevant traffic excluded as noise, an untracked completion response, or a render that occurs after apparent network quiet.
 
-### 9. Main09: Discovery Log & Diagnostic Recording
-A specialized tool for reverse-engineering and debugging complex automation scenarios.
-* **Event Stream:** Uses `StartDiscoveryLog` to capture a raw feed of every browser event, including network requests, console logs, and DOM changes (with an option to exclude image/css noise).
-* **Analysis:** Records activity using `RecordEventsForSeconds` for a specified duration and saves it via `StopAndSaveDiscoveryLog` for post-mortem analysis.
+### 4. Main04: Manual Login Wait Using URL and Post-Navigation Activity
+This procedure opens a login page, lets the user authenticate manually, and waits for the browser to reach the expected authenticated URL.
 
-### 10. Main10: Completion-Signal Gate & Bridging the Settle-to-Render Gap
-This procedure demonstrates the completion-signal gate (`ArmContentSignal`), which injects the operator's knowledge of "what marks done" into the idle consensus — closing the class of failures where an XHR settles quickly but the corresponding DOM paint lands noticeably later.
-* **Arm-then-Act Pattern:** Uses `ArmContentSignal` immediately before each click to declare the exact DOM subtree (`#table-body`) whose rewrite signals completion. The subsequent SPA wait cannot conclude as STABLE on quiescence alone while the declared signal is still outstanding — the wait is gated on the actual content rewrite, not on apparent quiet.
-* **One-Shot Consumption:** Each armed signal is consumed exactly once at wait end, so it never leaks into an unrelated subsequent wait. This is why the sample re-arms before every click: one signal, one wait.
-* **Fail-Fast Arming:** `ArmContentSignal` raises immediately if the declared target does not exist at arm time, so a mistyped XPath surfaces as an instant error instead of a silently meaningless wait.
-* **Noise Filtering as a Prerequisite:** Registers background telemetry (`cdn-cgi/rum`, Facebook tracking) with `AddIdleIgnoreNetworkPattern` first, so the consensus engine judges idleness only from traffic that actually matters.
+* **No arbitrary `Sleep`:** `ExecuteIsUrlContains` repeatedly checks the current live URL while the wait engine also observes navigation and network activity until a match or timeout occurs.
+* **Idle-aware success condition:** The sample uses `waitNetworkIdle=True`, so a matching URL alone is not treated as sufficient; the configured post-navigation activity must also reach the wrapper's wait conclusion.
+* **Manual credentials by design:** Credentials are not automated. The user must submit the login form within the configured 30-second window.
+* **What to customize:** Replace the login URL, expected URL fragment, and timeout. If an identity provider keeps the same URL after authentication, use a stable authenticated DOM/content signal instead of URL matching.
+
+### 5. Main05: Choosing Whether an Action Needs a Post-Action Wait
+This procedure demonstrates that not every browser action needs the same synchronization policy.
+
+* **Known synchronous actions:** Text entry and a color-button click use `waitForCompletion=False` on the Selenium test page because those specific actions are not expected to start relevant asynchronous work.
+* **Asynchronous action retained:** The “Add Label” click keeps the normal wait and requests a 1000 ms stable window because it triggers a delayed DOM update.
+* **One-shot verification:** `Debug.Assert` checks that the resulting element contains `Done!` after the action wait. This is a business-level assertion, not another polling loop.
+* **Adaptation rule:** Disable the post-action wait only when the target application's behavior is known. Using `False` merely to increase speed can reintroduce race conditions.
+
+### 6. Main06: Iframe Browsing-Context Discovery without Selenium Frame Switching
+This procedure targets an element inside an iframe by passing a WebDriver BiDi browsing-context ID directly to the action.
+
+* **Context discovery by URL:** `GetIframeContextIdByUrl` searches the current context tree for a child frame whose live URL contains the supplied fragment.
+* **Explicit action scope:** The returned context ID is passed to `ExecuteClickByXPath`, so the lookup and click run in that frame without changing SeleniumVBA's active frame.
+* **What to customize:** Replace the top-level URL, iframe URL fragment, and in-frame XPath.
+* **How to diagnose failure:** Check the frame's actual post-navigation URL and hierarchy. Redirects, dynamically generated URLs, and additional nesting can make an old fragment stop matching.
+
+### 7. Main07: Consent Auto-Clicker, Shadow DOM, and Explicit Network Gate
+This procedure is the ServiceNow validation scenario and combines several features needed for a difficult third-party SPA.
+
+* **Pre-navigation auto-clicker:** `ExecuteRegisterAutoClickerByXPath` is registered before navigation so the browser-side helper can dismiss the consent banner as soon as it appears.
+* **Shadow DOM interaction:** `ExecuteShadowClick` targets the sign-in button inside an encapsulated web component.
+* **Arm-then-act network gate:** `ArmNetworkSignal "metadata/application"` is called immediately before the Shadow DOM click. The one-shot signal belongs to the next action wait and helps bridge the transition into the sign-in experience.
+* **End-to-end diagnostic log:** Recording starts before registration and navigation, allowing the log to preserve the consent action, navigation, armed response, mutation tail, and final username input.
+* **Site-specific details:** The consent XPath, shadow selector, username XPath, and network pattern are observations from the current ServiceNow implementation, not universal authentication signals.
+
+### 8. Main08: Google Flights Heavy SPA Stress Sample
+This procedure demonstrates how multiple synchronization techniques can be combined on a highly reactive live SPA.
+
+* **Selector resilience:** The sample favors ARIA roles and accessible labels over obfuscated CSS classes, sets `--lang=en`, and uses `[last()]` where Google may create or replace duplicate combobox inputs.
+* **Trusted input path:** `ExecuteInputValueByXPath` uses the wrapper's active-element-aware input flow to clear, type, and validate values while the framework may replace controls.
+* **Traffic classification:** Non-essential resources are blocked, while required background requests are merely ignored for idle judgment. The Discovery Log remains the evidence source for revising both lists.
+* **Explicit render boundaries:** The calendar step arms both a network signal (`GetCalendarPicker`) and a visibility signal for fare cells. The search step arms `GetShoppingResults`. These are one-shot, observed implementation details rather than stable public APIs.
+* **Live-site limitations:** City suggestions, date-cell positions, button labels, endpoint names, consent state, locale, and account state may change. Update selectors and signals from a fresh log instead of adding arbitrary delays.
+* **Expected outcome:** The example demonstrates a robust diagnostic strategy, but it cannot guarantee immunity from future Google UI or backend changes.
+
+### 9. Main09: Manual Discovery Log Recorder
+This procedure records a narrow observation window while the user performs one meaningful browser action manually.
+
+* **Focused recording:** The recommended pattern is one action per run—for example, opening a calendar, selecting a suggestion, or pressing Search—so the causal sequence is easier to interpret.
+* **What the log captures:** It records the BiDi/network and SPA-probe evidence used by this project, including requests/responses, DOM activity, suppressed noise, armed-signal events, and stability decisions. It should not be described as a dump of every possible browser event.
+* **Filtering is not blocking:** `excludeImagesAndCss=True` removes common image/CSS entries from the saved diagnostic stream; it does not prevent those resources from loading in the page.
+* **Time-window selection:** A longer recording is not always better. Extra background activity can obscure the request and mutation tail associated with the intended action.
+* **How to use the result:** Use `discovery_log.txt` to decide what should be blocked, ignored, armed, or verified. Do not choose a completion signal from its name alone; confirm its timing and relation to the resulting DOM change.
+
+### 10. Main10: Content-Signal Gate for the Settle-to-Render Gap
+This procedure demonstrates `ArmContentSignal` for cases where a response settles before an existing results container is rewritten.
+
+* **Arm-then-act pattern:** The sample arms `#table-body` immediately before each year click. The next relevant SPA wait is gated on observing that existing subtree change in addition to the normal idle conditions.
+* **Existing-target requirement:** The target XPath must already exist when armed. This signal is not appropriate for an element that is created only after the action; choose an existing parent container or another completion signal instead.
+* **One-shot consumption:** Each armed signal is consumed by the next relevant wait, so the sample must re-arm before the second year click.
+* **Fail-fast configuration:** A missing target at arm time raises immediately, exposing a mistyped or obsolete XPath instead of silently creating a meaningless wait.
+* **Noise filtering:** Known background telemetry is ignored for idle judgment so unrelated traffic does not prevent the content-gated wait from settling.
+* **What to customize:** Choose a stable existing subtree whose rewrite genuinely marks business completion. Avoid broad ancestors that also mutate for animations, clocks, advertisements, or unrelated telemetry.
 
 ---
 ### 🔗 External Links

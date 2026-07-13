@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' ==========================================================================
 ' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.5
+' Version: 2.6
 ' MIT License Copyright (c) hanamichi77777
 ' ==========================================================================
 ' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
@@ -39,10 +39,14 @@ Option Explicit
 ' [FUNNELS]  Route through these; never call the inner layers directly.
 '   User actions   : ExecuteClickByXPath / ExecuteInputValueByXPath /
 '                    ExecuteSelectValueByXPath / ExecuteNavigateAndGetStatus
-'   All JS          : CallScript -> (WrapInSafetyShell auto) -> ExecuteBiDiCommand -> socket_.SendAndReceive
-'   All interaction : ExecuteBaseAction = TryPreparePhase / TryExecutePhase / TrySyncPhase
-'   All waits       : MasterWaitEngine -> EvaluateWaitCondition -> EvaluateSpaIdleCondition
-'   All timing args : SanitizeMs (entry guard; supplies defaults when waitNetworkIdle is on)
+'   Result JS       : CallScript -> (WrapInSafetyShell auto) -> ExecuteBiDiCommand -> socket_.SendAndReceive
+'                     (infra JS bypasses CallScript: script.evaluate probe, addPreloadScript, getRealms, PostScript)
+'   DOM actions     : ExecuteBaseAction = TryPreparePhase / TryExecutePhase / TrySyncPhase
+'                     (navigation, file-input, prompt & context ops do not route here)
+'   Central waits   : MasterWaitEngine -> EvaluateWaitCondition -> EvaluateSpaIdleCondition
+'                     (URL-contains & SPA-idle only; WaitForUrlStability, XPath & iframe use own loops)
+'   Timing args     : SanitizeMs, except documented exact-0 immediate-check
+'                     sentinels in ExecuteIsUrlContains and ExecuteIsElementVisible.
 '
 ' [STATE OWNERSHIP]  Mutate via the owner only; do not duplicate.
 '   Request ids     : BiDiSocketCommunicator (socket_), NOT this class
@@ -59,7 +63,7 @@ Option Explicit
 ' [INVARIANTS]  Breaking these = deadlock, zombie UI lock, or protocol violation.
 '   UI LOCK        : m_waitStackDepth owns Application.Interactive; lock at depth 1 and
 '                    restore ONLY at depth 0 (CleanExit forces depth 0 on error).
-'   JS PATH        : never bypass CallScript; that is what auto-applies WrapInSafetyShell
+'   JS PATH        : result-bearing JS uses CallScript, which auto-applies WrapInSafetyShell
 '                    (watchdog) and the heartbeat hb() closure. See Golden Rules below.
 '   RE-ENTRANCY    : do not DoEvents / PumpMessages while socket_ is mid SendAndReceive.
 '   CONSENSUS HALT : TrySyncPhase re-raises ONLY ERR_CONSENSUS_HALT; a plain 504 (DOM-only)
@@ -86,7 +90,8 @@ Private m_debugMode As Boolean              ' Backing field for the DebugMode pr
 
 ' --- Foundation: ID Management ---
 ' Request IDs are owned by BiDiSocketCommunicator (see AI NAVIGATION MAP).
-' Wrapper accesses them via socket_.GetNextRequestId.
+' Normal command IDs are generated internally by socket_.SendCommand;
+' the Wrapper does not allocate normal command IDs directly.
 
 ' --- Recovery & Stability ---
 Private m_isRecovering As Boolean
@@ -223,15 +228,20 @@ End Enum
 ' DEVELOPMENT & EXTENSION RULES FOR STABILITY
 ' To maintain "Anti-Freeze" architecture and "AI-Ready" predictability,
 ' all new interaction methods MUST adhere to the following 4 Golden Rules:
-' 1. [BASE UTILIZATION]: All JavaScript execution MUST go through 'Me.CallScript'.
+' 1. [BASE UTILIZATION]: Result-bearing action JavaScript MUST normally go
+'    through Me.CallScript.
+'    Infrastructure exceptions include probe injection, preload-script
+'    registration, realm discovery, and fire-and-forget PostScript.
 '    - Rationale: This ensures the 'WrapInSafetyShell' is automatically applied,
-'      activating the browser-side watchdog timer to prevent VBA hanging.
+'      bounding the VBA-side wait for cooperative/asynchronous JavaScript
+'      without cancelling the browser-side task.
 ' 2. [HEARTBEAT INTEGRATION (hb)]: For JS involving loops, polling, or long waits:
 '    - Action: Call 'hb()' inside the loop.
 '    - Rationale: hb() is provided via closure from WrapInSafetyShell.
 '      Do NOT write 'const hb = arguments[0]' -> hb is NOT passed as an argument,
 '      and doing so will overwrite your actual parameters (like sharedId).
-'      Calling hb() resets the browser-side watchdog timer to prevent task killing.
+'      Calling hb() refreshes the Safety-Shell watchdog and prevents a premature
+'      VBA_TIMEOUT while cooperative browser-side work is still progressing.
 ' 3. [TIMEOUT DELEGATION]: Public interaction methods SHOULD expose a 'timeoutMs' parameter.
 '    - Action: Pass this parameter down to 'CallScript'.
 '    Utility methods (ClearState, GetMainContextId, etc.) are exempt.
@@ -412,8 +422,10 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
             ' repeated responses to the same endpoint neither re-log nor re-match.
             ' Any status latches (a 500 on the awaited endpoint still opens the
             ' gate); the status is logged so the caller can judge the outcome.
-            ' The timestamp here is event-accurate (not poll-quantized), unlike
-            ' dom/vis hits which are detected on the ~100ms poll.
+            ' The hit is event-triggered rather than poll-detected.
+            ' Its timestamp is recorded at VBA dispatch time, so queue backlog
+            ' can add positive lag relative to the actual browser event.
+            ' dom/vis hits are detected on the ~100ms poll.
             If method = "network.responseCompleted" And m_sigNetArmed And Not m_sigNetSeen Then
                 Dim sigUrl As String: sigUrl = GetPathString(json, "params.response.url")
                 If Len(sigUrl) > 0 Then
@@ -673,8 +685,10 @@ Public Function ExecuteHandleUserPrompt(ByVal Accept As Boolean, Optional ByVal 
 End Function
 
 ' [PUBLIC] ExecuteIsUrlContains
-'  Checks if the current URL contains the partial string. Polls until match
-'              is found or timeout occurs. Optionally waits for SPA stability.
+'  Checks whether the current URL contains the partial string.
+'              With waitNetworkIdle=False and maxTimeoutMs=0, performs one immediate check;
+'              otherwise polls until a match is found or the timeout expires.
+'              Optionally waits for SPA stability.
 ' RETURNS    : True if URL contains the string within timeout, False otherwise.
 Public Function ExecuteIsUrlContains(ByVal partialUrl As String, _
                                      Optional ByVal waitNetworkIdle As Boolean = True, _
@@ -687,8 +701,17 @@ Public Function ExecuteIsUrlContains(ByVal partialUrl As String, _
         If minStableMs = 0 Then minStableMs = DEFAULT_IDLE_STABLE_MS
         If maxTimeoutMs = 0 Then maxTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS
     End If
-    ' SanitizeMs now respects 0ms for immediate checks, but our Entry Guard
-    ' has already ensured they are non-zero if waitNetworkIdle is True.
+    ' When waitNetworkIdle=False, exactly 0ms performs one immediate URL check.
+    ' This is a pure live protocol read and does not add event subscriptions.
+    If Not waitNetworkIdle And maxTimeoutMs = 0 Then
+        Dim immediateCtx As String
+        immediateCtx = ResolveTargetContext(contextId)
+
+        ExecuteIsUrlContains = _
+            (InStr(GetCurrentUrl(immediateCtx, True), partialUrl) > 0)
+        Exit Function
+    End If
+
     Dim vMinStable As Long: vMinStable = SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS)
     Dim vMaxTimeout As Long: vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
     
@@ -706,7 +729,6 @@ Public Function ExecuteIsUrlContains(ByVal partialUrl As String, _
     
     ' Start the engine. Internally calls EvaluateWaitCondition -> GetCurrentUrl (Clean)
     Dim isMatched As Boolean
-    ' Note: If vMaxTimeout is 0 (and waitNetworkIdle was False), this will perform a single immediate check.
     isMatched = MasterWaitEngine(WaitMode_UrlContains, vMaxTimeout, 200, waitCtx)
     
     If isMatched And waitNetworkIdle Then
@@ -901,8 +923,9 @@ Public Function ExecuteEnableResourceBlocking(ByVal patterns As Variant) As Stri
 End Function
 
 ' [PUBLIC] ExecuteIsElementVisible
-'  Checks if an element is rendered and visible in the viewport.
-'              Returns True only if the element exists in the DOM and is functionally visible.
+'  Checks whether an element is connected, style-visible, and has visual dimensions.
+'              Tests isConnected, display/visibility/opacity, and width/height/ClientRect.
+'              Does NOT test viewport intersection or occlusion by another element.
 '              Supports 0ms searchTimeoutMs for high-speed immediate polling.
 Public Function ExecuteIsElementVisible(ByVal xpath As String, _
                                         Optional ByVal searchTimeoutMs As Long = 10000, _
@@ -917,8 +940,16 @@ Public Function ExecuteIsElementVisible(ByVal xpath As String, _
         If minStableMs <= 0 Then minStableMs = DEFAULT_IDLE_STABLE_MS
         If maxTimeoutMs <= 0 Then maxTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS
     End If
-    ' Uses the enhanced SanitizeMs to ensure safe floor values.
-    Dim vSearchTimeout As Long: vSearchTimeout = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
+    ' Exactly 0 is the public immediate-check sentinel.
+    ' Negative values intentionally retain the existing SanitizeMs normalization;
+    ' GetFindElementSharedIdByXPath's <= 0 handling remains an internal safeguard.
+    Dim vSearchTimeout As Long
+    If searchTimeoutMs = 0 Then
+        vSearchTimeout = 0
+    Else
+        vSearchTimeout = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
+    End If
+
     Dim vMinStable As Long:     vMinStable = SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS)
     Dim vMaxTimeout As Long:    vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
     
@@ -1740,12 +1771,12 @@ End Function
 ' =====================================================================
 ' [PUBLIC] ExecuteLazyLoadScroll
 '   Drives a Lazy-Load / infinite-scroll page to the bottom, then (by
-'   default) waits for full SPA quiescence so every late chunk is in the DOM.
+'   default) does a best-effort SPA-quiescence wait so late chunks are likely present.
 '
 '   DESIGN (Plan A - reuse existing assets):
 '     * The "lazy_scroll" JS owns ONLY the scroll-loop control: it keeps
 '       jumping to the page bottom until scrollHeight stops growing.
-'     * The authoritative "everything finished loading" verdict is delegated
+'     * The best-effort SPA-quiescence assessment is delegated
 '       to WaitForNetworkIdleSpa (triggered via waitNetworkIdle=True inside
 '       ExecuteBaseAction), which already consenses on network silence +
 '       MutationObserver quiescence through the installed __vbaIdleProbe.
@@ -1754,7 +1785,8 @@ End Function
 '     ExecuteBaseAction feeds maxTimeout into BOTH the JS safety shell
 '     (CallScript safetyTimeoutMs) AND the trailing WaitForNetworkIdleSpa.
 '     Therefore the JS scroll budget MUST stay strictly below maxTimeout,
-'     or the safety shell aborts the scroll mid-flight. We enforce a margin
+'     or the Safety Shell may stop waiting and report VBA_TIMEOUT while the
+'     browser-side scroll task keeps running. We enforce a margin
 '     below and auto-raise maxTimeout when needed so callers can't foot-gun.
 '
 '   PARAMS:
@@ -1785,7 +1817,8 @@ Public Function ExecuteLazyLoadScroll(Optional ByVal scrollTimeoutMs As Long = 2
 
     ' --- [TIMING GUARD] Keep the JS scroll budget strictly inside the safety ceiling ---
     ' The scroll loop runs inside the CallScript safety shell whose timeout == maxTimeout.
-    ' If scrollTimeoutMs were >= maxTimeoutMs the shell would kill the scroll prematurely.
+    ' If scrollTimeoutMs were >= maxTimeoutMs, the wrapper could stop waiting
+    ' before the scroll task returns, leaving an ambiguous still-running task.
     ' We reserve SCROLL_SAFETY_MARGIN_MS as headroom for the final scrollTo(0,0) + return,
     ' and auto-raise maxTimeout if the caller under-provisioned it.
     Const SCROLL_SAFETY_MARGIN_MS As Long = 5000
@@ -1812,7 +1845,7 @@ Public Function ExecuteLazyLoadScroll(Optional ByVal scrollTimeoutMs As Long = 2
 
     ' awaitPromise=True is mandatory: the lazy_scroll JS is async (await inside the loop).
     ' Passing waitNetworkIdle through lets ExecuteBaseAction run WaitForNetworkIdleSpa
-    ' afterwards, sealing the "all chunks landed" guarantee on the VBA side.
+    ' afterwards; a non-HALT sync timeout is advisory and does not invalidate the scroll.
     ExecuteLazyLoadScroll = ExecuteBaseAction(targetCtx, "lazy_scroll", args, _
                                               waitNetworkIdle, minStableMs, True, _
                                               DEFAULT_STALE_RETRIES, vMaxTimeout)
@@ -2423,7 +2456,7 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). [REQ] pairs with [RES] on the shared id. Per-request latency (dur=) is not computed." & vbCrLf
         stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
         stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
-        stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HIT timestamps are event-accurate; dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
+        stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HITs are event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag. dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
         stm.WriteText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
         stm.WriteText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
         stm.WriteText vbCrLf
@@ -2472,7 +2505,7 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
         stm.WriteText "       bidi.ArmContentSignal ""<a targeted xpath seen in [SPA-ACT], e.g. //*[@id='table-body']>""" & vbCrLf
         stm.WriteText "       and/or bidi.ArmNetworkSignal ""<substring of the SUSPECT's firstJson key>""." & vbCrLf
         stm.WriteText "     With net+content armed, the HITs give a much cleaner measurement than ungated inference" & vbCrLf
-        stm.WriteText "     (net HIT is event-accurate; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
+        stm.WriteText "     (net HIT is event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
         stm.WriteText "     without guessing. Fallback: on a net-armed wait with no stable dom" & vbCrLf
         stm.WriteText "     selector, raising THAT action's minStableMs to (measured gap + margin) is valid per-action." & vbCrLf
         stm.WriteText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
@@ -3599,8 +3632,8 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
         End If
     End If
     If m_sigNetArmed And m_sigNetSeen Then
-        ' Hit already latched (and logged, event-accurate) by DispatchGlobalEvents;
-        ' this poll only performs the once-per-wait timer reset.
+        ' Hit already latched by DispatchGlobalEvents and logged with the VBA
+        ' dispatch timestamp; this poll only performs the once-per-wait timer reset.
         If ctx.Exists("sigNetAcked") Then
             If Not CBool(ctx("sigNetAcked")) Then
                 ctx("sigNetAcked") = True
@@ -4880,14 +4913,14 @@ End Sub
 
 ' [INTERNAL] SanitizeMs
 '  Central gatekeeper to validate millisecond arguments.
-'          Strictly rejects negative values (preventing True/-1 errors)
-'          and caps values to prevent permanent Excel hangs.
+'          Normalizes zero and negative values to the supplied default
+'          and caps large values to reduce prolonged Excel hangs.
 Private Function SanitizeMs(ByVal ms As Long, ByVal argName As String, _
                              ByVal defaultMs As Long, _
                              Optional ByVal minMs As Long = 50) As Long
     Dim vMs As Long: vMs = ms
     
-    ' 1. Logic Guard: Rejects zero or negative values.
+    ' 1. Logic Guard: substitutes the default for zero/negative values (does not raise).
     If vMs <= 0 Then
         If m_debugMode Then
             Debug.Print "BiDi Warning: Invalid value (" & ms & ") for '" & argName & "'. Using default: " & defaultMs
@@ -4960,8 +4993,11 @@ Public Sub WaitForUrlStability(Optional ByVal contextId As String = "", _
 End Sub
 
 ' [PRIVATE] WrapInSafetyShell (REFACTORED)
-'  Wraps JS code in a Promise.race to enforce a browser-side timeout.
-'              This is now the SOLE point of JSON stringification in the JS layer,
+'  Wraps JS code in a Promise.race watchdog to bound the WAIT (not the task).
+'              Stops waiting after the watchdog fires; the losing browser-side task is
+'              not cancelled and may keep running. This is the primary Safety-Shell
+'              envelope stringification point (the idle probe in GetProbeJs also
+'              stringifies),
 '              producing a clean, single-layer response for VBA.
 Private Function WrapInSafetyShell(ByVal jsBody As String, ByVal timeoutMs As Long) As String
     Dim js As String
