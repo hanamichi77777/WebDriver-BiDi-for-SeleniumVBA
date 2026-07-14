@@ -8,138 +8,52 @@ Attribute VB_Creatable = False
 Attribute VB_PredeclaredId = False
 Attribute VB_Exposed = True
 Option Explicit
-' ==========================================================================
-' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.6
-' MIT License Copyright (c) hanamichi77777
-' ==========================================================================
-' Class Name : BiDiSocketCommunicator
-' Purpose    : Professional WebSocket Client for WebDriver BiDi (W3C Standard).
+' WebDriver BiDi for SeleniumVBA
+' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
+' Version 2.7 / MIT License / Copyright (c) hanamichi77777
 '
-' [SECURITY & COMPLIANCE - ANALYST REFERENCE]
-' 1. SANDBOXED IPC SCOPE: Strictly restricted to the loopback interface (localhost, 127.0.0.1, [::1]).
-'    Engineered exclusively for Inter-Process Communication (IPC) between the VBA host
-'    and the local WebDriver/Browser instance.
-' 2. ANTI-RAT DESIGN: This implementation enforces a strict URL validation policy that
-'    blocks non-localhost routing, preventing its use as a Remote Access Tool (RAT).
-' 3. NO DATA EXFILTRATION: By architectural design, this module cannot initiate connections
-'    to remote C2 (Command & Control) servers, and is designed to prevent outbound exfiltration.
-' 4. NATIVE OS INTEGRITY: Utilizes 'WinHttp.dll' (a signed, core Windows System Component)
-'    for socket handshaking, complying with enterprise-level EDR auditing and OS policies.
-' 5. OPEN-SOURCE TRANSPARENCY: Part of the SeleniumVBA project (GCuser99).
-'    The full source code and logic are available for independent security audits:
-'    Audit URL: https://github.com/GCuser99/SeleniumVBA
-' 6. ARCHITECTURAL NECESSITY (W3C BiDi): Required for compliance with the W3C WebDriver BiDi
-'    standard. Unlike legacy one-way REST APIs, BiDi mandates a persistent WebSocket for
-'    bidirectional events (e.g., real-time network interception, console logs).
-'    The communication is inherently safe as the WebDriver process only exposes its
-'    BiDi endpoint to the local loopback interface.
-' ==========================================================================
-' AI NAVIGATION MAP  (transport layer; the Wrapper is the upper layer)
-' Read before editing any single method. The risk is not "where is X" but
-' "which wire-level invariant does X participate in". This class owns the
-' socket; business logic, retries and SPA waits live in BiDiCommandWrapper.
-' [FUNNELS]  Route through these; do not open ad-hoc paths.
-
-'   Connect        : 7-stage WinHttp WebSocket handshake; the ONLY place handles are acquired.
-'   SendCommand    : unified id-gen + envelope + size-check + SendAndReceive (callers pass method+params).
-'   SendAndReceive : core synchronous I/O, held under the m_isSendReceiving lock.
-'   SendMessage    : raw frame send; never re-sends the same id (see INVARIANTS).
-'                    allowRecovery:=False = best-effort path (PostScript), never recovers.
-'   GetMessage     : 100ms poll; swallows reserved-band replies (id < CMD_ID_FLOOR),
-'                    returns all other BiDi events.
+' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
+' request/system IDs, event FIFO and monotonic timing. Retry classification,
+' context recovery and SPA synchronization belong to BiDiCommandWrapper.
 '
-' [STATE OWNERSHIP]  This class is the owner. Do not duplicate these upstream.
-'   WinHttp/WebSocket handles : hSession_, hConnection_, hRequest_, hWebSocket_
-'   Request id generation     : GetNextRequestId (seed = CMD_ID_FLOOR)
-'   QPC monotonic clock       : NowTicks / NowMs / ElapsedMs (single source of time)
-'   I/O locks                 : m_isSendReceiving, m_isReading
-'
-' [INVARIANTS]  Breaking these = double-free, deadlock, or protocol violation.
-'   HANDLE OWNERSHIP : on a successful upgrade the request handle is closed and ownership
-'                      passes to hWebSocket_; on a FAILED CompleteUpgrade, hRequest_ is closed
-'                      defensively. Never retain or double-close it.
-'   RE-ENTRANCY      : no DoEvents / PumpMessages while m_isSendReceiving is True (WinHttp
-'                      state corrupts under re-entrant receive).
-'   ID BANDS         : [1..99] reserved (PostScript reply=2 fixed; heartbeat pings rotate
-'                      in [3..99]); commands [CMD_ID_FLOOR=100 .. ID_MAX]. Recognition is
-'                      band-based: any root id below CMD_ID_FLOOR is system traffic.
-'   NO RESEND        : on send failure SendMessage recovers the socket but returns False; the same
-'                      id is never re-sent (W3C requires unique ids). Retry is the Wrapper's job, new id.
-'   SILENT PEER      : sync WebSocket Receive has NO timeout; the timeout tiers work only
-'                      while frames arrive. A TCP-alive, frame-silent peer blocks
-'                      indefinitely (see the LIMITATION note in SendAndReceive).
-'   ERROR HANDLER    : no file I/O (Trace) inside the error handler.
-'   QPC FAIL-FAST    : Class_Initialize raises vbObjectError+9001 if QPC is unavailable.
-' ==========================================================================
-' --- Configuration ---
+' Preserve these invariants:
+'   - Accept only local unencrypted ws:// endpoints.
+'   - One SendAndReceive call owns response correlation; do not pump Office messages.
+'   - m_isReading and m_isRecovering are released only by structured cleanup.
+'   - IDs [1..99] are system traffic; normal commands use [100..ID_MAX].
+'   - Recovery may heal the socket but never replay the same payload/request ID.
+'   - Every native Pump is non-blocking and bounded by time and work.
+'   - Do not call Trace from a cleanup-critical error handler.
 Private Const DEBUG_MODE As Boolean = False
-Private Const AGENT_NAME As String = "SeleniumVBA/BiDi-Client (Open-Source; Local-IPC-Only)"
-
-' --- WinHttp API Declarations ---
-Private Declare PtrSafe Function WinHttpOpen Lib "WinHttp" (ByVal pszAgentW As LongPtr, ByVal dwAccessType As Long, ByVal pszProxyW As LongPtr, ByVal pszProxyBypassW As LongPtr, ByVal dwFlags As Long) As LongPtr
-Private Declare PtrSafe Function WinHttpConnect Lib "WinHttp" (ByVal hSession As LongPtr, ByVal pswzServerName As LongPtr, ByVal nServerPort As Long, ByVal dwReserved As Long) As LongPtr
-Private Declare PtrSafe Function WinHttpOpenRequest Lib "WinHttp" (ByVal hConnect As LongPtr, ByVal pwszVerb As LongPtr, ByVal pwszObjectName As LongPtr, ByVal pwszVersion As LongPtr, ByVal pwszReferrer As LongPtr, ByVal ppwszAcceptTypes As LongPtr, ByVal dwFlags As Long) As LongPtr
-Private Declare PtrSafe Function WinHttpSendRequest Lib "WinHttp" (ByVal hRequest As LongPtr, ByVal lpszHeaders As LongPtr, ByVal dwHeadersLength As Long, ByVal lpOptional As LongPtr, ByVal dwOptionalLength As Long, ByVal dwTotalLength As Long, ByVal dwContext As Long) As Long
-Private Declare PtrSafe Function WinHttpReceiveResponse Lib "WinHttp" (ByVal hRequest As LongPtr, ByVal lpReserved As LongPtr) As Long
-Private Declare PtrSafe Function WinHttpQueryHeaders Lib "WinHttp" (ByVal hRequest As LongPtr, ByVal dwInfoLevel As Long, ByVal pwszName As LongPtr, ByRef lpBuffer As Any, ByRef lpdwBufferLength As Long, ByRef lpdwIndex As Long) As Long
-Private Declare PtrSafe Function WinHttpSetOption Lib "WinHttp" (ByVal hInternet As LongPtr, ByVal dwOption As Long, ByRef lpBuffer As Any, ByVal dwBufferLength As Long) As Long
-Private Declare PtrSafe Function WinHttpSetTimeouts Lib "WinHttp" (ByVal hInternet As LongPtr, ByVal nResolveTimeout As Long, ByVal nConnectTimeout As Long, ByVal nSendTimeout As Long, ByVal nReceiveTimeout As Long) As Long
-Private Declare PtrSafe Function WinHttpCloseHandle Lib "WinHttp" (ByVal hInternet As LongPtr) As Long
-
-' --- WebSocket API Declarations ---
-Private Declare PtrSafe Function WinHttpWebSocketCompleteUpgrade Lib "WinHttp" (ByVal hRequest As LongPtr, ByVal pContext As LongPtr) As LongPtr
-Private Declare PtrSafe Function WinHttpWebSocketSend Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByVal eBufferType As Long, ByRef pvBuffer As Any, ByVal dwBufferLength As Long) As Long
-Private Declare PtrSafe Function WinHttpWebSocketReceive Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByRef pvBuffer As Any, ByVal dwBufferLength As Long, ByRef pdwBytesRead As Long, ByRef peBufferType As Long) As Long
-Private Declare PtrSafe Function WinHttpWebSocketClose Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByVal usStatus As Long, ByRef pvReason As Any, ByVal dwReasonLength As Long) As Long
-Private Declare PtrSafe Function WinHttpWebSocketShutdown Lib "WinHttp" (ByVal hWebSocket As LongPtr, ByVal usStatus As Long, ByRef pvReason As Any, ByVal dwReasonLength As Long) As Long
-
-' --- Utility API Declarations ---
 Private Declare PtrSafe Sub SleepWinAPI Lib "kernel32" Alias "Sleep" (ByVal milliseconds As Long)
 Private Declare PtrSafe Function QueryPerformanceCounter Lib "kernel32" (lpPerformanceCount As Currency) As Long
 Private Declare PtrSafe Function QueryPerformanceFrequency Lib "kernel32" (lpFrequency As Currency) As Long
 
-' --- WinHttp Constants ---
-Private Const WINHTTP_ACCESS_TYPE_NO_PROXY As Long = 1
-Private Const WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET As Long = 114
-Private Const WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL As Long = 116
-Private Const WINHTTP_QUERY_STATUS_CODE As Long = 19
-Private Const WINHTTP_QUERY_FLAG_NUMBER As Long = &H20000000
-Private Const WINHTTP_HEADER_NAME_BY_INDEX As Long = 0
-Private Const WINHTTP_NO_HEADER_INDEX As Long = 0
-
-' --- WebSocket Buffer Types ---
-Private Const WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE  As Long = 0
-Private Const WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE As Long = 1
-Private Const WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE    As Long = 2
-Private Const WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE   As Long = 3
-Private Const WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE           As Long = 4
-
-' --- Library Settings ---
-Private Const NO_ERROR As Long = 0
-' [BiDi spec compliance] Reserved POSITIVE id band for system traffic (js-uint conformant).
-' Commands are issued only from [CMD_ID_FLOOR .. ID_MAX]; ids [1..99] never collide with them.
-' Heartbeat pings ROTATE within [3..99]; provided pongs return within the band cycle, no
-' duplicate ping id is outstanding (W3C unique-id rationale, as in the NO RESEND invariant).
-' Recognition is band-based:
-' IsReservedSystemId discards every root id below CMD_ID_FLOOR at both receive sites.
+' IDs [1..99] are reserved for PostScript and rotating heartbeat traffic.
+' Commands use [CMD_ID_FLOOR..ID_MAX]; id-less BiDi events are not system replies.
+' Reserved-band replies are consumed at both receive sites.
 Private Const CMD_ID_FLOOR As Long = 100         ' command ids: [100 .. ID_MAX]
 Private Const ID_MAX As Long = 2000000000        ' wrap ceiling (within VBA Long range)
 Private Const POST_SCRIPT_REPLY_ID As Long = 2   ' reserved fixed id: PostScript fire-and-forget reply (discarded)
 Private Const SYSTEM_PING_ID_MIN As Long = 3     ' heartbeat rotating id band floor
 Private Const SYSTEM_PING_ID_MAX As Long = 99    ' heartbeat rotating id band ceiling
 Private Const MAX_CONSECUTIVE_SOFT_TIMEOUTS As Long = 2 ' soft timeouts on one connection before StateError
-Private Const DEFAULT_BUFFER_SIZE As Long = 8192
-Private Const MAX_BUFFER_SIZE As Long = 10485760 ' 10MB
 Private Const DEFAULT_TIMEOUT_MS As Long = 30000
 Private Const DEFAULT_POLLING_INTERVAL_MS As Long = 100
-Private Const KEEPALIVE_INTERVAL_MS As Long = 15000
 
-' --- State & Handle Variables ---
-Private hSession_ As LongPtr
-Private hConnection_ As LongPtr
-Private hRequest_ As LongPtr
-Private hWebSocket_ As LongPtr
+Private m_wsTransportInitialized As Boolean
+' Only symbolic localhost may fall back from [::1] to 127.0.0.1.
+' Explicit numeric loopback addresses preserve the caller's address family.
+Private m_WinsockEffectiveWsUrl As String
+Private m_WinsockIpv4FallbackUsed As Boolean
+Private m_WinsockPrimaryFailureText As String
+Private Const WINSOCK_CONNECT_TIMEOUT_MS As Long = 2000
+Private Const WINSOCK_HANDSHAKE_TIMEOUT_MS As Long = 5000
+Private Const WINSOCK_SEND_TIMEOUT_MS As Long = 5000
+Private Const WINSOCK_PUMP_MAX_MS As Long = 10
+Private Const WINSOCK_PUMP_MAX_BYTES As Long = 262144
+Private Const WINSOCK_PUMP_MAX_CALLS As Long = 16
+
 Private m_LastWsUrl As String
 Private m_LastPort As Long
 Private m_RetryCount As Long
@@ -147,12 +61,9 @@ Private m_MaxRetryAttempts As Long
 Private m_AutoReconnect As Boolean
 Private m_consecutiveInternalErrors As Long
 
-' --- Robustness Semaphores & Timestamps ---
-Private m_isReading As Boolean
-Private m_isReadingSince As Double ' Tracks the timestamp of the last read lock
-Private m_discardActive As Boolean ' TRUE iff m_InStream holds a partially-discarded oversized message (persists across ReadFromWire calls; cleared only where m_InStream is truncated)
-Private m_isSendReceiving As Boolean ' True when a command sequence is active
-Private m_isRecovering As Boolean ' Re-entrancy lock for AttemptRecovery
+Private m_isReading As Boolean ' Non-yielding receive/Pump guard; structural release only
+Private m_isSendReceiving As Boolean ' True while one command owns response correlation
+Private m_isRecovering As Boolean ' Prevents nested connection recovery attempts
 
 Public Enum BiDiSocketState
     StateDisconnected = 0
@@ -161,20 +72,13 @@ Public Enum BiDiSocketState
     StateDisconnecting = 3
     StateError = 4
 End Enum
-Private m_State As BiDiSocketState
-Public Event StateChanged(ByVal NewState As BiDiSocketState, ByVal stateName As String)
+Private m_state As BiDiSocketState
+Public Event StateChanged(ByVal NewState As BiDiSocketState, ByVal StateName As String)
 
-' --- Internal Buffers & Objects ---
 Private m_EventBuffer As Collection
+
 Private m_DefaultTimeout As Long
 Private m_PollingInterval As Long
-Private m_BufferSize As Long
-Private m_MaxBufferSize As Long
-Private m_ReceiveBuffer() As Byte
-Private m_GrowThresholdCount As Long
-Private m_RecentFullReads As Long
-Private m_InStream As ADODB.Stream  ' Dedicated Read Stream
-Private m_OutStream As ADODB.Stream ' Dedicated Write Stream
 Private m_DroppedEventsCount As Long
 Private m_lastPollTime As Double
 Private m_RegExp As RegExp
@@ -182,346 +86,620 @@ Private m_AllowUiPump As Boolean
 Private m_qpcFreq As Currency ' QueryPerformanceFrequency cache (set in Class_Initialize)
 Private m_lastPumpTicks As Currency ' Throttle state for PumpMessages
 
-' --- Request ID Management (owner; see AI NAVIGATION MAP) ---
 Private m_nextRequestId As Long
 Private m_nextSystemPingId As Long ' heartbeat id rotation cursor [3..99]
 Private m_consecutiveSoftTimeouts As Long ' consecutive soft timeouts on the current connection
+
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging (mirrors Wrapper constant)
 Private Const DEFAULT_MAX_INCOMING_SIZE As Long = 2097152 ' 2MB: receive-side assembly cap (runtime-tunable via MaxIncomingSize)
-Private m_MaxIncomingSize As Long ' Receive-side cap; oversized messages are discarded with identity diagnostics
+Private m_maxIncomingSize As Long ' Receive-side cap; oversized messages are discarded with identity diagnostics
 
-' Initialization & Termination
+' Ws*/WS_*/m_ws_* members form the RFC 6455 engine: socket, handshake,
+' framing, masking and WebSocket ping/pong. Each Pump is work-bounded; BiDi IDs,
+' heartbeats, recovery and the event FIFO remain in the outer communicator layer.
+
+Private Const WS_DEBUG_MODE As Boolean = True
+
+Private Declare PtrSafe Function WsApi_WSAStartup Lib "ws2_32.dll" Alias "WSAStartup" (ByVal wVersionRequired As Integer, ByRef lpWSAData As WsWSADATA) As Long
+Private Declare PtrSafe Function WsApi_WSACleanup Lib "ws2_32.dll" Alias "WSACleanup" () As Long
+Private Declare PtrSafe Function WsApi_socket Lib "ws2_32.dll" Alias "socket" (ByVal af As Long, ByVal socketType As Long, ByVal protocol As Long) As LongPtr
+Private Declare PtrSafe Function WsApi_closesocket Lib "ws2_32.dll" Alias "closesocket" (ByVal s As LongPtr) As Long
+Private Declare PtrSafe Function WsApi_connectSocket Lib "ws2_32.dll" Alias "connect" (ByVal s As LongPtr, ByRef socketAddress As Any, ByVal nameLength As Long) As Long
+Private Declare PtrSafe Function WsApi_sendSocket Lib "ws2_32.dll" Alias "send" (ByVal s As LongPtr, ByRef Buffer As Any, ByVal bufferLength As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_recvSocket Lib "ws2_32.dll" Alias "recv" (ByVal s As LongPtr, ByRef Buffer As Any, ByVal bufferLength As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_ioctlsocket Lib "ws2_32.dll" Alias "ioctlsocket" (ByVal s As LongPtr, ByVal command As Long, ByRef argument As Long) As Long
+Private Declare PtrSafe Function WsApi_selectSocket Lib "ws2_32.dll" Alias "select" (ByVal ignored As Long, ByRef readSet As WsFD_SET, ByRef writeSet As WsFD_SET, ByRef exceptSet As WsFD_SET, ByRef TIMEOUT As WsTIMEVAL) As Long
+Private Declare PtrSafe Function WsApi_getsockopt Lib "ws2_32.dll" Alias "getsockopt" (ByVal s As LongPtr, ByVal level As Long, ByVal optionName As Long, ByRef optionValue As Long, ByRef optionLength As Long) As Long
+Private Declare PtrSafe Function WsApi_setsockopt Lib "ws2_32.dll" Alias "setsockopt" (ByVal s As LongPtr, ByVal level As Long, ByVal optionName As Long, ByRef optionValue As Any, ByVal optionLength As Long) As Long
+Private Declare PtrSafe Function WsApi_shutdownSocket Lib "ws2_32.dll" Alias "shutdown" (ByVal s As LongPtr, ByVal how As Long) As Long
+Private Declare PtrSafe Function WsApi_WSAGetLastError Lib "ws2_32.dll" Alias "WSAGetLastError" () As Long
+Private Declare PtrSafe Function WsApi_InetPtonW Lib "ws2_32.dll" Alias "InetPtonW" (ByVal addressFamily As Long, ByVal addressText As LongPtr, ByRef addressBuffer As Any) As Long
+
+Private Declare PtrSafe Sub WsApi_SleepWinAPI Lib "kernel32" Alias "Sleep" (ByVal milliseconds As Long)
+Private Declare PtrSafe Function WsApi_QueryPerformanceCounter Lib "kernel32" Alias "QueryPerformanceCounter" (ByRef performanceCount As Currency) As Long
+Private Declare PtrSafe Function WsApi_QueryPerformanceFrequency Lib "kernel32" Alias "QueryPerformanceFrequency" (ByRef frequency As Currency) As Long
+
+Private Declare PtrSafe Function WsApi_BCryptGenRandom Lib "bcrypt.dll" Alias "BCryptGenRandom" (ByVal hAlgorithm As LongPtr, ByRef randomBuffer As Any, ByVal bufferSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptOpenAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptOpenAlgorithmProvider" (ByRef algorithmHandle As LongPtr, ByVal algorithmId As LongPtr, ByVal implementation As LongPtr, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptCloseAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptCloseAlgorithmProvider" (ByVal algorithmHandle As LongPtr, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptGetProperty Lib "bcrypt.dll" Alias "BCryptGetProperty" (ByVal objectHandle As LongPtr, ByVal propertyName As LongPtr, ByRef outputBuffer As Any, ByVal outputSize As Long, ByRef resultSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptCreateHash Lib "bcrypt.dll" Alias "BCryptCreateHash" (ByVal algorithmHandle As LongPtr, ByRef hashHandle As LongPtr, ByRef hashObject As Any, ByVal hashObjectSize As Long, ByVal secret As LongPtr, ByVal secretSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptHashData Lib "bcrypt.dll" Alias "BCryptHashData" (ByVal hashHandle As LongPtr, ByRef inputBuffer As Any, ByVal inputSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptFinishHash Lib "bcrypt.dll" Alias "BCryptFinishHash" (ByVal hashHandle As LongPtr, ByRef outputBuffer As Any, ByVal outputSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptDestroyHash Lib "bcrypt.dll" Alias "BCryptDestroyHash" (ByVal hashHandle As LongPtr) As Long
+
+
+Private Type WsWSADATA
+    version As Integer
+    highVersion As Integer
+    description(0 To 256) As Byte
+    systemStatus(0 To 128) As Byte
+    maxSockets As Integer
+    maxUdpDg As Integer
+    vendorInfo As LongPtr
+End Type
+
+Private Type WsSOCKADDR_IN
+    family As Integer
+    port As Integer
+    address As Long
+    zero(0 To 7) As Byte
+End Type
+
+Private Type WsSOCKADDR_IN6
+    family As Integer
+    port As Integer
+    flowInfo As Long
+    address(0 To 15) As Byte
+    scopeId As Long
+End Type
+
+Private Type WsFD_SET
+    count As Long
+    sockets(0 To 63) As LongPtr
+End Type
+
+Private Type WsTIMEVAL
+    seconds As Long
+    microseconds As Long
+End Type
+
+Private Const WS_AF_INET As Long = 2
+Private Const WS_AF_INET6 As Long = 23
+Private Const WS_SOCK_STREAM As Long = 1
+Private Const WS_IPPROTO_TCP As Long = 6
+Private Const WS_TCP_NODELAY As Long = 1
+Private Const WS_SOCKET_ERROR As Long = -1
+Private Const WS_FIONBIO As Long = &H8004667E
+Private Const WS_SOL_SOCKET As Long = &HFFFF&
+Private Const WS_SO_ERROR As Long = &H1007&
+Private Const WS_SD_BOTH As Long = 2
+
+Private Const WS_WSAEWOULDBLOCK As Long = 10035
+Private Const WS_WSAEINPROGRESS As Long = 10036
+Private Const WS_WSAEALREADY As Long = 10037
+Private Const WS_WSAEISCONN As Long = 10056
+Private Const WS_WSAECONNRESET As Long = 10054
+Private Const WS_WSAECONNABORTED As Long = 10053
+Private Const WS_WSAENOTCONN As Long = 10057
+
+Private Const WS_OPCODE_CONTINUATION As Long = 0
+Private Const WS_OPCODE_TEXT As Long = 1
+Private Const WS_OPCODE_BINARY As Long = 2
+Private Const WS_OPCODE_CLOSE As Long = 8
+Private Const WS_OPCODE_PING As Long = 9
+Private Const WS_OPCODE_PONG As Long = 10
+
+Private Const WS_DEFAULT_CONNECT_TIMEOUT_MS As Long = 2000
+Private Const WS_DEFAULT_HANDSHAKE_TIMEOUT_MS As Long = 5000
+Private Const WS_DEFAULT_MAX_INCOMING_SIZE As Long = 2097152
+Private Const WS_DEFAULT_MAX_PUMP_MS As Long = 10
+Private Const WS_DEFAULT_MAX_PUMP_BYTES As Long = 262144
+Private Const WS_DEFAULT_MAX_PUMP_CALLS As Long = 16
+Private Const WS_RECEIVE_CHUNK_SIZE As Long = 16384
+Private Const WS_PARSER_COPY_CHUNK_SIZE As Long = 4096
+Private Const WS_PARSER_COPY_GUARD_MS As Double = 1#
+Private Const WS_MAX_COMPLETED_MESSAGES_PER_PUMP As Long = 8
+Private Const WS_MAX_HTTP_HEADER_SIZE As Long = 32768
+
+Private Const WS_BCRYPT_USE_SYSTEM_PREFERRED_RNG As Long = &H2
+Private Const WS_BCRYPT_STATUS_SUCCESS As Long = 0
+Private Const WS_MASK_KEY_SIZE As Long = 4
+
+Private Const WS_CLIENT_PING_INTERVAL_MS As Long = 15000
+Private Const WS_CLIENT_PING_PAYLOAD_SIZE As Long = 4
+Private Const WS_CLIENT_PING_BUSY_RETRY_MS As Long = 1000
+
+Private Const WS_HANDSHAKE_NONCE_SIZE As Long = 16
+Private Const WS_WEBSOCKET_GUID As String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+Private Const WS_BCRYPT_SHA1_ALGORITHM As String = "SHA1"
+Private Const WS_BCRYPT_OBJECT_LENGTH As String = "ObjectLength"
+Private Const WS_BCRYPT_HASH_LENGTH As String = "HashDigestLength"
+
+Private Const WS_HANDSHAKE_ORIGIN_SCHEME As String = "http://"
+Private Const WS_HANDSHAKE_USER_AGENT As String = _
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+
+Private Enum WsWinsockTransportState
+    WsTransportDisconnected = 0
+    WsTransportConnecting = 1
+    WsTransportHandshakeSending = 2
+    WsTransportHandshakeReceiving = 3
+    WsTransportOpen = 4
+    WsTransportClosing = 5
+    WsTransportFailed = 6
+End Enum
+
+Private Enum WsFrameParserState
+    WsFrameReadBaseHeader = 0
+    WsFrameReadExtendedLength = 1
+    WsFrameReadPayload = 2
+    WsFrameFinalize = 3
+End Enum
+
+Private m_ws_state As WsWinsockTransportState
+Private m_ws_socket As LongPtr
+Private m_ws_wsaStarted As Boolean
+Private m_ws_qpcFrequency As Currency
+
+Private m_ws_url As String
+Private m_ws_host As String
+Private m_ws_hostHeader As String
+Private m_ws_path As String
+Private m_ws_port As Long
+Private m_ws_phaseDeadlineMs As Double
+Private m_ws_handshakeTimeoutMs As Long
+
+Private m_ws_handshakeClientKey As String
+Private m_ws_expectedHandshakeAccept As String
+Private m_ws_handshakeOrigin As String
+Private m_ws_handshakeUserAgent As String
+Private m_ws_handshakeValidationError As String
+Private m_ws_LastErrorCode As Long
+Private m_ws_lastErrorText As String
+
+Private m_ws_sendQueue As Collection
+Private m_ws_sendCurrent() As Byte
+Private m_ws_sendCurrentCount As Long
+Private m_ws_sendOffset As Long
+
+Private m_ws_rawBuffer() As Byte
+Private m_ws_rawCount As Long
+Private m_ws_rawReadPos As Long
+
+Private m_ws_rawTextQueue As Collection
+Private m_ws_rawTextLengthQueue As Collection
+Private m_ws_maxIncomingSize As Long
+
+Private m_ws_frameState As WsFrameParserState
+Private m_ws_frameFin As Boolean
+Private m_ws_frameOpcode As Long
+Private m_ws_frameLengthCode As Long
+Private m_ws_framePayloadLength As Long
+Private m_ws_framePayloadRemaining As Long
+Private m_ws_frameDiscardPayload As Boolean
+Private m_ws_controlPayload() As Byte
+Private m_ws_controlCount As Long
+
+Private m_ws_messageActive As Boolean
+Private m_ws_messageOpcode As Long
+Private m_ws_messageChunks As Collection
+Private m_ws_messageCount As Long
+Private m_ws_discardMessage As Boolean
+
+Private m_ws_closeSent As Boolean
+
+Private m_ws_currentPumpCompletedMessages As Long
+
+Private m_ws_clientPingEnabled As Boolean
+Private m_ws_nextClientPingAtMs As Double
+Private m_ws_clientPingOutstanding As Boolean
+Private m_ws_clientPingSequence As Long
+Private m_ws_clientPingOutstandingSequence As Long
+
 Private Sub Class_Initialize()
-    ' Fail-fast QPC initialization. Required for all timer APIs (NowTicks/NowMs/ElapsedMs).
     If QueryPerformanceFrequency(m_qpcFreq) = 0 Or m_qpcFreq <= 0 Then
         Err.Raise vbObjectError + 9001, "BiDiSocketCommunicator", _
                   "QueryPerformanceFrequency is unavailable on this system. QPC support is required."
     End If
+
     m_DefaultTimeout = DEFAULT_TIMEOUT_MS
     m_PollingInterval = DEFAULT_POLLING_INTERVAL_MS
     m_AllowUiPump = True
-    
-    m_BufferSize = DEFAULT_BUFFER_SIZE
-    ReDim m_ReceiveBuffer(m_BufferSize - 1)
-    m_MaxBufferSize = MAX_BUFFER_SIZE
-    m_MaxIncomingSize = DEFAULT_MAX_INCOMING_SIZE
+    m_maxIncomingSize = DEFAULT_MAX_INCOMING_SIZE
 
     Set m_EventBuffer = New Collection
-    
-    ' Maintain separate streams for Read and Write to prevent reentrancy collisions
-    Set m_InStream = New ADODB.Stream
-    m_InStream.mode = adModeReadWrite
-    m_InStream.Open
 
-    Set m_OutStream = New ADODB.Stream
-    m_OutStream.mode = adModeReadWrite
-    m_OutStream.Open
-    
-    ' Initial pattern for ExtractJsonId (will be updated JIT if needed)
     Set m_RegExp = New RegExp
     m_RegExp.Global = False
     m_RegExp.IgnoreCase = True
-    
-    ' Enable controlled auto-reconnect by default
-    m_MaxRetryAttempts = 5      ' up to 5 attempts with exponential backoff
-    m_AutoReconnect = True      ' allow recovery
 
-    ' Moderate buffer growth threshold (3 consecutive full reads)
-    m_GrowThresholdCount = 3
+    m_MaxRetryAttempts = 5
+    m_AutoReconnect = True
 
-    ' Request ID seed (first issued id = CMD_ID_FLOOR)
     m_nextRequestId = CMD_ID_FLOOR - 1
-    ' Heartbeat id seed (first issued ping id = SYSTEM_PING_ID_MIN)
     m_nextSystemPingId = SYSTEM_PING_ID_MIN - 1
 
     SetState StateDisconnected
 End Sub
 
 Private Sub Class_Terminate()
-' Ensure all handles, streams, and semaphores are cleaned up.
-    ' If the macro was forcefully stopped (Stop button, End statement, Ctrl+Break)
-    ' during an active SendAndReceive or ReadFromWire cycle, these flags remain True.
-    ' Without resetting them here, any subsequent reuse of the object (or a new instance
-    ' that inherits the module-level state in edge cases) would deadlock permanently.
+    ' Teardown is non-raising. Clear communicator-owned guards before native handles
+    ' so an interrupted call cannot poison later reuse.
+    On Error Resume Next
     m_isSendReceiving = False
     m_isReading = False
-    m_isReadingSince = 0
-    
+
     Disconnect
-    If Not m_InStream Is Nothing Then
-        If m_InStream.State = adStateOpen Then m_InStream.Close
-        Set m_InStream = Nothing
-    End If
-    If Not m_OutStream Is Nothing Then
-        If m_OutStream.State = adStateOpen Then m_OutStream.Close
-        Set m_OutStream = Nothing
+    If m_wsTransportInitialized Then
+        WsTransportTerminate
+        m_wsTransportInitialized = False
     End If
     Set m_RegExp = Nothing
     Set m_EventBuffer = Nothing
+    On Error GoTo 0
 End Sub
 
-' Resets the target stream state and sets the required type without cross-talk
-Private Sub PrepareStream(ByVal strm As ADODB.Stream, ByVal sType As StreamTypeEnum)
-    If strm.State = adStateClosed Then strm.Open
-    strm.Position = 0
-    strm.SetEOS ' Truncate existing data
-    strm.Type = sType
-End Sub
-
-' Helper to safely release stream resources
-Private Sub CloseStream(ByRef strm As ADODB.Stream)
-    If Not strm Is Nothing Then
-        If strm.State = adStateOpen Then strm.Close
-        Set strm = Nothing
+Public Property Get IsConnected() As Boolean
+    If m_wsTransportInitialized Then
+        IsConnected = WsIsOpen
     End If
-End Sub
+End Property
 
-' Public Properties
-Public Property Get IsConnected() As Boolean: IsConnected = (hWebSocket_ <> 0): End Property
+' Compatibility shim: WinSock is the only transport; False is rejected and True
+' is accepted only while disconnected.
+Public Property Let UseWinsockTransport(ByVal v As Boolean)
+    If Not v Then
+        Err.Raise vbObjectError + 9105, "BiDiSocketCommunicator", _
+                  "The legacy WinHTTP transport has been removed. WinSock is the only supported transport."
+    End If
+    If m_state <> StateDisconnected Then
+        Err.Raise vbObjectError + 9102, "BiDiSocketCommunicator", _
+                  "Transport mode can be confirmed only while disconnected."
+    End If
+End Property
+
+Public Property Get UseWinsockTransport() As Boolean
+    UseWinsockTransport = True
+End Property
+
+Public Property Get WinsockEffectiveWebSocketUrl() As String
+    WinsockEffectiveWebSocketUrl = m_WinsockEffectiveWsUrl
+End Property
+
+Public Property Get WinsockIpv4FallbackUsed() As Boolean
+    WinsockIpv4FallbackUsed = m_WinsockIpv4FallbackUsed
+End Property
+
+Public Property Get WinsockPrimaryFailureText() As String
+    WinsockPrimaryFailureText = m_WinsockPrimaryFailureText
+End Property
+
 Public Property Let PollingInterval(ByVal v As Long): m_PollingInterval = v: End Property
 Public Property Let AllowUiPump(ByVal v As Boolean): m_AllowUiPump = v: End Property
 Public Property Get AllowUiPump() As Boolean: AllowUiPump = m_AllowUiPump: End Property
-Public Property Get State() As BiDiSocketState: State = m_State: End Property
+Public Property Get state() As BiDiSocketState: state = m_state: End Property
 Public Property Let AutoReconnect(ByVal v As Boolean): m_AutoReconnect = v: End Property
 Public Property Get AutoReconnect() As Boolean: AutoReconnect = m_AutoReconnect: End Property
 Public Property Get ConsecutiveInternalErrors() As Long: ConsecutiveInternalErrors = m_consecutiveInternalErrors: End Property
-' MaxIncomingSize: receive-side assembly cap in bytes. Floor guard: values below
-' MAX_MSG_SIZE would discard legitimate command responses, so they are clamped.
+' MaxIncomingSize is a receive-assembly byte cap and is clamped to MAX_MSG_SIZE
+' so valid command responses are not rejected by configuration.
 Public Property Let MaxIncomingSize(ByVal v As Long)
     If v < MAX_MSG_SIZE Then v = MAX_MSG_SIZE
-    m_MaxIncomingSize = v
+    m_maxIncomingSize = v
+
+    If m_wsTransportInitialized Then
+        WsMaxIncomingSize = v
+    End If
+
 End Property
-Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_MaxIncomingSize: End Property
+Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_maxIncomingSize: End Property
 Public Property Get DroppedEventsCount() As Long: DroppedEventsCount = m_DroppedEventsCount: End Property
 
 Private Sub SetState(ByVal NewState As BiDiSocketState)
-    If m_State = NewState Then Exit Sub
+    If m_state = NewState Then Exit Sub
     
-    m_State = NewState
+    m_state = NewState
     
-    Dim stateName As String
-    Select Case m_State
-        Case StateDisconnected: stateName = "DISCONNECTED"
-        Case StateConnecting:   stateName = "CONNECTING"
-        Case StateConnected:    stateName = "CONNECTED"
-        Case StateDisconnecting: stateName = "DISCONNECTING"
-        Case StateError:         stateName = "ERROR"
+    Dim StateName As String
+    Select Case m_state
+        Case StateDisconnected: StateName = "DISCONNECTED"
+        Case StateConnecting:   StateName = "CONNECTING"
+        Case StateConnected:    StateName = "CONNECTED"
+        Case StateDisconnecting: StateName = "DISCONNECTING"
+        Case StateError:         StateName = "ERROR"
     End Select
     
-    If DEBUG_MODE Then Debug.Print "BiDi State Changed: " & stateName
-    RaiseEvent StateChanged(m_State, stateName)
+    If DEBUG_MODE Then Debug.Print "BiDi State Changed: " & StateName
+    RaiseEvent StateChanged(m_state, StateName)
 End Sub
 
-' Establishes a WebSocket connection to the WebDriver BiDi endpoint.
-' Utilizes a state machine to prevent redundant connection attempts and manages lifecycle.
 Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boolean
-    ' Guard: Prevent connection attempts if already connected or in progress
-    If m_State = StateConnecting Or m_State = StateConnected Then
-        If DEBUG_MODE Then Debug.Print "BiDi: Connect aborted. Current state is " & m_State
+    If m_state = StateConnecting Or m_state = StateConnected Then
+        If DEBUG_MODE Then Debug.Print "BiDi: Connect aborted. Current state is " & m_state
         Exit Function
     End If
-    
-    ' --- SECURITY ENFORCEMENT: STRICT LOOPBACK VALIDATION ---
-    ' [INTENT] Ensure the WebSocket connection is strictly bound to the local machine.
-    m_RegExp.pattern = "^wss?://(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:/|$)"
+
+    ' Reject anything except loopback ws:// before entering the RFC 6455 parser.
+    m_RegExp.pattern = "^ws://(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:/|$)"
     m_RegExp.IgnoreCase = True
-    
+
     If Not m_RegExp.Test(wsUrl) Then
-        Trace "[Security] Blocked: Connection attempt to non-local address. " & _
-              "BiDi communication is restricted to localhost for safety.", True
+        Trace "[Security] Blocked: endpoint must be a ws:// loopback URL " & _
+              "using localhost, 127.0.0.1, or [::1].", True
         SetState StateError
         Exit Function
     End If
-    
-    ' Store connection parameters for potential recovery attempts
+
     m_LastWsUrl = wsUrl
     m_LastPort = localPort
 
     On Error GoTo ErrorHandler
 
     SetState StateConnecting
-    
-    ' Ensure any residual handles are cleaned up before a new attempt
-    Call InternalCleanup
-    
-    If wsUrl = "" Or localPort = 0 Then
-        If DEBUG_MODE Then Debug.Print "BiDi: Connect failed. Invalid URL or Port."
-        GoTo ErrorHandler
-    End If
-    
-    Dim Path As String: Path = ExtractPath(wsUrl)
-    
-    ' WHY: dynamically extract the host to match the actual binding
-    Dim host As String: host = ExtractHost(wsUrl)
+    InternalCleanup
 
-    hSession_ = WinHttpOpen(StrPtr(AGENT_NAME), WINHTTP_ACCESS_TYPE_NO_PROXY, 0, 0, 0)
-    If hSession_ = 0 Then Err.Raise 513, "BiDiSocket", "WinHttpOpen failed"
-
-    ' --- RATIONALE: UI RESPONSIVENESS vs CPU BALANCE ---
-    ' Set connection-related timeouts (Resolve, Connect, Send, Receive)
-    WinHttpSetTimeouts hSession_, 2000, 2000, 5000, 100
-    
-    hConnection_ = WinHttpConnect(hSession_, StrPtr(host), localPort, 0)
-    If hConnection_ = 0 Then Err.Raise 514, "BiDiSocket", "WinHttpConnect failed"
-
-    hRequest_ = WinHttpOpenRequest(hConnection_, StrPtr("GET"), StrPtr(Path), StrPtr("HTTP/1.1"), 0, 0, 0)
-    If hRequest_ = 0 Then Err.Raise 515, "BiDiSocket", "WinHttpOpenRequest failed"
-
-    ' Configure the request for WebSocket upgrade
-    Dim nullPtr As LongPtr: nullPtr = 0
-    If WinHttpSetOption(hRequest_, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, ByVal nullPtr, 0) = 0 Then
-        Err.Raise 516, "BiDiSocket", "Failed to set WebSocket upgrade option"
+    If LenB(wsUrl) = 0 Or localPort = 0 Then
+        Err.Raise 512, "BiDiSocket", "Invalid WebSocket URL or port."
     End If
 
-    If WinHttpSendRequest(hRequest_, 0, 0, 0, 0, 0, 0) = 0 Then Err.Raise 517, "BiDiSocket", "SendRequest failed"
-    If WinHttpReceiveResponse(hRequest_, 0) = 0 Then Err.Raise 518, "BiDiSocket", "ReceiveResponse failed"
-
-    ' Verify Status 101 (Switching Protocols)
-    Dim status As Long, Size As Long: Size = 4
-    Dim idx As Long: idx = WINHTTP_NO_HEADER_INDEX
-    Dim headerRet As Long
-    
-    headerRet = WinHttpQueryHeaders(hRequest_, _
-                        WINHTTP_QUERY_STATUS_CODE Or WINHTTP_QUERY_FLAG_NUMBER, _
-                        WINHTTP_HEADER_NAME_BY_INDEX, _
-                        status, Size, idx)
-    
-    If headerRet <> 0 And status = 101 Then
-        hWebSocket_ = WinHttpWebSocketCompleteUpgrade(hRequest_, 0)
-
-        ' INVARIANT (HANDLE OWNERSHIP): the request handle and the WebSocket handle are independent.
-        ' If CompleteUpgrade fails, close the request handle and abort.
-        If hWebSocket_ = 0 Then
-            On Error Resume Next
-            WinHttpCloseHandle hRequest_
-            On Error GoTo ErrorHandler
-            hRequest_ = 0
-            Err.Raise 520, "BiDiSocket", "WebSocket upgrade failed"
-        End If
-
-        ' INVARIANT (HANDLE OWNERSHIP): on success the request handle is no longer needed and must be
-        ' closed (per WinHTTP docs/official sample); the WebSocket handle stays valid.
-        ' Not closing it would leak one request handle per connection.
-        On Error Resume Next
-        WinHttpCloseHandle hRequest_
-        On Error GoTo ErrorHandler
-        hRequest_ = 0
-
-        ' Configure Keep-Alive to maintain connection
-        Dim ka As Long: ka = KEEPALIVE_INTERVAL_MS
-        WinHttpSetOption hWebSocket_, WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL, ka, 4
-        
-        m_DroppedEventsCount = 0
-        
-        m_lastPollTime = 0
-        m_RetryCount = 0
-        m_consecutiveSoftTimeouts = 0 ' fresh connection: reset silence tracking
-        SetState StateConnected
+    If ConnectWithWinsock(wsUrl) Then
         Connect = True
-    Else
-        Err.Raise 519, "BiDiSocket", "Upgrade rejected. API Result: " & headerRet & " Status: " & status
+        Exit Function
     End If
-    Exit Function
+
+    Err.Raise 521, "BiDiSocket", _
+              "Winsock WebSocket connection failed: " & GetWinsockFailureText()
 
 ErrorHandler:
-    ' On any failure, transition to Error state and perform handle cleanup
     SetState StateError
-    Call InternalCleanup
+    InternalCleanup
     Connect = False
 End Function
 
-' Sends a raw UTF-8 string message through the WebSocket.
-' allowRecovery:=False makes this a best-effort send: on StateError or send failure
-' it exits/returns False WITHOUT invoking AttemptRecovery (no backoff wait). Used by
-' PostScript so fire-and-forget skips the recovery backoff and waits on no reply; the
-' synchronous WinHttpWebSocketSend itself can still block under TCP backpressure.
-Public Function SendMessage(ByVal Msg As String, Optional ByVal allowRecovery As Boolean = True) As Boolean
-    If LenB(Msg) = 0 Then Exit Function
-    
-    ' NEW: Log every send attempt before it happens
+Private Function ConnectWithWinsock(ByVal wsUrl As String) As Boolean
+    On Error GoTo ErrorHandler
+
+    m_WinsockEffectiveWsUrl = vbNullString
+    m_WinsockIpv4FallbackUsed = False
+    m_WinsockPrimaryFailureText = vbNullString
+
+    Dim primaryUrl As String
+    Dim fallbackUrl As String
+    Dim originalHost As String
+    originalHost = LCase$(ExtractHost(wsUrl))
+
+    Select Case originalHost
+        Case "localhost"
+            ' For symbolic localhost, try [::1] first and fall back to 127.0.0.1 only if
+            ' failure occurs before OPEN. Explicit numeric hosts never switch family.
+            primaryUrl = ReplaceLoopbackHost(wsUrl, "[::1]")
+            fallbackUrl = ReplaceLoopbackHost(wsUrl, "127.0.0.1")
+
+        Case "::1", "127.0.0.1"
+            primaryUrl = wsUrl
+        Case Else
+            primaryUrl = wsUrl
+    End Select
+
+    If TryConnectWithWinsockUrl(primaryUrl) Then
+        ConnectWithWinsock = True
+        Exit Function
+    End If
+
+    If Len(fallbackUrl) > 0 Then
+        m_WinsockPrimaryFailureText = GetWinsockFailureText()
+        Trace "BiDi Winsock: IPv6 loopback failed before OPEN; trying IPv4 fallback. " & _
+              m_WinsockPrimaryFailureText, True
+
+        If TryConnectWithWinsockUrl(fallbackUrl) Then
+            m_WinsockIpv4FallbackUsed = True
+            ConnectWithWinsock = True
+            Exit Function
+        End If
+    End If
+
+    Exit Function
+
+ErrorHandler:
+    m_ws_LastErrorCode = Err.Number
+    m_ws_lastErrorText = "ConnectWithWinsock VBA error: " & Err.description
+    ConnectWithWinsock = False
+End Function
+
+Private Function TryConnectWithWinsockUrl(ByVal candidateUrl As String) As Boolean
+    On Error GoTo ErrorHandler
+
+    Dim diagnosticStage As String
+    diagnosticStage = "entry"
+
+    If Not m_wsTransportInitialized Then
+        diagnosticStage = "WsTransportInitialize"
+        WsTransportInitialize
+        m_wsTransportInitialized = True
+    End If
+
+    diagnosticStage = "WsMaxIncomingSize"
+    WsMaxIncomingSize = m_maxIncomingSize
+
+    diagnosticStage = "WsBeginConnect"
+    If Not WsBeginConnect( _
+        candidateUrl, WINSOCK_CONNECT_TIMEOUT_MS, WINSOCK_HANDSHAKE_TIMEOUT_MS) Then
+        Exit Function
+    End If
+
+    Dim deadline As Double
+    deadline = nowMs() + WINSOCK_CONNECT_TIMEOUT_MS + WINSOCK_HANDSHAKE_TIMEOUT_MS + 1000
+
+    Do
+        diagnosticStage = "WsPump"
+        WsPump WINSOCK_PUMP_MAX_MS, _
+                                WINSOCK_PUMP_MAX_BYTES, _
+                                WINSOCK_PUMP_MAX_CALLS
+
+        If WsIsOpen Then
+            m_WinsockEffectiveWsUrl = candidateUrl
+            FinalizeConnectedState
+            Trace "BiDi Winsock: OPEN via " & WinsockEndpointFamily(candidateUrl) & _
+                  " loopback. Effective URL: " & candidateUrl
+            TryConnectWithWinsockUrl = True
+            Exit Function
+        End If
+
+        If Wsstate = WsTransportFailed Then
+            Exit Function
+        End If
+        If nowMs() >= deadline Then
+            m_ws_LastErrorCode = 9291
+            m_ws_lastErrorText = "Outer connection deadline expired while state=" & WsStateName
+            Exit Function
+        End If
+
+        SleepWinAPI 0
+    Loop
+
+ErrorHandler:
+    m_ws_LastErrorCode = Err.Number
+    m_ws_lastErrorText = "TryConnectWithWinsockUrl VBA error at " & diagnosticStage & ": " & Err.description
+    TryConnectWithWinsockUrl = False
+End Function
+
+Private Function ReplaceLoopbackHost(ByVal wsUrl As String, _
+                                     ByVal replacementHost As String) As String
+    Dim schemeEnd As Long
+    schemeEnd = InStr(1, wsUrl, "://", vbTextCompare)
+    If schemeEnd = 0 Then Exit Function
+
+    Dim authorityStart As Long
+    authorityStart = schemeEnd + 3
+
+    Dim pathStart As Long
+    pathStart = InStr(authorityStart, wsUrl, "/", vbBinaryCompare)
+    If pathStart = 0 Then pathStart = Len(wsUrl) + 1
+
+    Dim authority As String
+    authority = Mid$(wsUrl, authorityStart, pathStart - authorityStart)
+    If Len(authority) = 0 Then Exit Function
+
+    Dim portPart As String
+    If Left$(authority, 1) = "[" Then
+        Dim closeBracket As Long
+        closeBracket = InStr(1, authority, "]", vbBinaryCompare)
+        If closeBracket = 0 Then Exit Function
+        portPart = Mid$(authority, closeBracket + 1)
+    Else
+        Dim colonPos As Long
+        colonPos = InStrRev(authority, ":", -1, vbBinaryCompare)
+        If colonPos > 0 Then portPart = Mid$(authority, colonPos)
+    End If
+
+    ReplaceLoopbackHost = Left$(wsUrl, authorityStart - 1) & _
+                          replacementHost & portPart & Mid$(wsUrl, pathStart)
+End Function
+
+Private Function WinsockEndpointFamily(ByVal wsUrl As String) As String
+    If LCase$(ExtractHost(wsUrl)) = "::1" Then
+        WinsockEndpointFamily = "IPv6"
+    Else
+        WinsockEndpointFamily = "IPv4"
+    End If
+End Function
+
+Private Sub FinalizeConnectedState()
+    m_DroppedEventsCount = 0
+    m_lastPollTime = 0
+    m_RetryCount = 0
+    m_consecutiveSoftTimeouts = 0
+    SetState StateConnected
+End Sub
+
+Private Function GetWinsockFailureText() As String
+    If m_ws_LastErrorCode <> 0 Or Len(m_ws_lastErrorText) > 0 Then
+        GetWinsockFailureText = CStr(m_ws_LastErrorCode) & " / " & m_ws_lastErrorText
+    ElseIf Not m_wsTransportInitialized Then
+        GetWinsockFailureText = "integrated transport was not initialized"
+    Else
+        GetWinsockFailureText = CStr(WsLastErrorCode) & _
+                                " / " & WsLastErrorText
+    End If
+End Function
+
+Private Function SendMessageWinsock(ByVal msg As String) As Boolean
+    If Not m_wsTransportInitialized Then Exit Function
+    If Not WsIsOpen Then Exit Function
+    If Not WsQueueText(msg) Then Exit Function
+
+    Dim deadline As Double
+    deadline = nowMs() + WINSOCK_SEND_TIMEOUT_MS
+
+    Do While WsHasPendingOutput
+        WsPump WINSOCK_PUMP_MAX_MS, _
+               WINSOCK_PUMP_MAX_BYTES, _
+               WINSOCK_PUMP_MAX_CALLS
+
+        If Wsstate = WsTransportFailed Then Exit Function
+        If nowMs() >= deadline Then Exit Function
+
+        SleepWinAPI 0
+    Loop
+
+    If Not WsIsOpen Then Exit Function
+    SendMessageWinsock = True
+End Function
+
+' allowRecovery=False is PostScript's best-effort send-only path. Recovery may
+' repair a failed socket, but SendMessage returns False and never replays the payload.
+Public Function SendMessage(ByVal msg As String, Optional ByVal allowRecovery As Boolean = True) As Boolean
+    If LenB(msg) = 0 Then Exit Function
+
     Trace ">>> [Socket] Attempting to send message..."
 
-    If m_State = StateError Then
+    If m_state = StateError Then
         If Not allowRecovery Then Exit Function
         If Not AttemptRecovery() Then Exit Function
     End If
 
-    If m_State <> StateConnected Then
+    If m_state <> StateConnected Then
         Trace ">>> [Socket] Send aborted. Not connected.", True
         Exit Function
     End If
 
-    Dim data() As Byte: data = ToUtf8Bytes(Msg)
-    
-    Dim dataSize As Long
-    On Error Resume Next
-    dataSize = UBound(data) - LBound(data) + 1
-    If Err.Number <> 0 Then dataSize = 0
-    Err.Clear
-    On Error GoTo 0
-    
-    If dataSize <= 0 Then
-        Trace ">>> [Socket] Empty payload after UTF-8 conversion. Aborting.", True
-        Exit Function
-    End If
-    
-    Dim ret As Long
-    ret = WinHttpWebSocketSend(hWebSocket_, _
-                               WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, _
-                               data(0), _
-                               dataSize)
-    
-    If ret = NO_ERROR Then
+    If SendMessageWinsock(msg) Then
         SendMessage = True
         Exit Function
     End If
 
-    Trace ">>> [Socket] SendMessage failed. Error: " & ret, True
+    Trace ">>> [Socket] Winsock send failed. " & GetWinsockFailureText(), True
     SetState StateError
     Disconnect keepErrorState:=True
-    
-    ' INVARIANT (NO RESEND): protocol compliance
-    ' W3C WebDriver BiDi request IDs must remain unique within the session.
-    ' Resending an identical JSON payload after a socket drop may reuse an ID
-    ' that the peer is still tracking, so we never replay it on the recovered
-    ' connection.
-    ' We heal the connection here, but strictly return False so the upper layer
-    ' handles the failure (e.g., re-generating the ID or raising an exception).
-    ' Best-effort sends (allowRecovery:=False) skip healing entirely.
+
+    ' NO RESEND: the peer may already have accepted the request ID. Any safe retry is
+    ' an upper-layer decision using a newly allocated ID.
     If allowRecovery Then Call AttemptRecovery
     SendMessage = False
 End Function
 
-' PostScript: Fire & Forget transport. Sends a message without expecting a response.
-' Best-effort: never triggers recovery/backoff (see SendMessage allowRecovery).
-Public Sub PostScript(ByVal Msg As String)
-    SendMessage Msg, False
+Public Sub PostScript(ByVal msg As String)
+    SendMessage msg, False
 End Sub
 
-' FUNCTION: GetNextRequestId
-' SUMMARY: Generates a unique sequential Request ID for BiDi commands.
-'          Migrated from Wrapper to consolidate protocol-level concerns.
-'          VBA is single-threaded and SendAndReceive is synchronous, so the sequential
-'          counter alone guarantees uniqueness within any realistic session lifetime.
 Public Function GetNextRequestId() As Long
     m_nextRequestId = m_nextRequestId + 1
-    ' Wrap within the command band [CMD_ID_FLOOR .. ID_MAX]; never re-enter reserved 1..99
     If m_nextRequestId > ID_MAX Then m_nextRequestId = CMD_ID_FLOOR
     GetNextRequestId = m_nextRequestId
 End Function
 
-' Next heartbeat id, rotating within [SYSTEM_PING_ID_MIN .. SYSTEM_PING_ID_MAX].
-' Rotation keeps ping ids separate from the command band.
-' Outstanding ping ids remain unique provided replies return within one
-' complete [3..99] rotation cycle.
+' Heartbeat IDs rotate inside [3..99], separate from normal command IDs; replies
+' must return before a complete band rotation to keep outstanding IDs unique.
 Private Function GetNextSystemPingId() As Long
     m_nextSystemPingId = m_nextSystemPingId + 1
     If m_nextSystemPingId > SYSTEM_PING_ID_MAX Then m_nextSystemPingId = SYSTEM_PING_ID_MIN
     GetNextSystemPingId = m_nextSystemPingId
 End Function
 
-' True if idStr is a numeric root id inside the reserved system band [1 .. CMD_ID_FLOOR).
-' BiDi events carry no id (idStr = "") and are NOT system traffic.
+' Only numeric root IDs in [1..CMD_ID_FLOOR) are reserved replies. An id-less
+' BiDi event is asynchronous application traffic.
 Private Function IsReservedSystemId(ByVal idStr As String) As Boolean
     If Len(idStr) = 0 Then Exit Function
     If Not IsNumeric(idStr) Then Exit Function
@@ -529,23 +707,6 @@ Private Function IsReservedSystemId(ByVal idStr As String) As Boolean
     IsReservedSystemId = (v >= 1 And v < CMD_ID_FLOOR)
 End Function
 
-' FUNCTION: SendCommand
-' SUMMARY: High-level protocol command sender. Constructs the BiDi JSON envelope
-'          (id + method + params), validates payload size, serializes, and delegates
-'          to SendAndReceive for synchronous response retrieval.
-'
-' NOTE ON RESPONSIBILITY BOUNDARY:
-'   This method owns: ID generation, payload construction, size validation, serialization.
-'   It does NOT own: retry logic, context recovery, or error classification.
-'   Those remain in Wrapper's ExecuteBiDiCommand to preserve the existing recovery paths.
-'
-' PARAMETERS:
-'   method   - BiDi method name (e.g. "browsingContext.navigate")
-'   params   - Dictionary of method parameters
-'   Silent   - Suppresses debug logging when True
-' RETURNS: Raw JSON response string from the browser.
-' RAISES:  ERR_ACTION_FAILED (vbObjectError+1003) if payload exceeds MAX_MSG_SIZE.
-'          Propagates errors from SendAndReceive (600-604).
 Public Function SendCommand(ByVal method As String, _
                             ByRef params As Object, _
                             Optional ByVal Silent As Boolean = False) As String
@@ -560,10 +721,8 @@ Public Function SendCommand(ByVal method As String, _
     Dim sendMsg As String
     sendMsg = WebJsonConverter.ConvertToJson(requestDic)
     
-    ' Release the dictionary immediately (memory hygiene)
     Set requestDic = Nothing
     
-    ' Payload Size Guard (prevents VBA hang from oversized payloads)
     If Len(sendMsg) > MAX_MSG_SIZE Then
         Err.Raise vbObjectError + 1003, "BiDiSocket:SendCommand", _
                   "Outgoing payload size (" & Len(sendMsg) & " chars) exceeds MAX_MSG_SIZE (" & MAX_MSG_SIZE & "). " & _
@@ -588,98 +747,57 @@ Public Function SendCommand(ByVal method As String, _
     SendCommand = strRes
 End Function
 
-' Properly closes the WebSocket and all associated WinHttp handles.
 Public Sub Disconnect(Optional ByVal keepErrorState As Boolean = False)
-    ' If we are already in the middle of a connection attempt,
-    ' we should be cautious about forced disconnection unless it's a hard reset.
-    If m_State = StateDisconnecting Or m_State = StateDisconnected Then Exit Sub
+    If m_state = StateDisconnecting Or m_state = StateDisconnected Then Exit Sub
 
-    ' [STEP 1] Log the final count of dropped events to bidi_socket_trace.log.
-    ' This acts as a "Post-Mortem" report for debugging high-load scenarios.
-    ' We do not reset the counter here so it remains accessible via property after disconnect.
     If m_DroppedEventsCount > 0 Then
         Trace ">>> [Session Summary] Connection closing. Total events dropped during this session: " & m_DroppedEventsCount, True
     End If
 
     If Not keepErrorState Then SetState StateDisconnecting
     
-    ' Perform the actual handle cleanup
     Call InternalCleanup
     
-    ' Clear the event buffer
     Set m_EventBuffer = New Collection
     
-    ' Finalize state only if we are not preserving an Error state for recovery
     If Not keepErrorState Then
         SetState StateDisconnected
     End If
 End Sub
 
-' Private helper to release WinHttp handles.
-' STRICT RULE: This method MUST NOT modify m_State.
+' InternalCleanup releases transport resources only; its caller owns the public
+' BiDiSocketState transition.
 Private Sub InternalCleanup()
     On Error Resume Next
-    
-    If hWebSocket_ <> 0 Then
-        ' Send a close frame (Status 1000) WITHOUT waiting for the peer's reply.
-        ' DANGER: WinHttpWebSocketClose performs the FULL close handshake (send +
-        ' wait for the peer's close frame) and blocks indefinitely against a
-        ' half-dead peer (e.g. suspended driver: TCP still ACKs, no frames ever
-        ' arrive). WinHttpWebSocketShutdown is the send-only half; the handle
-        ' release below tears the connection down regardless of the peer.
-        ' (ForceClose already avoided Close for the same reason.)
-        WinHttpWebSocketShutdown hWebSocket_, 1000, ByVal 0&, 0
-        WinHttpCloseHandle hWebSocket_
-        hWebSocket_ = 0
-    End If
-    
-    If hRequest_ <> 0 Then
-        ' INVARIANT (HANDLE OWNERSHIP): the request handle is independent of the WebSocket handle.
-        ' On the success path it was already closed in Connect (so this is skipped);
-        ' here it only releases a handle left open by a failed/partial upgrade.
-        WinHttpCloseHandle hRequest_
-        hRequest_ = 0
-    End If
-    
-    If hConnection_ <> 0 Then
-        WinHttpCloseHandle hConnection_
-        hConnection_ = 0
-    End If
-    
-    If hSession_ <> 0 Then
-        WinHttpCloseHandle hSession_
-        hSession_ = 0
-    End If
-    
-    ' Purge the input stream to prevent cross-session data corruption.
-    ' If a connection drops mid-fragment, the residual bytes must be truncated
-    ' before the next socket connection is established.
-    If Not m_InStream Is Nothing Then
-        If m_InStream.State = adStateOpen Then
-            m_InStream.Position = 0
-            m_InStream.SetEOS
-            m_InStream.Type = adTypeBinary
+
+    If m_wsTransportInitialized Then
+        If WsIsOpen Then
+            WsBeginClose 1000
+
+            Dim closeDeadline As Double
+            closeDeadline = nowMs() + 250
+
+            Do While WsHasPendingOutput And nowMs() < closeDeadline
+                WsPump WINSOCK_PUMP_MAX_MS, _
+                                        WINSOCK_PUMP_MAX_BYTES, _
+                                        WINSOCK_PUMP_MAX_CALLS
+                SleepWinAPI 0
+            Loop
         End If
+
+        WsForceClose
     End If
-    
-    ' Reset module-scoped semaphores and latches.
+
     m_isRecovering = False
-    m_discardActive = False ' input stream truncated above: drop any partial-discard latch
-    
+
     On Error GoTo 0
 End Sub
 
-' Sends a JSON message and waits for a specific response ID.
-' Its soft and hard deadlines are cooperative: they can be evaluated only after
-' ReadFromWire regains control from WinHttpWebSocketReceive.
-' The high-purity loop suppresses DoEvents during the active command-response
-' cycle to prevent WinHttp state corruption.
+' SendAndReceive correlates one ID around bounded non-blocking Pump calls and
+' suppresses Office message pumping for the entire command-response cycle.
 Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitTimeMs As Long = 0) As String
-    ' Re-entry Guard: Lock the communication channel.
-    ' Raise (instead of returning "") so the caller cannot mistake a blocked
-    ' re-entry for an empty, successful response. This Raise happens BEFORE
-    ' "On Error GoTo Cleanup" is armed, so it propagates straight to the caller
-    ' and does NOT run Cleanup -- the outer in-flight call keeps the lock.
+    ' Re-entry raises before the local error handler is armed. The outer in-flight call
+    ' therefore retains m_isSendReceiving and cannot be mistaken for an empty response.
     If m_isSendReceiving Then
         Err.Raise 606, "BiDiSocket", _
             "SendAndReceive re-entry blocked (a command was issued while another was still in flight)."
@@ -687,12 +805,12 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     m_isSendReceiving = True
     
     Dim succeeded As Boolean: succeeded = False
-    Dim Msg As String, inId As String
+    Dim msg As String, inId As String
     Dim cmdId As String
     
     On Error GoTo Cleanup
 
-    If m_State <> StateConnected Then
+    If m_state <> StateConnected Then
         If Not AttemptRecovery() Then
             Err.Raise 600, "BiDiSocket", "Not connected and recovery failed."
         End If
@@ -701,83 +819,46 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     cmdId = ExtractJsonId(jsonMessage)
     
     If Not SendMessage(jsonMessage) Then
-        If m_State <> StateConnected Then
+        If m_state <> StateConnected Then
             Err.Raise 600, "BiDiSocket", "Connection lost during send operation."
         Else
-            Err.Raise 601, "BiDiSocket", "Send failed due to internal WinHttp error."
+            Err.Raise 601, "BiDiSocket", "Send failed due to an internal Winsock transport error."
         End If
     End If
     
-    ' WHY: two-tier timeout strategy distinguishes transient browser slowness from
-    '       sustained socket silence without immediately destroying handles.
-    '
-    '       Soft Timeout (1x): no matching response within the normal window. Raises
-    '           604 but PRESERVES the connection. 604 is an AMBIGUOUS outcome (the
-    '           command was sent, result unknown). Idempotent callers (ExecuteBiDiCommand
-    '           with allowAmbiguousRetry:=True) retry as a NEW SendAndReceive call with a
-    '           new id and fresh deadlines. State-changing callers
-    '           (allowAmbiguousRetry:=False) must NOT re-send; they propagate the
-    '           ambiguous outcome to the caller to avoid a double operation.
-    '           Each soft timeout on the same connection increments
-    '           m_consecutiveSoftTimeouts; reaching MAX_CONSECUTIVE_SOFT_TIMEOUTS is
-    '           judged sustained silence (half-dead socket that still accepts sends)
-    '           and escalates to StateError. The counter resets on any successfully
-    '           matched response and on a fresh Connect.
-    '       Hard Timeout (2x): a cooperative deadline reachable only while
-    '           ReadFromWire continues regaining control, such as during fragmented
-    '           message assembly. Transitions to StateError when evaluated after
-    '           twice the normal window.
-    '       On StateError, handles are cleaned up on exit ONLY when AutoReconnect
-    '           is enabled (see Cleanup); otherwise they persist until Disconnect.
-    '
-    '       LIMITATION (empirically verified):
-    '           Observed: on a TCP-alive but frame-silent peer,
-    '           WinHttpWebSocketReceive does not return within the intended timeout
-    '           window, so the surrounding deadlines cannot be evaluated until
-    '           Receive returns.
-    '           Likely cause: pre-upgrade WinHttpSetTimeouts values are not honored
-    '           on the completed WebSocket handle, leaving the synchronous receive
-    '           without an effective timeout.
-    '           A killed peer does unblock Receive through a TCP reset/error.
-    '           Escaping a silent-but-alive peer would require asynchronous WinHTTP
-    '           or a second thread, neither available to VBA.
-    Dim timeout As Long: timeout = IIf(waitTimeMs > 0, waitTimeMs, m_DefaultTimeout)
-    Dim softDeadline As Double: softDeadline = NowMs() + timeout
-    Dim hardDeadline As Double: hardDeadline = NowMs() + (timeout * 2)
+    ' Timeout policy:
+    '   - 1x raises ambiguous 604 while preserving an otherwise-open socket.
+    '   - Repeated soft timeouts escalate to StateError; a healthy response/connect resets them.
+    '   - 2x is a secondary overrun fail-safe and marks the socket failed.
+    '   - StateError cleanup releases native handles automatically only with AutoReconnect.
+    ' All native calls and Pump work are bounded, so silence cannot trap VBA in receive.
+    Dim TIMEOUT As Long: TIMEOUT = IIf(waitTimeMs > 0, waitTimeMs, m_DefaultTimeout)
+    Dim softDeadline As Double: softDeadline = nowMs() + TIMEOUT
+    Dim hardDeadline As Double: hardDeadline = nowMs() + (TIMEOUT * 2)
     
-    ' Memory Protection Constants
-    ' [PATCH] Raised from 1000. Because the drain fix below keeps the matching
-    ' response from being buried, a deeper buffer can now safely retain events
-    ' that arrive during a long-held command (instead of dropping them, which
-    ' would lose recorder log entries). ~20k small log/network events is a few
-    ' MB at most; lower it if memory is tight, raise it for very chatty pages.
+    ' The command-time event FIFO is count-bounded; individual messages remain bounded
+    ' by MaxIncomingSize. Oldest asynchronous events are dropped first.
     Const MAX_EVENT_BUFFER_SIZE As Long = 20000
     
-    ' Receive Loop (High-Purity)
     Do
-        If m_State <> StateConnected Then
+        If m_state <> StateConnected Then
             Err.Raise 600, "BiDiSocket", "Connection lost while waiting for ID: " & cmdId
         End If
 
-        Msg = ReadFromWire(hardDeadline)
+        msg = ReadFromWire(softDeadline)
         
-        If Len(Msg) > 0 Then
-            inId = ExtractJsonId(Msg)
+        If Len(msg) > 0 Then
+            inId = ExtractJsonId(msg)
             If inId = cmdId Then
-                SendAndReceive = Msg
+                SendAndReceive = msg
                 succeeded = True
                 GoTo Cleanup
             Else
-                ' Async events or pongs: Queue for GetMessage processing
-                ' BiDi events (network.beforeRequestSent etc.) have no "id" field,
-                ' so the old condition (inId <> "") silently discarded them.
-                ' Losing these one-shot events degraded recorder/[REQ] completeness.
-                ' Discard reserved-band system replies (rotating heartbeat pongs,
-                ' PostScript reply) via a single band check.
+                ' Queue id-less/asynchronous events, but consume reserved PostScript/heartbeat
+                ' replies internally rather than exposing them through GetMessage.
                 If Not IsReservedSystemId(inId) Then
-                    m_EventBuffer.Add Msg
+                    m_EventBuffer.Add msg
                     
-                    ' FIFO Protection to prevent memory exhaustion
                     If m_EventBuffer.count > MAX_EVENT_BUFFER_SIZE Then
                         m_EventBuffer.Remove 1
                         m_DroppedEventsCount = m_DroppedEventsCount + 1
@@ -786,19 +867,13 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
             End If
         End If
         
-        Dim nowT As Double: nowT = NowMs()
+        Dim nowT As Double: nowT = nowMs()
         
-        ' HARD Timeout: Sustained silence beyond 2x the normal timeout.
-        ' This indicates a genuine connection problem, not just browser slowness.
         If nowT > hardDeadline Then
             SetState StateError
             Err.Raise 604, "BiDiSocket", "Socket Silence: Hard timeout (connection presumed lost) waiting for ID: " & cmdId
         End If
         
-        ' SOFT Timeout: Response not received within the normal timeout window.
-        ' First occurrence preserves the connection for a caller retry; consecutive
-        ' occurrences on the same connection indicate a half-dead socket (sends
-        ' still succeed, nothing ever matches) and escalate to StateError.
         If nowT > softDeadline Then
             m_consecutiveSoftTimeouts = m_consecutiveSoftTimeouts + 1
             If m_consecutiveSoftTimeouts >= MAX_CONSECUTIVE_SOFT_TIMEOUTS Then
@@ -811,16 +886,12 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
             End If
         End If
 
-        ' [PATCH] Drain at full speed while messages are flowing; only sleep when
-        ' the wire produced nothing this iteration. ReadFromWire blocks inside
-        ' WinHttpWebSocketReceive when idle, so this never busy-spins. This keeps
-        ' the m_EventBuffer from overflowing under event floods and prevents the
-        ' matching response from being buried behind queued events.
-        If Len(Msg) = 0 Then YieldExecution 5, False
+        ' While data is flowing, drain without sleeping so events cannot bury the matching
+        ' response; yield only when the bounded Pump produced nothing.
+        If Len(msg) = 0 Then YieldExecution 5, False
     Loop
 
 Cleanup:
-    ' WHY: save Err info immediately to prevent overwrite during InternalCleanup.
     Dim savedErrNum As Long: savedErrNum = Err.Number
     Dim savedErrDesc As String: savedErrDesc = Err.description
     Dim savedErrSrc As String: savedErrSrc = Err.source
@@ -828,44 +899,34 @@ Cleanup:
     If succeeded Then
         savedErrNum = 0
         Err.Clear
-        ' A matched response proves the connection is alive: reset silence tracking.
         m_consecutiveSoftTimeouts = 0
     End If
     
     m_isSendReceiving = False
     
-    ' WHY: handle cleanup is conditional on the two-tier timeout strategy:
-    '   - Soft timeout (604 without StateError): Connection is preserved.
-    '     The caller (ExecuteBiDiCommand) can retry with the same socket.
-    '   - Hard timeout (604 with StateError): Connection is presumed dead.
-    '     Clear stale handles so the next attempt triggers a full reconnect.
-    If m_State = StateError And m_AutoReconnect Then
+    ' A first soft timeout preserves StateConnected. Hard or repeated soft timeout sets
+    ' StateError; AutoReconnect then releases stale native handles during cleanup.
+    If m_state = StateError And m_AutoReconnect Then
         Call InternalCleanup
     End If
     
-    ' Explicit cleanup of potentially large strings
-    Msg = ""
+    msg = ""
     inId = ""
     
-    ' Error Propagation
     If Not succeeded And savedErrNum <> 0 Then
         On Error GoTo 0
         Err.Raise savedErrNum, savedErrSrc, savedErrDesc
     End If
 End Function
 
-' Internal recovery logic with re-entrancy protection.
+' Recovery acquires m_isRecovering before any yield; every precondition, success and
+' error path converges on cleanup so nested COM/timer re-entry cannot retain the lock.
 Private Function AttemptRecovery() As Boolean
-    ' Re-entrancy guard: Acquire the lock IMMEDIATELY.
-    ' Moving this to the very top ensures atomic-like locking before any other
-    ' evaluations or error handler setups occur.
     If m_isRecovering Then Exit Function
     m_isRecovering = True
     
-    ' WHY: route all runtime errors to the ErrorHandler to guarantee flag reset
     On Error GoTo ErrorHandler
 
-    ' Pre-condition checks now route to CleanExit to properly release the lock
     If Not m_AutoReconnect Then GoTo CleanExit
     If m_RetryCount >= m_MaxRetryAttempts Then
         Trace ">>> [Recovery] Max retry attempts reached.", True
@@ -877,9 +938,6 @@ Private Function AttemptRecovery() As Boolean
     Dim waitTime As Long: waitTime = (2 ^ (m_RetryCount - 1)) * 1000
     Trace ">>> [Recovery] Attempt #" & m_RetryCount & " (Waiting " & waitTime & "ms)", True
     
-    ' During YieldExecution, DoEvents is pumped (allowDoEvents = True).
-    ' External COM events or Timers could attempt re-entrancy here.
-    ' Because m_isRecovering is already True, they will be safely rejected.
     YieldExecution waitTime, True
     
     If Connect(m_LastWsUrl, m_LastPort) Then
@@ -892,86 +950,169 @@ Private Function AttemptRecovery() As Boolean
     End If
     
 CleanExit:
-    ' [CRITICAL] Always release the recovery lock regardless of success, failure, or runtime errors
     m_isRecovering = False
     On Error GoTo 0
     Exit Function
 
 ErrorHandler:
-    ' INVARIANT (ERROR HANDLER): prohibit Trace (File I/O) within the error handler.
-    ' If File I/O fails (e.g., file lock, permissions), a new exception occurs here,
-    ' preventing Resume CleanExit from executing and leaving m_isRecovering=True forever.
-    ' Debug.Print is non-throwing and safe in this context.
+    ' Never call Trace from this error handler: secondary file-I/O failure could bypass
+    ' CleanExit and leave m_isRecovering permanently set. Debug.Print is non-raising.
     Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [Recovery] Critical Error during attempt: " & Err.description
     
     AttemptRecovery = False
-    ' Clear the error state and jump to the cleanup block to release the lock
     Resume CleanExit
 End Function
 
-' Polling-based BiDi message pump; processes queued events and manages heartbeat.
-' The short ReadFromWire deadline is cooperative only: it limits processing after
-' Receive returns, but cannot interrupt a frame-silent synchronous receive.
-Public Function GetMessage() As String
-    ' Block heartbeat/ping while a command response is pending in SendAndReceive
-    If m_isSendReceiving Then Exit Function
-    
-    ' Serve from local event buffer first
-    If m_EventBuffer.count > 0 Then
-        GetMessage = m_EventBuffer(1): m_EventBuffer.Remove 1: Exit Function
+' ObserveWinsockMessage applies reserved-reply inspection consistently to both
+' receive paths.
+Private Sub ObserveWinsockMessage(ByVal rawMsg As String)
+    Dim isSuspicious As Boolean
+    isSuspicious = (InStr(1, rawMsg, """error"":", vbTextCompare) > 0) Or _
+                   (InStr(1, rawMsg, "chrome-error", vbTextCompare) > 0)
+
+    If isSuspicious Then
+        m_consecutiveInternalErrors = m_consecutiveInternalErrors + 1
     End If
 
-    ' Autonomous recovery and connectivity guard
-    If m_State = StateError Then If Not AttemptRecovery() Then Exit Function
-    If m_State <> StateConnected Then Exit Function
+    Trace ">>> [Winsock] Message assembled. Length: " & Len(rawMsg), isSuspicious
+End Sub
 
-    ' Enforce polling cadence (100ms) to prevent CPU spikes
-    Dim nowT As Double: nowT = NowMs()
+Private Sub ProcessReservedSystemResponse(ByVal inId As String, _
+                                          ByVal rawMsg As String, _
+                                          ByVal isPostHeartbeat As Boolean)
+    If inId <> CStr(POST_SCRIPT_REPLY_ID) Then
+        If m_RetryCount > 0 Then m_RetryCount = 0
+    End If
+End Sub
+
+' Drain completed messages before an optional bounded Pump; a real message suppresses
+' heartbeat generation for that GetMessage call.
+Private Function TryReadWinsockBeforeHeartbeat(ByRef realMsg As String, _
+                                               ByVal allowPump As Boolean) As Boolean
+    If Not m_wsTransportInitialized Then Exit Function
+    If Not WsIsOpen Then Exit Function
+
+    ' m_isReading is a same-thread guard around non-yielding Pump/dequeue work and is
+    ' released only by structured cleanup or emergency teardown.
+    If m_isReading Then Exit Function
+
+    On Error GoTo ErrorHandler
+
+    m_isReading = True
+
+    Dim didPump As Boolean
+    Dim candidate As String
+    Dim inId As String
+
+DrainCompleted:
+    Do While WsTryDequeueText(candidate)
+        inId = ExtractJsonId(candidate)
+
+        If IsReservedSystemId(inId) Then
+            ProcessReservedSystemResponse inId, candidate, False
+        Else
+            ObserveWinsockMessage candidate
+            realMsg = candidate
+            TryReadWinsockBeforeHeartbeat = True
+            GoTo FinalCleanup
+        End If
+    Loop
+
+    If Not allowPump Or didPump Then GoTo FinalCleanup
+
+    didPump = True
+    WsPump WINSOCK_PUMP_MAX_MS, _
+           WINSOCK_PUMP_MAX_BYTES, _
+           WINSOCK_PUMP_MAX_CALLS
+
+    If Wsstate = WsTransportFailed Then
+        SetState StateError
+        GoTo FinalCleanup
+    End If
+
+    If Not WsIsOpen Then
+        SetState StateError
+        GoTo FinalCleanup
+    End If
+
+    GoTo DrainCompleted
+
+FinalCleanup:
+    m_isReading = False
+    Exit Function
+
+ErrorHandler:
+    Debug.Print "[" & Format(Now, "hh:nn:ss") & _
+                "] [Winsock] Pre-heartbeat read error: " & Err.description
+    SetState StateError
+    Resume FinalCleanup
+End Function
+
+' GetMessage serves the event FIFO, performs bounded receive work, then manages the
+' reserved-band session.status heartbeat.
+Public Function GetMessage() As String
+    If m_isSendReceiving Then Exit Function
+
+    If m_EventBuffer.count > 0 Then
+        GetMessage = m_EventBuffer(1)
+        m_EventBuffer.Remove 1
+        Exit Function
+    End If
+
+    If m_state = StateError Then
+        If Not AttemptRecovery() Then Exit Function
+    End If
+    If m_state <> StateConnected Then Exit Function
+
+    Dim preHeartbeatMsg As String
+    If TryReadWinsockBeforeHeartbeat(preHeartbeatMsg, False) Then
+        GetMessage = preHeartbeatMsg
+        Exit Function
+    End If
+
+    If m_state <> StateConnected Then Exit Function
+
+    Dim nowT As Double
+    nowT = nowMs()
     If (nowT - m_lastPollTime) < m_PollingInterval Then Exit Function
     m_lastPollTime = nowT
 
-    ' [SMART HEARTBEAT]
-    ' Send a silent keep-alive ping every poll cycle to hold the pipe open at
-    ' 100ms cadence. The pong is swallowed below; no console/file logging.
-    Dim pingId As Long: pingId = GetNextSystemPingId()
-    Dim pingCmd As String: pingCmd = "{""id"":" & pingId & ", ""method"":""session.status"", ""params"":{}}"
-
-    If Not SendMessage(pingCmd) Then Exit Function
-
-    Dim rawMsg As String: rawMsg = ReadFromWire(nowT + 10)
-
-    If LenB(rawMsg) = 0 Then
-        YieldExecution 1, m_AllowUiPump: Exit Function
+    ' Perform one bounded receive Pump before heartbeat; send heartbeat only when no real
+    ' message is ready.
+    preHeartbeatMsg = vbNullString
+    If TryReadWinsockBeforeHeartbeat(preHeartbeatMsg, True) Then
+        GetMessage = preHeartbeatMsg
+        Exit Function
     End If
 
-    Dim inId As String: inId = ExtractJsonId(rawMsg)
+    If m_state <> StateConnected Then Exit Function
+
+    Dim pingId As Long
+    pingId = GetNextSystemPingId()
+
+    Dim pingCmd As String
+    pingCmd = "{""id"":" & pingId & ", ""method"":""session.status"", ""params"":{}}"
+    If Not SendMessage(pingCmd) Then Exit Function
+
+    Dim rawMsg As String
+    rawMsg = ReadFromWire(nowMs() + 10)
+
+    If LenB(rawMsg) = 0 Then
+        YieldExecution 1, m_AllowUiPump
+        Exit Function
+    End If
+
+    Dim inId As String
+    inId = ExtractJsonId(rawMsg)
+
     If IsReservedSystemId(inId) Then
-        ' Reserved band: heartbeat pong (rotating [3..99]) or PostScript reply (2).
-        ' All are swallowed so they never reach the recorder/event stream.
-        If inId <> CStr(POST_SCRIPT_REPLY_ID) Then
-            ' Heartbeat pong: connection proven healthy -> clear any retry backoff.
-            If m_RetryCount > 0 Then m_RetryCount = 0
-        End If
-        GetMessage = ""
+        ProcessReservedSystemResponse inId, rawMsg, True
+        GetMessage = vbNullString
     Else
-        ' Return the actual BiDi message (Event/Response)
         GetMessage = rawMsg
     End If
 End Function
 
-' FUNCTION: GetParsedEvent
-' SUMMARY: Higher-level event retrieval that combines GetMessage + validation + JSON parse.
-'          Returns a parsed Dictionary object ready for dispatch, or Nothing if no
-'          valid event is available.
-'
-' This consolidates the "dequeue -> validate -> parse" pipeline that was previously
-' duplicated in Wrapper's ProcessRecorderQueue, reducing the Wrapper's responsibility
-' to pure dispatch logic.
-'
-' PARAMETERS:
-'   minMsgSize  - Minimum message length to accept (filters noise). Default: 10
-'   maxMsgSize  - Maximum message length to accept (prevents VBA hang). Default: 300000
-' RETURNS: Parsed Dictionary object, or Nothing if buffer is empty / message invalid.
 Public Function GetParsedEvent(Optional ByVal minMsgSize As Long = 10, _
                                Optional ByVal maxMsgSize As Long = 300000) As Object
     Dim rawMsg As String: rawMsg = GetMessage()
@@ -979,10 +1120,8 @@ Public Function GetParsedEvent(Optional ByVal minMsgSize As Long = 10, _
     
     If Len(rawMsg) < minMsgSize Or Len(rawMsg) > maxMsgSize Then Exit Function
     
-    ' Structural pre-check (must contain at least a method or id key)
     If InStr(rawMsg, """method"":") = 0 And InStr(rawMsg, """id"":") = 0 Then Exit Function
     
-    ' JSON Parse (under OERN; returns Nothing on malformed input)
     Dim parsed As Object
     On Error Resume Next
     Set parsed = WebJsonConverter.ParseJson(rawMsg)
@@ -996,258 +1135,89 @@ Public Function GetParsedEvent(Optional ByVal minMsgSize As Long = 10, _
     Set GetParsedEvent = parsed
 End Function
 
-' Reads a WebSocket frame with strict receive-side memory management.
-' The optional deadline is cooperative and is evaluated only after
-' WinHttpWebSocketReceive returns control.
-Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
-    If m_State <> StateConnected And m_State <> StateDisconnecting Then Exit Function
-    
-    ' Stale read-lock guard evaluated on re-entry only.
-    ' It cannot detect or interrupt an in-progress WinHttpWebSocketReceive block.
-    If m_isReading Then
-        If (NowMs() - m_isReadingSince) > 5000 Then
-            Debug.Print "[" & Format(Now, "hh:nn:ss") & "] BiDi Warning: Read lock stuck. Force-resetting."
-            m_isReading = False
-        Else
-            Exit Function
-        End If
-    End If
+Private Function ReadFromWinsock(Optional ByVal deadline As Double = 0) As String
+    If Not m_wsTransportInitialized Then Exit Function
+
+    ' ReadFromWinsock holds the same non-yielding read guard and releases it through a
+    ' single cleanup path.
+    If m_isReading Then Exit Function
 
     On Error GoTo ErrorHandler
 
     m_isReading = True
-    m_isReadingSince = NowMs()
 
-    Dim ret As Long, bytesRead As Long, bufType As Long
-    Dim isMessageFinished As Boolean
-    Dim hasValidData As Boolean
-    ' Counter to track fragment throughput
-    Dim fragmentCount As Long: fragmentCount = 0
-    ' Receive-side cap bookkeeping. Discard state is held in the module-level
-    ' m_discardActive latch (NOT call-local): a 12002/deadline exit can interrupt
-    ' an oversized message mid-discard, and the latch keeps discard engaged across
-    ' calls until the MESSAGE boundary truncates m_InStream -- mirroring how a normal
-    ' partial message persists via the retained stream + non-zero Position. The latch
-    ' is cleared ONLY where m_InStream is truncated (CleanExit finished block,
-    ' StreamErrorHandler, InternalCleanup, ForceClose), so 'empty stream yet still
-    ' discarding' cannot occur. totalBytes stays call-local (current call only).
-    Dim totalBytes As Long
+    Dim rawMsg As String
+    If deadline <= 0 Then deadline = nowMs() + m_DefaultTimeout
 
-    If m_InStream.Position = 0 Then
-        PrepareStream m_InStream, adTypeBinary
-    End If
-    
     Do
-        ' Receive data from the WebSocket
-        ret = WinHttpWebSocketReceive(hWebSocket_, _
-                                      m_ReceiveBuffer(0), _
-                                      m_BufferSize, _
-                                      bytesRead, _
-                                      bufType)
-        
-        If ret <> NO_ERROR Then
-            If ret <> 12002 Then
-                Trace ">>> [WinHttp] Receive Failed. Code: " & ret, True
-                SetState StateError
-                Disconnect keepErrorState:=True
-            End If
-            GoTo CleanExit
+        If WsTryDequeueText(rawMsg) Then Exit Do
+
+        WsPump WINSOCK_PUMP_MAX_MS, _
+               WINSOCK_PUMP_MAX_BYTES, _
+               WINSOCK_PUMP_MAX_CALLS
+
+        If WsTryDequeueText(rawMsg) Then Exit Do
+
+        If Wsstate = WsTransportFailed Then
+            SetState StateError
+            Exit Do
         End If
 
-        If bytesRead > 0 Then
-            hasValidData = True
-            totalBytes = totalBytes + bytesRead
-
-            If Not m_discardActive Then
-                If m_InStream.Size + bytesRead > m_MaxIncomingSize Then
-                    ' Cap exceeded: stop writing, keep draining fragments until the
-                    ' MESSAGE frame closes the boundary. The retained head is used
-                    ' for identity diagnostics in CleanExit.
-                    m_discardActive = True
-                    Trace ">>> [WinHttp] Incoming message exceeded MaxIncomingSize (" & _
-                          m_MaxIncomingSize & "). Discard mode engaged.", True
-                Else
-                    If bytesRead = m_BufferSize Then
-                        m_InStream.Write m_ReceiveBuffer
-                    Else
-                        Dim chunk() As Byte
-                        chunk = m_ReceiveBuffer
-                        ReDim Preserve chunk(bytesRead - 1)
-                        m_InStream.Write chunk
-                        Erase chunk
-                    End If
-                End If
-            End If
-
-            MaybeGrowBuffer bytesRead
+        If Not WsIsOpen Then
+            SetState StateError
+            Exit Do
         End If
 
-        ' Frame Assembly Logic
-        Select Case bufType
-            Case WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, _
-                 WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE
-                isMessageFinished = True
-                GoTo CleanExit
+        Dim remainingMs As Double
+        remainingMs = deadline - nowMs()
+        If remainingMs <= 0 Then Exit Do
 
-            Case WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE
-                ' Server initiated close. Handle is now invalid.
-                Debug.Print "[BiDi] WebSocket Close frame received from server."
-                SetState StateError
-                Disconnect keepErrorState:=True
-                GoTo CleanExit
-                
-            Case WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE, _
-                 WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE
-                ' WHY: prevent Excel freezing during high-volume fragment assembly
-                fragmentCount = fragmentCount + 1
-                If fragmentCount Mod 20 = 0 Then
-                    ' Yield to the OS message pump only if allowed by class settings
-                    If m_AllowUiPump And Not m_isSendReceiving Then DoEvents
-                    ' WHY: do not reset the counter here. The Mod operator cycles every 20
-                    ' iterations on its own; resetting to 0 would fire the next DoEvents
-                    ' after 21 fragments instead of 20 (off-by-one).
-                End If
-                
-            Case Else
-                GoTo CleanExit
-        End Select
-        
-        ' Overall Deadline Check
-        If deadline > 0 And NowMs() > deadline Then
-            Trace ">>> [WinHttp] Read loop hit internal deadline.", True
-            GoTo CleanExit
+        If remainingMs > 20 Then
+            SleepWinAPI 1
+        Else
+            SleepWinAPI 0
         End If
-
-        ' NO SLEEP HERE (deliberate). WinHttpWebSocketReceive is synchronous
-        ' and therefore paces the loop while frames continue to arrive.
-        '
-        ' Observed: on a TCP-alive but frame-silent peer, Receive may not return
-        ' within the intended timeout window, so neither this loop's deadline nor
-        ' any surrounding VBA guard can be evaluated until control returns.
-        ' Likely cause: the pre-upgrade WinHttpSetTimeouts values do not provide
-        ' an effective timeout on the completed WebSocket handle.
-        '
-        ' A former "YieldExecution 1, False" here cost ~15.6ms per fragment
-        ' because kernel32 Sleep(1) rounds up to the system timer quantum
-        ' (no timeBeginPeriod in this process), turning a 12.6MB / 8KB =
-        ' ~1,540-fragment assembly into a ~24s UI freeze.
-        ' UI responsiveness while frames are arriving is handled by the
-        ' Mod-20 DoEvents guard above.
     Loop
 
-CleanExit:
-    On Error GoTo StreamErrorHandler
-
-    If isMessageFinished And hasValidData Then
-        m_InStream.Position = 0
-        m_InStream.Type = adTypeText
-        m_InStream.Charset = "UTF-8"
-
-        If m_discardActive Then
-            ' IDENTITY DIAGNOSTICS for oversized messages:
-            '   HEAD300           -> shows the leading JSON ("method"/"id") of the giant
-            '   fusionMarkers(}{) -> 0  = genuine single message
-            '                        >0 = multiple messages fused into one frame
-            Dim headText As String: headText = m_InStream.ReadText
-            Dim fusionCount As Long
-            fusionCount = (Len(headText) - Len(Replace(headText, "}{", ""))) \ 2
-            Trace ">>> [WinHttp] OVERSIZED MESSAGE DISCARDED. thisCallBytes=" & totalBytes & _
-                  " retainedChars=" & Len(headText) & _
-                  " fusionMarkers(}{)=" & fusionCount & _
-                  " HEAD300=[" & Left$(headText, 300) & "]", True
-            ReadFromWire = ""
-        Else
-            ReadFromWire = m_InStream.ReadText
-
-            Dim isSuspicious As Boolean
-            isSuspicious = (InStr(1, ReadFromWire, """error"":", vbTextCompare) > 0) Or _
-                           (InStr(1, ReadFromWire, "chrome-error", vbTextCompare) > 0)
-
-            If isSuspicious Then m_consecutiveInternalErrors = m_consecutiveInternalErrors + 1
-            Trace ">>> [WinHttp] Message assembled. Length: " & Len(ReadFromWire), isSuspicious
-        End If
-
-        PrepareStream m_InStream, adTypeBinary
-        m_discardActive = False ' MESSAGE boundary reached: stream truncated, latch cleared
+    If Len(rawMsg) > 0 Then
+        ObserveWinsockMessage rawMsg
+        ReadFromWinsock = rawMsg
     End If
-    
-    GoTo FinalCleanup
-
-StreamErrorHandler:
-    On Error Resume Next
-    Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [WinHttp] Stream Error: " & Err.description
-    CloseStream m_InStream
-    Set m_InStream = New ADODB.Stream
-    m_InStream.mode = adModeReadWrite
-    m_InStream.Open
-    PrepareStream m_InStream, adTypeBinary
-    m_discardActive = False ' stream rebuilt empty: no partial/discard data survives
-    Resume FinalCleanup
 
 FinalCleanup:
     m_isReading = False
-    m_isReadingSince = 0
-    On Error GoTo 0
     Exit Function
 
 ErrorHandler:
-    m_isReading = False
-    m_isReadingSince = 0
-    Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [WinHttp] Critical Read Error: " & Err.description
-    Resume CleanExit
+    Debug.Print "[" & Format(Now, "hh:nn:ss") & _
+                "] [Winsock] Critical Read Error: " & Err.description
+    SetState StateError
+    Resume FinalCleanup
 End Function
 
-' Helpers & Utils
-' Unified Timer API (QPC-based, monotonic)
-' NowTicks   : Opaque Currency snapshot (raw QPC counter). Use as a token for ElapsedMs.
-' ElapsedMs  : Difference between a NowTicks snapshot and the current counter, in ms.
-' NowMs      : Absolute monotonic timestamp in ms (since QPC origin).
-' Note: m_qpcFreq is initialized in Class_Initialize with fail-fast on missing QPC support.
+Private Function ReadFromWire(Optional ByVal deadline As Double = 0) As String
+    If m_state <> StateConnected And m_state <> StateDisconnecting Then Exit Function
+    ReadFromWire = ReadFromWinsock(deadline)
+End Function
+
+' NowTicks/ElapsedMs/NowMs use cached QPC frequency and are monotonic; QPC absence
+' fails Class_Initialize rather than silently changing timer semantics.
 Public Function NowTicks() As Currency
     QueryPerformanceCounter NowTicks
 End Function
 
-Public Function ElapsedMs(ByVal startTicks As Currency) As Double
+Public Function elapsedMs(ByVal startTicks As Currency) As Double
     Dim cur As Currency
     QueryPerformanceCounter cur
-    ElapsedMs = (CDbl(cur - startTicks) / CDbl(m_qpcFreq)) * 1000#
+    elapsedMs = (CDbl(cur - startTicks) / CDbl(m_qpcFreq)) * 1000#
 End Function
 
-Public Function NowMs() As Double
+Public Function nowMs() As Double
     Dim cur As Currency
     QueryPerformanceCounter cur
-    NowMs = (CDbl(cur) / CDbl(m_qpcFreq)) * 1000#
+    nowMs = (CDbl(cur) / CDbl(m_qpcFreq)) * 1000#
 End Function
 
-' Peak-holding buffer growth logic
-Private Sub MaybeGrowBuffer(ByVal bytesRead As Long)
-    If bytesRead >= m_BufferSize Then
-        m_RecentFullReads = m_RecentFullReads + 1
-        If m_RecentFullReads >= m_GrowThresholdCount Then
-            Dim newSize As Long: newSize = m_BufferSize * 2
-            If newSize > m_MaxBufferSize Then newSize = m_MaxBufferSize
-            
-            If newSize > m_BufferSize Then
-                m_BufferSize = newSize
-                m_RecentFullReads = 0
-                
-                ' Sync the actual byte array with the new buffer size
-                ReDim m_ReceiveBuffer(m_BufferSize - 1)
-                
-                If DEBUG_MODE Then Debug.Print "BiDi: Buffer grown to " & m_BufferSize
-            Else
-                ' WHY: reset consecutive counter even when MAX_BUFFER_SIZE is reached
-                ' to prevent infinite accumulation.
-                m_RecentFullReads = 0
-            End If
-        End If
-    Else
-        ' WHY: reset consecutive counter when a partial read occurs
-        m_RecentFullReads = 0
-    End If
-End Sub
-
-' Standardized port retrieval with type-safety
 Public Function AttemptAutoConnect(ByVal wsUrl As String) As Boolean
     Dim port As Long
     port = GetPortFromUrl(wsUrl)
@@ -1272,13 +1242,12 @@ Public Function GetPortFromUrl(ByVal wsUrl As String) As Long
     End If
 End Function
 
-' Extracts the root-level "id" value from a JSON string.
-' Designed to be robust against variations in key order and large payloads.
+' ExtractJsonId scans only the root object so nested event payload IDs cannot be
+' mistaken for the BiDi request/response ID.
 Private Function ExtractJsonId(ByVal json As String) As String
     Dim s As String: s = LTrim$(json)
     If Len(s) < 10 Or Left$(s, 1) <> "{" Then Exit Function
 
-    ' Fast pre-check: Avoid running the scanner on payloads without "id"
     If InStr(1, s, """id""", vbTextCompare) = 0 Then Exit Function
 
     Dim depth As Long: depth = 0
@@ -1286,30 +1255,21 @@ Private Function ExtractJsonId(ByVal json As String) As String
     Dim isEscaped As Boolean: isEscaped = False
     Dim i As Long
     
-    ' Map the string directly to a Byte array (UTF-16 LE) for blazing fast memory access
     Dim b() As Byte: b = s
     Dim bLen As Long: bLen = UBound(b)
     
-    ' Constants for ASCII character codes
     Const CHAR_QUOTE As Byte = 34  ' "
     Const CHAR_LBRACE As Byte = 123 ' {
     Const CHAR_RBRACE As Byte = 125 ' }
     Const CHAR_SLASH As Byte = 92  ' \
     
-    ' In VBA, strings are UTF-16, so each character is 2 bytes. We step by 2.
     For i = 0 To bLen Step 2
-        ' [CRITICAL ASCII GUARD]
-        ' VBA strings are UTF-16 LE. Each char is 2 bytes: low byte (b(i)) + high byte (b(i+1)).
-        ' We MUST verify the high byte is 0 (=ASCII range) before evaluating b(i).
-        ' Without this guard, any non-ASCII char whose low byte happens to match
-        ' '{' (0x7B), '}' (0x7D), '"' (0x22), or '\' (0x5C) would corrupt depth/inString.
-        ' Example: Many Japanese chars have low bytes that collide with these ASCII codes.
-        ' Bounds check (i+1 <= bLen) is included to guarantee no array overrun on
-        ' an oddly-sized buffer (defensive; VBA strings should always be even).
+        ' The byte scanner reads UTF-16 LE. Test each high byte before interpreting ASCII;
+        ' otherwise non-ASCII low-byte collisions can corrupt string/depth tracking. Keep the
+        ' paired-byte bounds guard.
         If i + 1 > bLen Then Exit For
         If b(i + 1) <> 0 Then GoTo ContinueLoop
 
-        ' Check if we are currently escaping a character
         If isEscaped Then
             isEscaped = False
             GoTo ContinueLoop
@@ -1317,18 +1277,13 @@ Private Function ExtractJsonId(ByVal json As String) As String
 
         Select Case b(i)
             Case CHAR_SLASH
-                ' If inside a string, the next character is escaped
                 If inString Then isEscaped = True
                 
             Case CHAR_QUOTE
                 inString = Not inString
                 
-                ' If we just OPENED a string at the root level, check if it's "id"
                 If inString And depth = 1 Then
-                    ' Ensure we don't go out of bounds (need 4 chars: i, d, ", :)
                     If i + 8 <= bLen Then
-                        ' Check for 'i' (105) and 'd' (100) and '"' (34)
-                        ' Also verify each char's high byte is 0 (ASCII range)
                         If b(i + 2) = 105 And b(i + 3) = 0 _
                            And b(i + 4) = 100 And b(i + 5) = 0 _
                            And b(i + 6) = 34 And b(i + 7) = 0 Then
@@ -1336,24 +1291,17 @@ Private Function ExtractJsonId(ByVal json As String) As String
                             Dim j As Long: j = i + 8 ' Start right after "id"
                             Dim idVal As String
                             
-                            ' Bounds safety: explicitly check both j and j+1 in every iteration.
-                            ' This ensures no reliance on implicit mathematical safety (j <= bLen-1).
                             Do While j + 1 <= bLen
-                                ' Validate that the character is strictly within ASCII range
-                                ' (Upper byte must be 0 in UTF-16 LE).
                                 If b(j + 1) = 0 Then
                                     Select Case b(j)
                                         Case 48 To 57, 45 ' '0'-'9', '-'
                                             idVal = idVal & Chr$(b(j))
                                         Case 32, 58, 9, 10, 13 ' spaces, colon, tabs, CRLF
-                                            ' Stop parsing if we hit a delimiter AFTER numbers have started
                                             If Len(idVal) > 0 Then Exit Do
                                         Case Else
-                                            ' Hit an invalid ASCII char (e.g., letters, quote, bracket)
                                             Exit Do
                                     End Select
                                 Else
-                                    ' Non-ASCII character encountered; terminate extraction immediately.
                                     Exit Do
                                 End If
                                 j = j + 2
@@ -1374,7 +1322,6 @@ Private Function ExtractJsonId(ByVal json As String) As String
             Case CHAR_RBRACE
                 If Not inString Then
                     depth = depth - 1
-                    ' Optimization: If depth drops to 0, we have parsed the root object
                     If depth = 0 Then Exit Function
                 End If
         End Select
@@ -1383,85 +1330,26 @@ ContinueLoop:
     Next i
 End Function
 
-Private Function ExtractPath(ByVal url As String) As String
-    ' Explicit branch: IIf would evaluate both arms, so a path-less URL
-    ' (e.g. "ws://localhost:12345", no "/" after the host) would still run
-    ' Mid$(url, 0) and raise runtime error 5. Default to "/" instead.
-    Dim p As Long
-    p = InStr(1, url, "://")
-    If p > 0 Then p = p + 3 Else p = 1
-
-    p = InStr(p, url, "/")
-    If p > 0 Then
-        ExtractPath = Mid$(url, p)
-    Else
-        ExtractPath = "/"
-    End If
-End Function
-
-' UTF-8 Conversion Utility
-Private Function ToUtf8Bytes(ByVal txt As String) As Byte()
-    ' Use the dedicated output stream to avoid corrupting m_InStream
-    PrepareStream m_OutStream, adTypeText
-    m_OutStream.Charset = "UTF-8"
-    m_OutStream.WriteText txt
-    
-    m_OutStream.Position = 0
-    m_OutStream.Type = adTypeBinary
-    
-    ' Dynamic BOM Detection (EF BB BF)
-    If m_OutStream.Size >= 3 Then
-        Dim Header() As Byte: Header = m_OutStream.Read(3)
-        If Header(0) = &HEF And Header(1) = &HBB And Header(2) = &HBF Then
-            m_OutStream.Position = 3 ' Skip BOM
-        Else
-            m_OutStream.Position = 0
-        End If
-    Else
-        m_OutStream.Position = 0
-    End If
-    
-    If m_OutStream.Size > m_OutStream.Position Then
-        ToUtf8Bytes = m_OutStream.Read
-    Else
-        ToUtf8Bytes = StrConv("", vbFromUnicode)
-    End If
-End Function
-
-' PumpMessages: Drains the Windows message queue (DoEvents) without sleeping.
-'   throttleMs = 0 : pump unconditionally
-'   throttleMs > 0 : pump only if at least throttleMs has elapsed since the last pump
-' Skipped while m_isSendReceiving is True to prevent WinHttp re-entrancy.
-' On the very first call (m_lastPumpTicks = 0), DoEvents always runs.
+' PumpMessages may run DoEvents only outside SendAndReceive; throttleMs limits how
+' often the Office queue is pumped.
 Public Sub PumpMessages(Optional ByVal throttleMs As Long = 0)
     If m_isSendReceiving Then Exit Sub
     If throttleMs > 0 And m_lastPumpTicks <> 0 Then
-        If ElapsedMs(m_lastPumpTicks) < throttleMs Then Exit Sub
+        If elapsedMs(m_lastPumpTicks) < throttleMs Then Exit Sub
     End If
     DoEvents
     m_lastPumpTicks = NowTicks()
 End Sub
 
-' YieldExecution: Sleeps for the given duration, optionally pumping the Windows
-' message queue. Companion to PumpMessages (which only pumps, no sleep).
-'   ms <= 50  : direct SleepWinAPI for precision
-'   ms > 50   : delegates to InterruptibleSleep for chunked, responsive waiting
-' DoEvents fires only when allowDoEvents=True AND m_isSendReceiving=False
-' (re-entrancy guard against WinHttp corruption during active I/O).
+' YieldExecution may pump Office messages only when explicitly requested and never
+' while a command owns response correlation.
 Public Sub YieldExecution(Optional ByVal ms As Long = 1, Optional ByVal allowDoEvents As Boolean = False)
-    ' Floor Guard: Prevent negative values from causing undefined SleepWinAPI behavior.
-    ' This is the only addition; the optimized 50ms branching logic below is preserved as-is.
     Dim vMs As Long: vMs = ms
     If vMs < 0 Then vMs = 1
 
-    ' 1. Use the robust chunked sleep for any duration longer than 50ms.
-    ' This ensures that long waits (like in AttemptRecovery) do not freeze Excel.
     If vMs > 50 Then
         Call InterruptibleSleep(vMs, allowDoEvents)
     Else
-        ' 2. For very short durations, perform a direct sleep to maintain precision.
-        ' Even for short sleeps, we apply the m_isSendReceiving guard to prevent
-        ' unintended re-entrancy during active command cycles.
         If allowDoEvents And Not m_isSendReceiving Then
             DoEvents
         End If
@@ -1470,36 +1358,26 @@ Public Sub YieldExecution(Optional ByVal ms As Long = 1, Optional ByVal allowDoE
     End If
 End Sub
 
-' Leaves breadcrumbs in both the external file and the Immediate Window.
-' CRITICAL PASS-THROUGH: isCritical=True bypasses the DEBUG_MODE gate for the
-' FILE log only (production incident monitoring, e.g. oversized-message
-' diagnostics whose root cause is still unconfirmed). Immediate Window output
-' and the substring-based detection (Return Code/failed/error) remain
-' DEBUG_MODE-only, so production log volume is limited to explicitly
-' flagged exceptional events.
-Public Sub Trace(ByVal Msg As String, Optional ByVal isCritical As Boolean = False)
+' DEBUG_MODE controls Immediate output and keyword-based file detection. In production,
+' file logging is driven only by the caller's explicit isCritical classification.
+Public Sub Trace(ByVal msg As String, Optional ByVal isCritical As Boolean = False)
     If Not DEBUG_MODE And Not isCritical Then Exit Sub
     
-    Dim logMsg As String: logMsg = "[" & Format(Now, "hh:mm:ss") & "] " & Msg
+    Dim logMsg As String: logMsg = "[" & Format(Now, "hh:mm:ss") & "] " & msg
     
-    ' Only print the message itself to the Immediate Window (debug builds only)
     If DEBUG_MODE Then Debug.Print logMsg
     
-    ' Detection Logic
-    ' WHY: the substring probes are gated on DEBUG_MODE so that production
-    ' file logging is driven solely by the caller's explicit isCritical flag,
-    ' not by incidental keywords in high-volume messages.
     Dim shouldLogToFile As Boolean
     shouldLogToFile = isCritical
     If DEBUG_MODE Then
         shouldLogToFile = shouldLogToFile Or _
-                          (InStr(1, Msg, "Return Code", vbTextCompare) > 0) Or _
-                          (InStr(1, Msg, "failed", vbTextCompare) > 0) Or _
-                          (InStr(1, Msg, "error", vbTextCompare) > 0)
+                          (InStr(1, msg, "Return Code", vbTextCompare) > 0) Or _
+                          (InStr(1, msg, "failed", vbTextCompare) > 0) Or _
+                          (InStr(1, msg, "error", vbTextCompare) > 0)
     End If
 
     If shouldLogToFile Then
-        Dim localDir As String: localDir = WebShared.getFullLocalPath(ThisWorkbook.Path)
+        Dim localDir As String: localDir = WebShared.getFullLocalPath(ThisWorkbook.path)
         If localDir = "" Then localDir = Environ("USERPROFILE") & "\Desktop"
         If Right$(localDir, 1) <> "\" Then localDir = localDir & "\"
         
@@ -1511,11 +1389,9 @@ Public Sub Trace(ByVal Msg As String, Optional ByVal isCritical As Boolean = Fal
         Print #fNum, logMsg & " (LOG_EVENT)"
         Close #fNum
         On Error GoTo 0
-        ' [SILENT] Removed LOG_SUCCESS print for clean operation
     End If
 End Sub
 
-' LogEvent: Unified logging with QPC timestamps and chunked output for long strings.
 Public Sub LogEvent(ByVal Header As String, ByVal Body As String, _
                    Optional ByVal tag As String = "[INFO]", _
                    Optional ByVal LogToFile As Boolean = False)
@@ -1525,11 +1401,9 @@ Public Sub LogEvent(ByVal Header As String, ByVal Body As String, _
     Dim timePrefix As String
     Dim currentTick As Currency
     
-    ' High-resolution timestamp for synchronization and performance analysis
     currentTick = Me.NowTicks()
     timePrefix = "[" & Format(Now, "hh:mm:ss") & " | " & Format(currentTick, "0") & "] "
 
-    ' Normalize text: remove null characters and trailing whitespace/newlines
     cleanText = Replace(Body, vbNullChar, "")
     Do While Len(cleanText) > 0
         Dim lastChar As String
@@ -1541,32 +1415,26 @@ Public Sub LogEvent(ByVal Header As String, ByVal Body As String, _
         End If
     Loop
 
-    ' Output the header with the structured tag.
-    ' Format: [Time | Ticks] [TAG] Header (Length: N)
     Dim sfx As String: sfx = "": If Len(cleanText) > 0 Then sfx = " (Length: " & Len(cleanText) & ")"
     Dim headerLine As String: headerLine = timePrefix & tag & " " & Header & sfx
     Debug.Print headerLine
 
-    ' Chunked output to bypass VBA's Immediate Window line length limits
     If Len(cleanText) > 0 Then
         For i = 1 To Len(cleanText) Step CHUNK_SIZE
-            ' Print parts of the string without an automatic newline
             Debug.Print Mid$(cleanText, i, CHUNK_SIZE);
         Next i
         Debug.Print ""
     End If
     
-    ' Optional file logging
     If LogToFile Then
         WriteLogToFile headerLine & vbCrLf & cleanText
     End If
 End Sub
 
-' Internal helper for LogToFile
-Private Sub WriteLogToFile(ByVal Msg As String)
+Private Sub WriteLogToFile(ByVal msg As String)
     Dim localDir As String
     On Error Resume Next
-    localDir = WebShared.getFullLocalPath(ThisWorkbook.Path)
+    localDir = WebShared.getFullLocalPath(ThisWorkbook.path)
     If localDir = "" Then localDir = Environ("USERPROFILE") & "\Desktop"
     If Right$(localDir, 1) <> "\" Then localDir = localDir & "\"
     
@@ -1574,19 +1442,17 @@ Private Sub WriteLogToFile(ByVal Msg As String)
     Dim fNum As Integer: fNum = FreeFile
     
     Open logPath For Append As #fNum
-    Print #fNum, Msg
+    Print #fNum, msg
     Close #fNum
     On Error GoTo 0
 End Sub
 
-' Explicitly resets the consecutive error counter.
-' Called by the Wrapper only when a truly healthy response is confirmed.
+' Only a confirmed healthy response should reset the consecutive internal-error
+' counter.
 Public Sub ClearInternalErrorCounter()
     m_consecutiveInternalErrors = 0
 End Sub
 
-' Extracts the host name/IP from a URL.
-' Designed to be future-proof against IPv6 loopbacks (e.g., [::1]) and custom ports.
 Private Function ExtractHost(ByVal url As String) As String
     Dim startPos As Long
     Dim relPos As Long
@@ -1602,7 +1468,6 @@ Private Function ExtractHost(ByVal url As String) As String
     url = Trim$(url)
     If url = "" Then Exit Function
 
-    ' Check for "://" (standard), "//" (protocol-relative), or none
     startPos = InStr(1, url, "://", vbTextCompare)
     relPos = InStr(1, url, "//")
 
@@ -1616,11 +1481,9 @@ Private Function ExtractHost(ByVal url As String) As String
 
     authEnd = InStr(startPos, url, "/")
     
-    ' Check for Query string indicator (?)
     qPos = InStr(startPos, url, "?")
     If qPos > 0 And (authEnd = 0 Or qPos < authEnd) Then authEnd = qPos
     
-    ' Check for Fragment indicator (#)
     fPos = InStr(startPos, url, "#")
     If fPos > 0 And (authEnd = 0 Or fPos < authEnd) Then authEnd = fPos
     
@@ -1629,22 +1492,17 @@ Private Function ExtractHost(ByVal url As String) As String
     authority = Mid$(url, startPos, authEnd - startPos)
     If authority = "" Then Exit Function
     
-    ' Strip user credentials; InStrRev handles '@' inside passwords
     atPos = InStrRev(authority, "@")
     If atPos > 0 Then authority = Mid$(authority, atPos + 1)
     
     If Left$(authority, 1) = "[" Then
-        ' Case: IPv6 address [::1]:port
         closeBracket = InStr(1, authority, "]")
         If closeBracket > 0 Then
             hostPart = Mid$(authority, 2, closeBracket - 2)
         Else
-            ' Invalid IPv6 format (missing closing bracket)
             Exit Function
         End If
     Else
-        ' Case: Standard domain or IPv4 address
-        ' Locate the last colon to identify the port number
         portPos = InStrRev(authority, ":")
         If portPos > 0 Then
             hostPart = Left$(authority, portPos - 1)
@@ -1653,18 +1511,13 @@ Private Function ExtractHost(ByVal url As String) As String
         End If
     End If
     
-    ' Convert host to lowercase for consistency
     If hostPart <> "" Then ExtractHost = LCase$(hostPart)
 End Function
 
-' Extracts the origin (scheme + host + port) from a URL string.
-' Example: "https://example.com:8080/path" -> "https://example.com:8080"
-' Returns empty string for non-parseable or empty URLs.
 Public Function ExtractOrigin(ByVal url As String) As String
     If Len(url) = 0 Then Exit Function
     Dim schemeEnd As Long: schemeEnd = InStr(1, url, "://", vbTextCompare)
     If schemeEnd = 0 Then Exit Function
-    ' Find the first "/" after "://" which terminates the authority part
     Dim authStart As Long: authStart = schemeEnd + 3
     Dim pathStart As Long: pathStart = InStr(authStart, url, "/")
     If pathStart = 0 Then
@@ -1674,78 +1527,1765 @@ Public Function ExtractOrigin(ByVal url As String) As String
     End If
 End Function
 
-' Internal Helper: Performs an interruptible sleep in small chunks.
-' It intelligently yields to the OS (DoEvents) only when it's safe to do so,
-' ensuring that the WebSocket state machine is not corrupted by re-entrancy.
+' InterruptibleSleep pumps Office messages only when allowed and outside an active
+' SendAndReceive cycle; otherwise it is a physical chunked wait.
 Private Sub InterruptibleSleep(ByVal totalMs As Long, Optional ByVal allowDoEvents As Boolean = True)
-    Dim startTs As Double: startTs = NowMs()
+    Dim startTs As Double: startTs = nowMs()
     Const CHUNK_MS As Long = 50 ' Small granularity for better responsiveness
     
-    Do While (NowMs() - startTs) < totalMs
-        ' CRITICAL GUARD:
-        ' We only call DoEvents if:
-        ' 1. The caller explicitly allows it (allowDoEvents).
-        ' 2. We are NOT in the middle of a SendAndReceive operation (m_isSendReceiving).
-        ' corrupting the WinHttp handle state during active I/O.
+    Do While (nowMs() - startTs) < totalMs
         If allowDoEvents And Not m_isSendReceiving Then
             DoEvents
         End If
         
-        ' Physical sleep to prevent high CPU usage during the wait period.
         SleepWinAPI CHUNK_MS
     Loop
 End Sub
 
-' Releases all WinHttp handles without sending a WebSocket close frame.
+' ForceClose skips the close handshake and performs non-raising emergency teardown.
 Public Sub ForceClose()
-    ' OERN SCOPE = ENTIRE PROCEDURE (no matching "On Error GoTo 0"): emergency
-    ' teardown must never raise. Every handle release below is best-effort.
+    ' Clear I/O guards before closing native transport so interrupted operations do not
+    ' poison object reuse.
     On Error Resume Next
-    ' INVARIANT (TEARDOWN ORDER): clear communication locks first, before any handle operations.
-    ' ForceClose is the emergency exit path (called from Wrapper.Shutdown and
-    ' Class_Terminate). If the caller was interrupted mid-SendAndReceive,
-    ' these flags must be reset to prevent deadlock on reconnection.
     m_isSendReceiving = False
     m_isReading = False
-    m_isReadingSince = 0
-    m_discardActive = False
-    
-    ' Skip WinHttpWebSocketClose (no close frame, no timeout).
-    ' Directly release all WinHttp handles.
-    '
-    ' INVARIANT (HANDLE OWNERSHIP): the request handle is independent of the WebSocket handle.
-    ' On the success path it was already closed in Connect; here we simply close
-    ' whatever handles are still open (best-effort emergency teardown).
-    If hWebSocket_ <> 0 Then
-        WinHttpCloseHandle hWebSocket_
-        hWebSocket_ = 0
-    End If
-    If hRequest_ <> 0 Then
-        WinHttpCloseHandle hRequest_
-        hRequest_ = 0
-    End If
-    If hConnection_ <> 0 Then
-        WinHttpCloseHandle hConnection_
-        hConnection_ = 0
-    End If
-    If hSession_ <> 0 Then
-        WinHttpCloseHandle hSession_
-        hSession_ = 0
-    End If
 
-    ' Purge the input stream so a reused instance never carries stale fragments into the
-    ' next connection's first message. Connect -> InternalCleanup already truncates on
-    ' reconnect, so this is defense-in-depth; it also keeps ForceClose consistent with
-    ' InternalCleanup and with the m_discardActive invariant cleared above.
-    If Not m_InStream Is Nothing Then
-        If m_InStream.State = adStateOpen Then
-            m_InStream.Position = 0
-            m_InStream.SetEOS
-            m_InStream.Type = adTypeBinary
-        End If
+    If m_wsTransportInitialized Then
+        WsForceClose
     End If
 
     Set m_EventBuffer = New Collection
     SetState StateDisconnected
     On Error GoTo 0
 End Sub
+
+Private Sub WsTransportInitialize()
+    Dim frequency As Currency
+    If WsApi_QueryPerformanceFrequency(frequency) = 0 Or frequency = 0 Then
+        Err.Raise vbObjectError + 9001, "BiDiSocketCommunicator", "QPC is unavailable."
+    End If
+    m_ws_qpcFrequency = frequency
+
+    Dim data As WsWSADATA
+    Dim result As Long
+    result = WsApi_WSAStartup(&H202, data)
+    If result <> 0 Then
+        Err.Raise vbObjectError + 9101, "BiDiSocketCommunicator", "WSAStartup failed: " & result
+    End If
+    m_ws_wsaStarted = True
+
+    Set m_ws_sendQueue = New Collection
+    Set m_ws_rawTextQueue = New Collection
+    Set m_ws_rawTextLengthQueue = New Collection
+    m_ws_socket = -1
+    m_ws_state = WsTransportDisconnected
+    m_ws_maxIncomingSize = WS_DEFAULT_MAX_INCOMING_SIZE
+    m_ws_frameState = WsFrameReadBaseHeader
+    m_ws_clientPingEnabled = True
+
+End Sub
+
+Private Sub WsTransportTerminate()
+    On Error Resume Next
+    WsForceClose
+    If m_ws_wsaStarted Then
+        WsApi_WSACleanup
+        m_ws_wsaStarted = False
+    End If
+    On Error GoTo 0
+End Sub
+
+Private Property Get Wsstate() As WsWinsockTransportState
+    Wsstate = m_ws_state
+End Property
+
+Private Property Get WsStateName() As String
+    Select Case m_ws_state
+        Case WsTransportDisconnected: WsStateName = "DISCONNECTED"
+        Case WsTransportConnecting: WsStateName = "CONNECTING"
+        Case WsTransportHandshakeSending: WsStateName = "HANDSHAKE_SEND"
+        Case WsTransportHandshakeReceiving: WsStateName = "HANDSHAKE_RECEIVE"
+        Case WsTransportOpen: WsStateName = "OPEN"
+        Case WsTransportClosing: WsStateName = "CLOSING"
+        Case WsTransportFailed: WsStateName = "FAILED"
+        Case Else: WsStateName = "UNKNOWN"
+    End Select
+End Property
+
+Private Property Get WsIsOpen() As Boolean
+    WsIsOpen = (m_ws_state = WsTransportOpen)
+End Property
+
+Private Property Get WsLastErrorCode() As Long
+    WsLastErrorCode = m_ws_LastErrorCode
+End Property
+
+Private Property Get WsLastErrorText() As String
+    WsLastErrorText = m_ws_lastErrorText
+End Property
+
+Private Property Get WsMaxIncomingSize() As Long
+    WsMaxIncomingSize = m_ws_maxIncomingSize
+End Property
+
+Private Property Let WsMaxIncomingSize(ByVal value As Long)
+    If value < 300000 Then value = 300000
+    m_ws_maxIncomingSize = value
+End Property
+
+Private Property Get WsHasPendingOutput() As Boolean
+    WsHasPendingOutput = WsHasPendingSend
+End Property
+
+Private Function WsMonotonicMs() As Double
+    Dim currentTick As Currency
+    WsApi_QueryPerformanceCounter currentTick
+    WsMonotonicMs = (CDbl(currentTick) / CDbl(m_ws_qpcFrequency)) * 1000#
+End Function
+
+Private Function WsApplyTcpNoDelay() As Boolean
+    Dim optionValue As Long
+    Dim actualValue As Long
+    Dim optionLength As Long
+    Dim socketError As Long
+
+    optionValue = 1
+
+    If WsApi_setsockopt(m_ws_socket, WS_IPPROTO_TCP, WS_TCP_NODELAY, _
+                  optionValue, LenB(optionValue)) = WS_SOCKET_ERROR Then
+        socketError = WsApi_WSAGetLastError()
+        WsSetFailure socketError, "setsockopt TCP_NODELAY failed."
+        Exit Function
+    End If
+
+    optionLength = LenB(actualValue)
+
+    If WsApi_getsockopt(m_ws_socket, WS_IPPROTO_TCP, WS_TCP_NODELAY, _
+                  actualValue, optionLength) = WS_SOCKET_ERROR Then
+        socketError = WsApi_WSAGetLastError()
+        WsSetFailure socketError, "getsockopt TCP_NODELAY failed."
+        Exit Function
+    End If
+
+    If actualValue = 0 Then
+        WsSetFailure 9240, "TCP_NODELAY remained disabled."
+        Exit Function
+    End If
+
+    WsApplyTcpNoDelay = True
+End Function
+
+Private Function WsBeginConnect(ByVal wsUrl As String, _
+                             Optional ByVal connectTimeoutMs As Long = WS_DEFAULT_CONNECT_TIMEOUT_MS, _
+                             Optional ByVal handshakeTimeoutMs As Long = WS_DEFAULT_HANDSHAKE_TIMEOUT_MS) As Boolean
+    On Error GoTo ErrorHandler
+
+    WsForceClose
+    WsResetRuntimeState
+
+    If connectTimeoutMs < 1 Then connectTimeoutMs = WS_DEFAULT_CONNECT_TIMEOUT_MS
+    If handshakeTimeoutMs < 1 Then handshakeTimeoutMs = WS_DEFAULT_HANDSHAKE_TIMEOUT_MS
+
+    If Not WsParseLoopbackUrl(wsUrl) Then
+        WsSetFailure 9201, "Only ws:// loopback URLs are supported."
+        Exit Function
+    End If
+
+    m_ws_url = wsUrl
+    m_ws_handshakeTimeoutMs = handshakeTimeoutMs
+
+    Dim addressFamily As Long
+    If m_ws_host = "[::1]" Then
+        addressFamily = WS_AF_INET6
+    Else
+        addressFamily = WS_AF_INET
+    End If
+
+    m_ws_socket = WsApi_socket(addressFamily, WS_SOCK_STREAM, WS_IPPROTO_TCP)
+    If m_ws_socket = -1 Then
+        WsSetFailure WsApi_WSAGetLastError(), "socket failed."
+        Exit Function
+    End If
+
+    If Not WsApplyTcpNoDelay Then Exit Function
+
+    Dim nonBlocking As Long
+    nonBlocking = 1
+    If WsApi_ioctlsocket(m_ws_socket, WS_FIONBIO, nonBlocking) = WS_SOCKET_ERROR Then
+        WsSetFailure WsApi_WSAGetLastError(), "FIONBIO failed."
+        Exit Function
+    End If
+
+    m_ws_state = WsTransportConnecting
+    m_ws_phaseDeadlineMs = WsMonotonicMs() + connectTimeoutMs
+
+    Dim connectResult As Long
+    If addressFamily = WS_AF_INET6 Then
+        Dim address6 As WsSOCKADDR_IN6
+        address6.family = WS_AF_INET6
+        address6.port = WsHostToNetworkShort(m_ws_port)
+
+        If WsApi_InetPtonW(WS_AF_INET6, StrPtr("::1"), address6.address(0)) <> 1 Then
+            WsSetFailure WsApi_WSAGetLastError(), "IPv6 loopback conversion failed."
+            Exit Function
+        End If
+
+        connectResult = WsApi_connectSocket(m_ws_socket, address6, LenB(address6))
+    Else
+        Dim address4 As WsSOCKADDR_IN
+        address4.family = WS_AF_INET
+        address4.port = WsHostToNetworkShort(m_ws_port)
+
+        If WsApi_InetPtonW(WS_AF_INET, StrPtr("127.0.0.1"), address4.address) <> 1 Then
+            WsSetFailure WsApi_WSAGetLastError(), "IPv4 loopback conversion failed."
+            Exit Function
+        End If
+
+        connectResult = WsApi_connectSocket(m_ws_socket, address4, LenB(address4))
+    End If
+
+    If connectResult = 0 Then
+        WsBeginHandshake
+    Else
+        Dim socketError As Long
+        socketError = WsApi_WSAGetLastError()
+
+        If socketError <> WS_WSAEWOULDBLOCK And _
+           socketError <> WS_WSAEINPROGRESS And _
+           socketError <> WS_WSAEALREADY And _
+           socketError <> WS_WSAEISCONN Then
+            WsSetFailure socketError, "connect failed."
+            Exit Function
+        End If
+
+        If socketError = WS_WSAEISCONN Then WsBeginHandshake
+    End If
+
+    WsBeginConnect = True
+    Exit Function
+
+ErrorHandler:
+    WsSetFailure Err.Number, Err.description
+End Function
+
+Private Function WsPump(Optional ByVal maxPumpMs As Long = WS_DEFAULT_MAX_PUMP_MS, _
+                     Optional ByVal maxBytes As Long = WS_DEFAULT_MAX_PUMP_BYTES, _
+                     Optional ByVal maxCalls As Long = WS_DEFAULT_MAX_PUMP_CALLS) As Boolean
+    m_ws_currentPumpCompletedMessages = 0
+
+    If maxPumpMs < 1 Then maxPumpMs = 1
+    If maxBytes < 1 Then maxBytes = 1
+    If maxCalls < 1 Then maxCalls = 1
+
+    Dim pumpStartedAt As Double
+    Dim pumpDeadline As Double
+    Dim copyGuardDeadline As Double
+
+    pumpStartedAt = WsMonotonicMs()
+    pumpDeadline = pumpStartedAt + maxPumpMs
+    copyGuardDeadline = pumpDeadline
+
+    ' Reserve the final parser millisecond only for the normal product Pump budget.
+    If maxPumpMs >= WS_DEFAULT_MAX_PUMP_MS Then
+        copyGuardDeadline = pumpDeadline - WS_PARSER_COPY_GUARD_MS
+    End If
+
+    Select Case m_ws_state
+        Case WsTransportConnecting
+            WsPumpConnect
+
+        Case WsTransportHandshakeSending, WsTransportHandshakeReceiving
+            WsPumpHandshake pumpDeadline, copyGuardDeadline, maxBytes, maxCalls
+
+        Case WsTransportOpen
+            WsMaybeQueueClientPing
+
+            If m_ws_state = WsTransportOpen Then
+                WsPumpSendInternal pumpDeadline, maxBytes, maxCalls
+            End If
+
+            If m_ws_state = WsTransportOpen And WsMonotonicMs() < pumpDeadline Then
+                WsPumpReceiveInternal pumpDeadline, copyGuardDeadline, _
+                                    maxBytes, maxCalls, True
+            End If
+
+        Case WsTransportClosing
+            WsPumpSendInternal pumpDeadline, maxBytes, maxCalls
+
+            If Not WsHasPendingSend Then WsForceClose
+    End Select
+
+    WsPump = (m_ws_state <> WsTransportFailed)
+End Function
+
+Private Function WsQueueText(ByVal message As String) As Boolean
+    If m_ws_state <> WsTransportOpen Then Exit Function
+
+    Dim payload() As Byte
+    payload = WsEncodeUtf8(message)
+
+    Dim frame() As Byte
+    frame = WsBuildClientFrame(WS_OPCODE_TEXT, payload, True)
+
+    If m_ws_state = WsTransportFailed Then Exit Function
+    If WsByteArrayLength(frame) = 0 Then Exit Function
+
+    WsEnqueueSendBytes frame
+    WsQueueText = True
+End Function
+
+Private Function WsTryDequeueText(ByRef message As String) As Boolean
+    On Error GoTo ErrorHandler
+
+    If m_ws_rawTextLengthQueue.count <> m_ws_rawTextQueue.count Then
+        WsSetFailure 9218, "Deferred text queue is inconsistent."
+        Exit Function
+    End If
+
+    If m_ws_rawTextQueue.count = 0 Then Exit Function
+
+    Dim chunks As Collection
+    Dim totalBytes As Long
+
+    Set chunks = m_ws_rawTextQueue(1)
+    totalBytes = CLng(m_ws_rawTextLengthQueue(1))
+
+    m_ws_rawTextQueue.Remove 1
+    m_ws_rawTextLengthQueue.Remove 1
+
+    message = WsDecodeUtf8Chunks(chunks, totalBytes)
+    WsTryDequeueText = (m_ws_state <> WsTransportFailed)
+    Exit Function
+
+ErrorHandler:
+    WsSetFailure Err.Number, "Deferred UTF-8 decode failed: " & Err.description
+End Function
+
+Private Function WsBeginClose(Optional ByVal statusCode As Long = 1000) As Boolean
+    If m_ws_state <> WsTransportOpen Then Exit Function
+    If m_ws_closeSent Then
+        WsBeginClose = True
+        Exit Function
+    End If
+
+    Dim payload(0 To 1) As Byte
+    payload(0) = CByte((statusCode \ &H100&) And &HFF&)
+    payload(1) = CByte(statusCode And &HFF&)
+
+    Dim frame() As Byte
+    frame = WsBuildClientFrame(WS_OPCODE_CLOSE, payload, True)
+
+    If m_ws_state = WsTransportFailed Then Exit Function
+    If WsByteArrayLength(frame) = 0 Then Exit Function
+
+    WsEnqueueSendBytes frame
+
+    m_ws_closeSent = True
+    m_ws_state = WsTransportClosing
+    WsBeginClose = True
+End Function
+
+Private Sub WsForceClose()
+    On Error Resume Next
+
+    If m_ws_socket <> -1 Then
+        WsApi_shutdownSocket m_ws_socket, WS_SD_BOTH
+        WsApi_closesocket m_ws_socket
+        m_ws_socket = -1
+    End If
+
+    Set m_ws_sendQueue = New Collection
+    Set m_ws_rawTextQueue = New Collection
+    Set m_ws_rawTextLengthQueue = New Collection
+    Set m_ws_messageChunks = Nothing
+
+    Erase m_ws_sendCurrent
+    Erase m_ws_rawBuffer
+    Erase m_ws_controlPayload
+
+    m_ws_sendCurrentCount = 0
+    m_ws_sendOffset = 0
+    m_ws_rawCount = 0
+    m_ws_rawReadPos = 0
+    m_ws_messageCount = 0
+    m_ws_controlCount = 0
+    m_ws_state = WsTransportDisconnected
+
+    On Error GoTo 0
+End Sub
+
+Private Sub WsPumpConnect()
+    If WsMonotonicMs() >= m_ws_phaseDeadlineMs Then
+        WsSetFailure 9202, "Connect timeout."
+        Exit Sub
+    End If
+
+    Dim readSet As WsFD_SET
+    Dim writeSet As WsFD_SET
+    Dim exceptSet As WsFD_SET
+    Dim TIMEOUT As WsTIMEVAL
+
+    writeSet.count = 1
+    writeSet.sockets(0) = m_ws_socket
+    exceptSet.count = 1
+    exceptSet.sockets(0) = m_ws_socket
+
+    Dim ready As Long
+    ready = WsApi_selectSocket(0, readSet, writeSet, exceptSet, TIMEOUT)
+    If ready = WS_SOCKET_ERROR Then
+        WsSetFailure WsApi_WSAGetLastError(), "select failed during connect."
+        Exit Sub
+    End If
+    If ready = 0 Then Exit Sub
+
+    Dim socketError As Long
+    Dim optionLength As Long
+    optionLength = 4
+
+    If WsApi_getsockopt(m_ws_socket, WS_SOL_SOCKET, WS_SO_ERROR, socketError, optionLength) = WS_SOCKET_ERROR Then
+        WsSetFailure WsApi_WSAGetLastError(), "getsockopt(SO_ERROR) failed."
+        Exit Sub
+    End If
+
+    If socketError <> 0 Then
+        WsSetFailure socketError, "Non-blocking connect failed."
+        Exit Sub
+    End If
+
+    WsBeginHandshake
+End Sub
+
+Private Sub WsBeginHandshake()
+    m_ws_handshakeValidationError = vbNullString
+
+    If Not WsPrepareHandshakeValues Then Exit Sub
+
+    WsPrepareHandshakeHeaders
+
+    Dim requestText As String
+    requestText = _
+        "GET " & m_ws_path & " HTTP/1.1" & vbCrLf & _
+        "Host: " & m_ws_hostHeader & vbCrLf & _
+        "Upgrade: websocket" & vbCrLf & _
+        "Connection: Upgrade" & vbCrLf & _
+        "Sec-WebSocket-Key: " & m_ws_handshakeClientKey & vbCrLf & _
+        "Sec-WebSocket-Version: 13" & vbCrLf & _
+        "Origin: " & m_ws_handshakeOrigin & vbCrLf & _
+        "User-Agent: " & m_ws_handshakeUserAgent & vbCrLf & vbCrLf
+
+    Dim requestBytes() As Byte
+    requestBytes = WsEncodeAscii(requestText)
+    WsEnqueueSendBytes requestBytes
+
+    m_ws_phaseDeadlineMs = WsMonotonicMs() + m_ws_handshakeTimeoutMs
+    m_ws_state = WsTransportHandshakeSending
+End Sub
+
+Private Sub WsPumpHandshake(ByVal pumpDeadline As Double, _
+                          ByVal copyGuardDeadline As Double, _
+                          ByVal maxBytes As Long, _
+                          ByVal maxCalls As Long)
+    If WsMonotonicMs() >= m_ws_phaseDeadlineMs Then
+        WsSetFailure 9203, "WebSocket handshake timeout."
+        Exit Sub
+    End If
+
+    If m_ws_state = WsTransportHandshakeSending Then
+        WsPumpSendInternal pumpDeadline, maxBytes, maxCalls
+        If m_ws_state = WsTransportFailed Then Exit Sub
+
+        If Not WsHasPendingSend Then
+            m_ws_state = WsTransportHandshakeReceiving
+        End If
+    End If
+
+    If m_ws_state = WsTransportHandshakeReceiving And WsMonotonicMs() < pumpDeadline Then
+        WsPumpReceiveInternal pumpDeadline, copyGuardDeadline, _
+                            maxBytes, maxCalls, False
+        If m_ws_state = WsTransportFailed Then Exit Sub
+
+        WsTryCompleteHandshake pumpDeadline, copyGuardDeadline
+    End If
+End Sub
+
+Private Sub WsTryCompleteHandshake(ByVal pumpDeadline As Double, _
+                                 ByVal copyGuardDeadline As Double)
+    Dim headerEnd As Long
+    headerEnd = WsFindHttpHeaderEnd()
+    If headerEnd = 0 Then
+        If WsRawAvailable > WS_MAX_HTTP_HEADER_SIZE Then
+            WsSetFailure 9204, "HTTP upgrade header is too large."
+        End If
+        Exit Sub
+    End If
+
+    Dim headerText As String
+    headerText = WsReadAsciiFromRaw(headerEnd)
+
+    If Not WsValidateHandshakeHeader(headerText) Then
+        WsSetFailure 9205, _
+                   "WebSocket upgrade response validation failed: " & _
+                   m_ws_handshakeValidationError
+        Exit Sub
+    End If
+
+    WsConsumeRaw headerEnd
+    m_ws_state = WsTransportOpen
+    m_ws_frameState = WsFrameReadBaseHeader
+    m_ws_nextClientPingAtMs = WsMonotonicMs() + WS_CLIENT_PING_INTERVAL_MS
+
+    If WS_DEBUG_MODE Then Debug.Print "BiDiSocketCommunicator[IntegratedWinsock]: OPEN"
+
+    WsParseAvailableFrames pumpDeadline, copyGuardDeadline
+End Sub
+
+Private Function WsValidateHandshakeHeader(ByVal headerText As String) As Boolean
+    m_ws_handshakeValidationError = vbNullString
+
+    Dim lines() As String
+    lines = Split(headerText, vbCrLf)
+    If UBound(lines) < 1 Then
+        m_ws_handshakeValidationError = "response has no headers"
+        Exit Function
+    End If
+
+    Dim firstLine As String
+    firstLine = Trim$(lines(0))
+
+    Dim statusValid As Boolean
+    statusValid = _
+        (InStr(1, firstLine, " 101 ", vbTextCompare) > 0) Or _
+        (Right$(firstLine, 4) = " 101")
+
+    Dim hasUpgrade As Boolean
+    Dim hasConnectionUpgrade As Boolean
+    Dim acceptPresent As Boolean
+    Dim acceptValue As String
+    Dim i As Long
+
+    For i = 1 To UBound(lines)
+        Dim colonPos As Long
+        colonPos = InStr(1, lines(i), ":", vbBinaryCompare)
+
+        If colonPos > 0 Then
+            Dim headerName As String
+            Dim headerValue As String
+
+            headerName = _
+                LCase$(Trim$(Left$(lines(i), colonPos - 1)))
+            headerValue = Trim$(Mid$(lines(i), colonPos + 1))
+
+            If headerName = "upgrade" Then
+                hasUpgrade = _
+                    (StrComp(headerValue, "websocket", _
+                             vbTextCompare) = 0)
+            ElseIf headerName = "connection" Then
+                hasConnectionUpgrade = _
+                    WsHeaderContainsToken(headerValue, "upgrade")
+            ElseIf headerName = "sec-websocket-accept" Then
+                acceptPresent = True
+                acceptValue = headerValue
+            End If
+        End If
+    Next
+
+    Dim acceptMatched As Boolean
+    If acceptPresent Then
+        acceptMatched = _
+            (StrComp(acceptValue, m_ws_expectedHandshakeAccept, _
+                     vbBinaryCompare) = 0)
+    End If
+
+    If Not statusValid Then
+        m_ws_handshakeValidationError = "HTTP status is not 101"
+    ElseIf Not hasUpgrade Then
+        m_ws_handshakeValidationError = _
+            "Upgrade header is not websocket"
+    ElseIf Not hasConnectionUpgrade Then
+        m_ws_handshakeValidationError = _
+            "Connection header has no Upgrade token"
+    ElseIf Not acceptPresent Then
+        m_ws_handshakeValidationError = _
+            "Sec-WebSocket-Accept is missing"
+    ElseIf Not acceptMatched Then
+        m_ws_handshakeValidationError = _
+            "Sec-WebSocket-Accept does not match"
+    Else
+        WsValidateHandshakeHeader = True
+    End If
+End Function
+
+Private Sub WsPrepareHandshakeHeaders()
+    If m_ws_port = 80 Then
+        m_ws_handshakeOrigin = WS_HANDSHAKE_ORIGIN_SCHEME & m_ws_host
+    Else
+        m_ws_handshakeOrigin = WS_HANDSHAKE_ORIGIN_SCHEME & m_ws_hostHeader
+    End If
+
+    m_ws_handshakeUserAgent = WS_HANDSHAKE_USER_AGENT
+End Sub
+
+Private Function WsPrepareHandshakeValues() As Boolean
+    Dim nonce(0 To WS_HANDSHAKE_NONCE_SIZE - 1) As Byte
+
+    Dim status As Long
+    status = WsApi_BCryptGenRandom(0, nonce(0), WS_HANDSHAKE_NONCE_SIZE, _
+                             WS_BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Then
+        WsSetFailure 9230, _
+                   "Handshake BCryptGenRandom failed. NTSTATUS=0x" & _
+                   Right$("00000000" & hex$(status), 8)
+        Exit Function
+    End If
+
+    m_ws_handshakeClientKey = WsBase64EncodeBytes(nonce)
+
+    If Not WsTryBuildExpectedAccept( _
+        m_ws_handshakeClientKey, m_ws_expectedHandshakeAccept) Then
+        Exit Function
+    End If
+
+    WsPrepareHandshakeValues = True
+End Function
+
+Private Function WsTryBuildExpectedAccept(ByVal clientKey As String, _
+                                        ByRef acceptValue As String) As Boolean
+    Dim inputBytes() As Byte
+    inputBytes = WsEncodeAscii(clientKey & WS_WEBSOCKET_GUID)
+
+    Dim digest() As Byte
+    Dim failureText As String
+
+    If Not WsTrySha1(inputBytes, digest, failureText) Then
+        WsSetFailure 9231, _
+                   "Handshake SHA-1 failed: " & failureText
+        Exit Function
+    End If
+
+    acceptValue = WsBase64EncodeBytes(digest)
+    WsTryBuildExpectedAccept = True
+End Function
+
+Private Function WsTrySha1(ByRef inputBytes() As Byte, _
+                         ByRef digest() As Byte, _
+                         ByRef failureText As String) As Boolean
+    Dim algorithmHandle As LongPtr
+    Dim hashHandle As LongPtr
+    Dim status As Long
+    Dim completed As Boolean
+
+    Dim algorithmId As String
+    algorithmId = WS_BCRYPT_SHA1_ALGORITHM
+
+    status = WsApi_BCryptOpenAlgorithmProvider( _
+        algorithmHandle, StrPtr(algorithmId), 0, 0)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Then
+        failureText = _
+            "BCryptOpenAlgorithmProvider NTSTATUS=0x" & _
+            Right$("00000000" & hex$(status), 8)
+        GoTo Cleanup
+    End If
+
+    Dim objectProperty As String
+    objectProperty = WS_BCRYPT_OBJECT_LENGTH
+
+    Dim objectLength As Long
+    Dim resultSize As Long
+
+    status = WsApi_BCryptGetProperty( _
+        algorithmHandle, StrPtr(objectProperty), _
+        objectLength, 4, resultSize, 0)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Or objectLength <= 0 Then
+        failureText = _
+            "ObjectLength query NTSTATUS=0x" & _
+            Right$("00000000" & hex$(status), 8)
+        GoTo Cleanup
+    End If
+
+    Dim hashProperty As String
+    hashProperty = WS_BCRYPT_HASH_LENGTH
+
+    Dim hashLength As Long
+    resultSize = 0
+
+    status = WsApi_BCryptGetProperty( _
+        algorithmHandle, StrPtr(hashProperty), _
+        hashLength, 4, resultSize, 0)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Or hashLength <= 0 Then
+        failureText = _
+            "HashDigestLength query NTSTATUS=0x" & _
+            Right$("00000000" & hex$(status), 8)
+        GoTo Cleanup
+    End If
+
+    Dim hashObject() As Byte
+    ReDim hashObject(0 To objectLength - 1)
+    ReDim digest(0 To hashLength - 1)
+
+    status = WsApi_BCryptCreateHash( _
+        algorithmHandle, hashHandle, hashObject(0), _
+        objectLength, 0, 0, 0)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Then
+        failureText = _
+            "BCryptCreateHash NTSTATUS=0x" & _
+            Right$("00000000" & hex$(status), 8)
+        GoTo Cleanup
+    End If
+
+    Dim inputLength As Long
+    inputLength = WsByteArrayLength(inputBytes)
+
+    If inputLength <= 0 Then
+        failureText = "SHA-1 input is empty"
+        GoTo Cleanup
+    End If
+
+    status = WsApi_BCryptHashData( _
+        hashHandle, inputBytes(0), inputLength, 0)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Then
+        failureText = _
+            "BCryptHashData NTSTATUS=0x" & _
+            Right$("00000000" & hex$(status), 8)
+        GoTo Cleanup
+    End If
+
+    status = WsApi_BCryptFinishHash( _
+        hashHandle, digest(0), hashLength, 0)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Then
+        failureText = _
+            "BCryptFinishHash NTSTATUS=0x" & _
+            Right$("00000000" & hex$(status), 8)
+        GoTo Cleanup
+    End If
+
+    completed = True
+
+Cleanup:
+    On Error Resume Next
+
+    If hashHandle <> 0 Then
+        WsApi_BCryptDestroyHash hashHandle
+        hashHandle = 0
+    End If
+
+    If algorithmHandle <> 0 Then
+        WsApi_BCryptCloseAlgorithmProvider algorithmHandle, 0
+        algorithmHandle = 0
+    End If
+
+    On Error GoTo 0
+
+    WsTrySha1 = completed
+End Function
+
+Private Function WsBase64EncodeBytes(ByRef Bytes() As Byte) As String
+    Const alphabet As String = _
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+    Dim count As Long
+    count = WsByteArrayLength(Bytes)
+
+    If count <= 0 Then
+        WsBase64EncodeBytes = vbNullString
+        Exit Function
+    End If
+
+    Dim result As String
+    Dim index As Long
+
+    Do While index < count
+        Dim byte0 As Long
+        Dim byte1 As Long
+        Dim byte2 As Long
+        Dim remaining As Long
+
+        byte0 = Bytes(index)
+        remaining = count - index
+
+        If remaining > 1 Then
+            byte1 = Bytes(index + 1)
+        Else
+            byte1 = 0
+        End If
+
+        If remaining > 2 Then
+            byte2 = Bytes(index + 2)
+        Else
+            byte2 = 0
+        End If
+
+        result = result & _
+            Mid$(alphabet, (byte0 \ 4) + 1, 1)
+
+        result = result & _
+            Mid$(alphabet, _
+                 (((byte0 And 3) * 16) Or (byte1 \ 16)) + 1, _
+                 1)
+
+        If remaining > 1 Then
+            result = result & _
+                Mid$(alphabet, _
+                     (((byte1 And 15) * 4) Or (byte2 \ 64)) + 1, _
+                     1)
+        Else
+            result = result & "="
+        End If
+
+        If remaining > 2 Then
+            result = result & _
+                Mid$(alphabet, (byte2 And 63) + 1, 1)
+        Else
+            result = result & "="
+        End If
+
+        index = index + 3
+    Loop
+
+    WsBase64EncodeBytes = result
+End Function
+
+Private Function WsHeaderContainsToken(ByVal headerValue As String, ByVal token As String) As Boolean
+    Dim parts() As String
+    parts = Split(headerValue, ",")
+
+    Dim i As Long
+    For i = LBound(parts) To UBound(parts)
+        If LCase$(Trim$(parts(i))) = LCase$(token) Then
+            WsHeaderContainsToken = True
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Sub WsPumpSendInternal(ByVal pumpDeadline As Double, _
+                             ByVal maxBytes As Long, _
+                             ByVal maxCalls As Long)
+    Dim sentBytes As Long
+    Dim callCount As Long
+
+    Do While callCount < maxCalls And sentBytes < maxBytes
+        If WsMonotonicMs() >= pumpDeadline Then Exit Do
+
+        If m_ws_sendCurrentCount = 0 Then
+            If Not WsLoadNextSendBuffer Then Exit Do
+        End If
+
+        Dim remaining As Long
+        remaining = m_ws_sendCurrentCount - m_ws_sendOffset
+        If remaining <= 0 Then
+            WsClearCurrentSendBuffer
+        Else
+            Dim allowed As Long
+            allowed = remaining
+            If allowed > (maxBytes - sentBytes) Then allowed = maxBytes - sentBytes
+            If allowed <= 0 Then Exit Do
+
+            Dim result As Long
+            result = WsApi_sendSocket(m_ws_socket, m_ws_sendCurrent(m_ws_sendOffset), allowed, 0)
+            callCount = callCount + 1
+
+            If result > 0 Then
+                m_ws_sendOffset = m_ws_sendOffset + result
+                sentBytes = sentBytes + result
+
+                If m_ws_sendOffset >= m_ws_sendCurrentCount Then
+                    WsClearCurrentSendBuffer
+                End If
+            ElseIf result = WS_SOCKET_ERROR Then
+                Dim socketError As Long
+                socketError = WsApi_WSAGetLastError()
+
+                If socketError = WS_WSAEWOULDBLOCK Then Exit Do
+
+                WsSetFailure socketError, "send failed."
+                Exit Do
+            Else
+                WsSetFailure 9206, "send returned zero."
+                Exit Do
+            End If
+        End If
+    Loop
+End Sub
+
+Private Sub WsPumpReceiveInternal(ByVal pumpDeadline As Double, _
+                                ByVal copyGuardDeadline As Double, _
+                                ByVal maxBytes As Long, _
+                                ByVal maxCalls As Long, _
+                                ByVal parseFrames As Boolean)
+    Dim receivedBytes As Long
+    Dim callCount As Long
+
+    ' Resume parsing buffered TCP bytes before requesting more network data.
+    If parseFrames Then
+        WsParseAvailableFrames pumpDeadline, copyGuardDeadline
+        If m_ws_state = WsTransportFailed Then Exit Sub
+        If m_ws_currentPumpCompletedMessages >= _
+           WS_MAX_COMPLETED_MESSAGES_PER_PUMP Then Exit Sub
+        If WsMonotonicMs() >= pumpDeadline Then Exit Sub
+    End If
+
+    Do While callCount < maxCalls And receivedBytes < maxBytes
+        If m_ws_currentPumpCompletedMessages >= _
+           WS_MAX_COMPLETED_MESSAGES_PER_PUMP Then Exit Do
+        If WsMonotonicMs() >= pumpDeadline Then Exit Do
+
+        WsCompactRawIfNeeded
+        WsEnsureRawCapacity m_ws_rawCount + WS_RECEIVE_CHUNK_SIZE
+
+        Dim allowed As Long
+        allowed = WS_RECEIVE_CHUNK_SIZE
+        If allowed > (maxBytes - receivedBytes) Then allowed = maxBytes - receivedBytes
+        If allowed <= 0 Then Exit Do
+
+        Dim result As Long
+        result = WsApi_recvSocket(m_ws_socket, m_ws_rawBuffer(m_ws_rawCount), allowed, 0)
+        callCount = callCount + 1
+
+        If result > 0 Then
+            m_ws_rawCount = m_ws_rawCount + result
+            receivedBytes = receivedBytes + result
+
+            If parseFrames Then
+                WsParseAvailableFrames pumpDeadline, copyGuardDeadline
+                If m_ws_state = WsTransportFailed Then Exit Do
+                If m_ws_currentPumpCompletedMessages >= _
+                   WS_MAX_COMPLETED_MESSAGES_PER_PUMP Then Exit Do
+                If WsMonotonicMs() >= pumpDeadline Then Exit Do
+            End If
+        ElseIf result = 0 Then
+            If m_ws_state = WsTransportClosing Then
+                WsForceClose
+            Else
+                WsSetFailure 9207, "Peer closed the socket."
+            End If
+            Exit Do
+        Else
+            Dim socketError As Long
+            socketError = WsApi_WSAGetLastError()
+
+            If socketError = WS_WSAEWOULDBLOCK Then Exit Do
+
+            If socketError = WS_WSAECONNRESET Or _
+               socketError = WS_WSAECONNABORTED Or _
+               socketError = WS_WSAENOTCONN Then
+                WsSetFailure socketError, "Connection lost during recv."
+            Else
+                WsSetFailure socketError, "recv failed."
+            End If
+            Exit Do
+        End If
+    Loop
+End Sub
+
+Private Sub WsParseAvailableFrames(ByVal pumpDeadline As Double, _
+                                 ByVal copyGuardDeadline As Double)
+    Do While m_ws_state = WsTransportOpen Or m_ws_state = WsTransportClosing
+        If WsMonotonicMs() >= pumpDeadline Then Exit Do
+        If m_ws_currentPumpCompletedMessages >= WS_MAX_COMPLETED_MESSAGES_PER_PUMP Then Exit Do
+
+        Select Case m_ws_frameState
+            Case WsFrameReadBaseHeader
+                If WsRawAvailable < 2 Then Exit Do
+
+                Dim firstByte As Long
+                Dim secondByte As Long
+                firstByte = WsReadRawByte()
+                secondByte = WsReadRawByte()
+
+                If (firstByte And &H70&) <> 0 Then
+                    WsSetFailure 9210, "RSV bits are not supported."
+                    Exit Do
+                End If
+
+                m_ws_frameFin = ((firstByte And &H80&) <> 0)
+                m_ws_frameOpcode = firstByte And &HF&
+                m_ws_frameLengthCode = secondByte And &H7F&
+
+                If (secondByte And &H80&) <> 0 Then
+                    WsSetFailure 9211, "Masked server frame rejected."
+                    Exit Do
+                End If
+
+                If Not WsValidateFrameOpcode(m_ws_frameOpcode) Then
+                    WsSetFailure 9212, "Invalid WebSocket opcode."
+                    Exit Do
+                End If
+
+                If m_ws_frameOpcode >= WS_OPCODE_CLOSE Then
+                    If Not m_ws_frameFin Then
+                        WsSetFailure 9213, "Fragmented control frame rejected."
+                        Exit Do
+                    End If
+                End If
+
+                If m_ws_frameLengthCode <= 125 Then
+                    WsPrepareFramePayload m_ws_frameLengthCode
+                Else
+                    m_ws_frameState = WsFrameReadExtendedLength
+                End If
+
+            Case WsFrameReadExtendedLength
+                If m_ws_frameLengthCode = 126 Then
+                    If WsRawAvailable < 2 Then Exit Do
+
+                    Dim length16 As Long
+                    length16 = WsReadRawByte() * &H100& + WsReadRawByte()
+                    WsPrepareFramePayload length16
+                Else
+                    If WsRawAvailable < 8 Then Exit Do
+
+                    Dim lengthBytes(0 To 7) As Byte
+                    Dim i As Long
+                    For i = 0 To 7
+                        lengthBytes(i) = CByte(WsReadRawByte())
+                    Next
+
+                    Dim length64 As Double
+                    length64 = WsDecodeSafePayloadLength(lengthBytes)
+                    If length64 < 0 Then
+                        WsSetFailure 9214, "Payload length exceeds Phase 1A limits."
+                        Exit Do
+                    End If
+
+                    WsPrepareFramePayload CLng(length64)
+                End If
+
+            Case WsFrameReadPayload
+                If m_ws_framePayloadRemaining = 0 Then
+                    m_ws_frameState = WsFrameFinalize
+                Else
+                    Dim available As Long
+                    available = WsRawAvailable
+                    If available <= 0 Then Exit Do
+
+                    If WsMonotonicMs() >= copyGuardDeadline Then Exit Do
+
+                    Dim takeCount As Long
+                    takeCount = available
+                    If takeCount > m_ws_framePayloadRemaining Then takeCount = m_ws_framePayloadRemaining
+                    If takeCount > WS_PARSER_COPY_CHUNK_SIZE Then takeCount = WS_PARSER_COPY_CHUNK_SIZE
+
+                    WsConsumeFramePayload takeCount
+                    m_ws_framePayloadRemaining = m_ws_framePayloadRemaining - takeCount
+
+                    If m_ws_framePayloadRemaining = 0 Then
+                        m_ws_frameState = WsFrameFinalize
+                    End If
+                End If
+
+            Case WsFrameFinalize
+                If WsMonotonicMs() >= pumpDeadline Then Exit Do
+
+                WsCompleteCurrentFrame
+                If m_ws_state = WsTransportFailed Then Exit Do
+        End Select
+    Loop
+End Sub
+
+Private Sub WsPrepareFramePayload(ByVal payloadLength As Long)
+    If m_ws_frameOpcode >= WS_OPCODE_CLOSE And payloadLength > 125 Then
+        WsSetFailure 9215, "Control payload exceeds 125 bytes."
+        Exit Sub
+    End If
+
+    If m_ws_frameOpcode = WS_OPCODE_CONTINUATION Then
+        If Not m_ws_messageActive Then
+            WsSetFailure 9216, "Unexpected continuation frame."
+            Exit Sub
+        End If
+    ElseIf m_ws_frameOpcode = WS_OPCODE_TEXT Or m_ws_frameOpcode = WS_OPCODE_BINARY Then
+        If m_ws_messageActive Then
+            WsSetFailure 9217, "New data frame received during fragmentation."
+            Exit Sub
+        End If
+
+        m_ws_messageActive = True
+        m_ws_messageOpcode = m_ws_frameOpcode
+        m_ws_messageCount = 0
+        m_ws_discardMessage = (m_ws_frameOpcode = WS_OPCODE_BINARY)
+
+        If m_ws_discardMessage Then
+            Set m_ws_messageChunks = Nothing
+        Else
+            Set m_ws_messageChunks = New Collection
+        End If
+    End If
+
+    m_ws_framePayloadLength = payloadLength
+    m_ws_framePayloadRemaining = payloadLength
+    m_ws_frameDiscardPayload = False
+    m_ws_controlCount = 0
+    Erase m_ws_controlPayload
+
+    If m_ws_frameOpcode <= WS_OPCODE_BINARY Then
+        If payloadLength > m_ws_maxIncomingSize Then
+            m_ws_discardMessage = True
+            m_ws_frameDiscardPayload = True
+            Set m_ws_messageChunks = Nothing
+
+        ElseIf Not m_ws_discardMessage Then
+            If CDbl(m_ws_messageCount) + CDbl(payloadLength) > CDbl(m_ws_maxIncomingSize) Then
+                m_ws_discardMessage = True
+                m_ws_frameDiscardPayload = True
+                Set m_ws_messageChunks = Nothing
+            End If
+        End If
+    End If
+
+    m_ws_frameState = WsFrameReadPayload
+End Sub
+
+Private Sub WsConsumeFramePayload(ByVal count As Long)
+    If count <= 0 Then Exit Sub
+
+    If m_ws_frameOpcode >= WS_OPCODE_CLOSE Then
+        WsEnsureControlCapacity m_ws_controlCount + count
+
+        Dim i As Long
+        For i = 0 To count - 1
+            m_ws_controlPayload(m_ws_controlCount + i) = CByte(WsPeekRawByte(i))
+        Next
+        m_ws_controlCount = m_ws_controlCount + count
+
+    ElseIf Not m_ws_discardMessage And Not m_ws_frameDiscardPayload Then
+        If m_ws_messageChunks Is Nothing Then
+            WsSetFailure 9219, "Text message chunk accumulator is unavailable."
+            Exit Sub
+        End If
+
+        Dim dataChunk() As Byte
+        ReDim dataChunk(0 To count - 1)
+
+        Dim j As Long
+        For j = 0 To count - 1
+            dataChunk(j) = CByte(WsPeekRawByte(j))
+        Next
+
+        Dim chunkValue As Variant
+        chunkValue = dataChunk
+        m_ws_messageChunks.Add chunkValue
+        m_ws_messageCount = m_ws_messageCount + count
+    End If
+
+    WsConsumeRaw count
+End Sub
+
+Private Sub WsCompleteCurrentFrame()
+    If m_ws_frameOpcode = WS_OPCODE_PING Then
+        Dim pongFrame() As Byte
+        pongFrame = WsBuildClientFrame(WS_OPCODE_PONG, m_ws_controlPayload, True)
+
+        If m_ws_state = WsTransportFailed Then Exit Sub
+        If WsByteArrayLength(pongFrame) = 0 Then Exit Sub
+
+        WsEnqueueSendBytes pongFrame
+
+    ElseIf m_ws_frameOpcode = WS_OPCODE_PONG Then
+        WsHandleClientPong
+
+    ElseIf m_ws_frameOpcode = WS_OPCODE_CLOSE Then
+        If Not m_ws_closeSent Then
+            Dim closeFrame() As Byte
+            closeFrame = WsBuildClientFrame(WS_OPCODE_CLOSE, m_ws_controlPayload, True)
+
+            If m_ws_state = WsTransportFailed Then Exit Sub
+            If WsByteArrayLength(closeFrame) = 0 Then Exit Sub
+
+            WsEnqueueSendBytes closeFrame
+            m_ws_closeSent = True
+        End If
+
+        m_ws_state = WsTransportClosing
+
+    ElseIf m_ws_frameOpcode = WS_OPCODE_TEXT Or _
+           m_ws_frameOpcode = WS_OPCODE_BINARY Or _
+           m_ws_frameOpcode = WS_OPCODE_CONTINUATION Then
+
+        If m_ws_frameFin Then
+            If m_ws_messageOpcode = WS_OPCODE_TEXT And Not m_ws_discardMessage Then
+                If m_ws_messageChunks Is Nothing Then
+                    Set m_ws_messageChunks = New Collection
+                End If
+
+                m_ws_rawTextQueue.Add Item:=m_ws_messageChunks
+                m_ws_rawTextLengthQueue.Add m_ws_messageCount
+            End If
+
+            m_ws_currentPumpCompletedMessages = m_ws_currentPumpCompletedMessages + 1
+            WsResetMessageAccumulator
+        End If
+    End If
+
+    m_ws_frameState = WsFrameReadBaseHeader
+    m_ws_framePayloadLength = 0
+    m_ws_framePayloadRemaining = 0
+    m_ws_frameDiscardPayload = False
+    m_ws_controlCount = 0
+    Erase m_ws_controlPayload
+End Sub
+
+Private Function WsValidateFrameOpcode(ByVal opcode As Long) As Boolean
+    Select Case opcode
+        Case WS_OPCODE_CONTINUATION, WS_OPCODE_TEXT, WS_OPCODE_BINARY, WS_OPCODE_CLOSE, WS_OPCODE_PING, WS_OPCODE_PONG
+            WsValidateFrameOpcode = True
+    End Select
+End Function
+
+Private Function WsDecodeSafePayloadLength(ByRef Bytes() As Byte) As Double
+    If (Bytes(0) And &H80) <> 0 Then
+        WsDecodeSafePayloadLength = -1
+        Exit Function
+    End If
+
+    If Bytes(0) <> 0 Or Bytes(1) <> 0 Or Bytes(2) <> 0 Or Bytes(3) <> 0 Then
+        WsDecodeSafePayloadLength = -1
+        Exit Function
+    End If
+
+    Dim value As Double
+    value = CDbl(Bytes(4)) * 16777216# + _
+            CDbl(Bytes(5)) * 65536# + _
+            CDbl(Bytes(6)) * 256# + _
+            CDbl(Bytes(7))
+
+    If value > 2147483647# Then
+        WsDecodeSafePayloadLength = -1
+    Else
+        WsDecodeSafePayloadLength = value
+    End If
+End Function
+
+Private Sub WsMaybeQueueClientPing()
+    If Not m_ws_clientPingEnabled Then Exit Sub
+    If m_ws_state <> WsTransportOpen Then Exit Sub
+
+    Dim nowMs As Double
+    nowMs = WsMonotonicMs()
+
+    If m_ws_nextClientPingAtMs <= 0 Then
+        m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
+        Exit Sub
+    End If
+
+    If nowMs < m_ws_nextClientPingAtMs Then Exit Sub
+
+    If m_ws_clientPingOutstanding Then
+        m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
+        Exit Sub
+    End If
+
+    If WsHasPendingSend Then
+        m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_BUSY_RETRY_MS
+        Exit Sub
+    End If
+
+    If m_ws_clientPingSequence >= &H7FFFFFFF Then
+        m_ws_clientPingSequence = 1
+    Else
+        m_ws_clientPingSequence = m_ws_clientPingSequence + 1
+    End If
+
+    Dim payload(0 To WS_CLIENT_PING_PAYLOAD_SIZE - 1) As Byte
+    WsEncodePingSequence m_ws_clientPingSequence, payload
+
+    Dim pingFrame() As Byte
+    pingFrame = WsBuildClientFrame(WS_OPCODE_PING, payload, True)
+
+    If m_ws_state = WsTransportFailed Then Exit Sub
+    If WsByteArrayLength(pingFrame) = 0 Then Exit Sub
+
+    WsEnqueueSendBytes pingFrame
+
+    m_ws_clientPingOutstanding = True
+    m_ws_clientPingOutstandingSequence = m_ws_clientPingSequence
+    m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
+End Sub
+
+Private Sub WsHandleClientPong()
+    If m_ws_controlCount <> WS_CLIENT_PING_PAYLOAD_SIZE Then Exit Sub
+
+    Dim sequence As Long
+    If Not WsTryDecodePingSequence(m_ws_controlPayload, sequence) Then Exit Sub
+
+    If Not m_ws_clientPingOutstanding Or _
+       sequence <> m_ws_clientPingOutstandingSequence Then
+        Exit Sub
+    End If
+
+    Dim nowMs As Double
+    nowMs = WsMonotonicMs()
+
+    m_ws_clientPingOutstanding = False
+    m_ws_clientPingOutstandingSequence = 0
+    m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
+End Sub
+
+Private Sub WsEncodePingSequence(ByVal sequence As Long, _
+                               ByRef payload() As Byte)
+    payload(0) = CByte((sequence \ &H1000000) And &HFF&)
+    payload(1) = CByte((sequence \ &H10000) And &HFF&)
+    payload(2) = CByte((sequence \ &H100&) And &HFF&)
+    payload(3) = CByte(sequence And &HFF&)
+End Sub
+
+Private Function WsTryDecodePingSequence(ByRef payload() As Byte, _
+                                       ByRef sequence As Long) As Boolean
+    Dim value As Double
+    value = CDbl(payload(0)) * 16777216# + _
+            CDbl(payload(1)) * 65536# + _
+            CDbl(payload(2)) * 256# + _
+            CDbl(payload(3))
+
+    If value > 2147483647# Then Exit Function
+
+    sequence = CLng(value)
+    WsTryDecodePingSequence = True
+End Function
+
+Private Function WsBuildClientFrame(ByVal opcode As Long, _
+                                  ByRef payload() As Byte, _
+                                  ByVal finalFrame As Boolean) As Byte()
+    Dim payloadLength As Long
+    payloadLength = WsByteArrayLength(payload)
+
+    Dim extendedLengthBytes As Long
+    Dim lengthCode As Long
+
+    If payloadLength <= 125 Then
+        lengthCode = payloadLength
+    ElseIf payloadLength <= 65535 Then
+        lengthCode = 126
+        extendedLengthBytes = 2
+    Else
+        lengthCode = 127
+        extendedLengthBytes = 8
+    End If
+
+    Dim headerLength As Long
+    headerLength = 2 + extendedLengthBytes + 4
+
+    Dim frame() As Byte
+    ReDim frame(0 To headerLength + payloadLength - 1)
+
+    Dim firstByte As Long
+    firstByte = opcode And &HF&
+    If finalFrame Then firstByte = firstByte Or &H80&
+    frame(0) = CByte(firstByte)
+    frame(1) = CByte(&H80& Or lengthCode)
+
+    Dim position As Long
+    position = 2
+
+    If lengthCode = 126 Then
+        frame(position) = CByte((payloadLength \ &H100&) And &HFF&)
+        frame(position + 1) = CByte(payloadLength And &HFF&)
+        position = position + 2
+    ElseIf lengthCode = 127 Then
+        frame(position) = 0
+        frame(position + 1) = 0
+        frame(position + 2) = 0
+        frame(position + 3) = 0
+        frame(position + 4) = CByte((payloadLength \ &H1000000) And &HFF&)
+        frame(position + 5) = CByte((payloadLength \ &H10000) And &HFF&)
+        frame(position + 6) = CByte((payloadLength \ &H100&) And &HFF&)
+        frame(position + 7) = CByte(payloadLength And &HFF&)
+        position = position + 8
+    End If
+
+    Dim mask(0 To WS_MASK_KEY_SIZE - 1) As Byte
+    If Not WsGenerateMaskKey(mask) Then Exit Function
+
+    Dim i As Long
+    For i = 0 To WS_MASK_KEY_SIZE - 1
+        frame(position + i) = mask(i)
+    Next
+    position = position + WS_MASK_KEY_SIZE
+
+    For i = 0 To payloadLength - 1
+        frame(position + i) = payload(i) Xor mask(i Mod WS_MASK_KEY_SIZE)
+    Next
+
+    WsBuildClientFrame = frame
+End Function
+
+Private Function WsGenerateMaskKey(ByRef mask() As Byte) As Boolean
+    Dim status As Long
+    status = WsApi_BCryptGenRandom(0, mask(0), WS_MASK_KEY_SIZE, _
+                             WS_BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+
+    If status <> WS_BCRYPT_STATUS_SUCCESS Then
+        WsSetFailure 9220, _
+                   "BCryptGenRandom failed. NTSTATUS=0x" & _
+                   Right$("00000000" & hex$(status), 8)
+        Exit Function
+    End If
+
+    WsGenerateMaskKey = True
+End Function
+Private Sub WsEnqueueSendBytes(ByRef Bytes() As Byte)
+    Dim value As Variant
+    value = Bytes
+    m_ws_sendQueue.Add value
+End Sub
+
+Private Function WsLoadNextSendBuffer() As Boolean
+    If m_ws_sendQueue.count = 0 Then Exit Function
+
+    Dim value As Variant
+    value = m_ws_sendQueue(1)
+    m_ws_sendQueue.Remove 1
+
+    m_ws_sendCurrent = value
+    m_ws_sendCurrentCount = WsByteArrayLength(m_ws_sendCurrent)
+    m_ws_sendOffset = 0
+
+    WsLoadNextSendBuffer = (m_ws_sendCurrentCount > 0)
+End Function
+
+Private Property Get WsHasPendingSend() As Boolean
+    WsHasPendingSend = (m_ws_sendCurrentCount > 0 Or m_ws_sendQueue.count > 0)
+End Property
+
+Private Sub WsClearCurrentSendBuffer()
+    Erase m_ws_sendCurrent
+    m_ws_sendCurrentCount = 0
+    m_ws_sendOffset = 0
+End Sub
+
+Private Sub WsEnsureRawCapacity(ByVal requiredCount As Long)
+    Dim capacity As Long
+    capacity = WsByteArrayCapacity(m_ws_rawBuffer)
+    If capacity >= requiredCount Then Exit Sub
+
+    If capacity < WS_RECEIVE_CHUNK_SIZE Then capacity = WS_RECEIVE_CHUNK_SIZE
+    Do While capacity < requiredCount
+        capacity = capacity * 2
+    Loop
+
+    If WsByteArrayCapacity(m_ws_rawBuffer) = 0 Then
+        ReDim m_ws_rawBuffer(0 To capacity - 1)
+    Else
+        ReDim Preserve m_ws_rawBuffer(0 To capacity - 1)
+    End If
+End Sub
+
+Private Sub WsCompactRawIfNeeded()
+    If m_ws_rawReadPos = 0 Then Exit Sub
+
+    If m_ws_rawReadPos >= m_ws_rawCount Then
+        m_ws_rawReadPos = 0
+        m_ws_rawCount = 0
+        Exit Sub
+    End If
+
+    If m_ws_rawReadPos < WS_RECEIVE_CHUNK_SIZE And m_ws_rawReadPos < (m_ws_rawCount \ 2) Then Exit Sub
+
+    Dim unreadCount As Long
+    unreadCount = m_ws_rawCount - m_ws_rawReadPos
+
+    Dim i As Long
+    For i = 0 To unreadCount - 1
+        m_ws_rawBuffer(i) = m_ws_rawBuffer(m_ws_rawReadPos + i)
+    Next
+
+    m_ws_rawCount = unreadCount
+    m_ws_rawReadPos = 0
+End Sub
+
+Private Property Get WsRawAvailable() As Long
+    WsRawAvailable = m_ws_rawCount - m_ws_rawReadPos
+End Property
+
+Private Function WsReadRawByte() As Long
+    WsReadRawByte = m_ws_rawBuffer(m_ws_rawReadPos)
+    m_ws_rawReadPos = m_ws_rawReadPos + 1
+    WsNormalizeRawPositions
+End Function
+
+Private Function WsPeekRawByte(ByVal offset As Long) As Long
+    WsPeekRawByte = m_ws_rawBuffer(m_ws_rawReadPos + offset)
+End Function
+
+Private Sub WsConsumeRaw(ByVal count As Long)
+    m_ws_rawReadPos = m_ws_rawReadPos + count
+    WsNormalizeRawPositions
+End Sub
+
+Private Sub WsNormalizeRawPositions()
+    If m_ws_rawReadPos >= m_ws_rawCount Then
+        m_ws_rawReadPos = 0
+        m_ws_rawCount = 0
+    End If
+End Sub
+
+Private Function WsFindHttpHeaderEnd() As Long
+    Dim i As Long
+    For i = m_ws_rawReadPos To m_ws_rawCount - 4
+        If m_ws_rawBuffer(i) = 13 And _
+           m_ws_rawBuffer(i + 1) = 10 And _
+           m_ws_rawBuffer(i + 2) = 13 And _
+           m_ws_rawBuffer(i + 3) = 10 Then
+            WsFindHttpHeaderEnd = (i - m_ws_rawReadPos) + 4
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Function WsReadAsciiFromRaw(ByVal count As Long) As String
+    Dim text As String
+    Dim i As Long
+
+    text = String$(count, vbNullChar)
+    For i = 0 To count - 1
+        Mid$(text, i + 1, 1) = Chr$(m_ws_rawBuffer(m_ws_rawReadPos + i))
+    Next
+
+    WsReadAsciiFromRaw = text
+End Function
+
+Private Sub WsEnsureControlCapacity(ByVal requiredCount As Long)
+    Dim capacity As Long
+    capacity = WsByteArrayCapacity(m_ws_controlPayload)
+    If capacity >= requiredCount Then Exit Sub
+
+    If requiredCount < 1 Then requiredCount = 1
+    If capacity = 0 Then
+        ReDim m_ws_controlPayload(0 To requiredCount - 1)
+    Else
+        ReDim Preserve m_ws_controlPayload(0 To requiredCount - 1)
+    End If
+End Sub
+
+Private Sub WsResetMessageAccumulator()
+    m_ws_messageActive = False
+    m_ws_messageOpcode = 0
+    m_ws_messageCount = 0
+    m_ws_discardMessage = False
+    Set m_ws_messageChunks = Nothing
+End Sub
+
+Private Sub WsResetRuntimeState()
+    m_ws_LastErrorCode = 0
+    m_ws_lastErrorText = vbNullString
+
+    Set m_ws_sendQueue = New Collection
+    Set m_ws_rawTextQueue = New Collection
+    Set m_ws_rawTextLengthQueue = New Collection
+    Set m_ws_messageChunks = Nothing
+
+    Erase m_ws_sendCurrent
+    Erase m_ws_rawBuffer
+    Erase m_ws_controlPayload
+
+    m_ws_sendCurrentCount = 0
+    m_ws_sendOffset = 0
+    m_ws_rawCount = 0
+    m_ws_rawReadPos = 0
+    m_ws_frameState = WsFrameReadBaseHeader
+    m_ws_framePayloadLength = 0
+    m_ws_framePayloadRemaining = 0
+    m_ws_frameDiscardPayload = False
+    m_ws_controlCount = 0
+    m_ws_closeSent = False
+    m_ws_nextClientPingAtMs = 0
+    m_ws_clientPingOutstanding = False
+    m_ws_clientPingOutstandingSequence = 0
+    m_ws_handshakeClientKey = vbNullString
+    m_ws_expectedHandshakeAccept = vbNullString
+    m_ws_handshakeOrigin = vbNullString
+    m_ws_handshakeUserAgent = vbNullString
+    m_ws_handshakeValidationError = vbNullString
+
+    WsResetMessageAccumulator
+End Sub
+
+Private Sub WsSetFailure(ByVal errorCode As Long, ByVal description As String)
+    m_ws_LastErrorCode = errorCode
+    m_ws_lastErrorText = description
+
+    On Error Resume Next
+    If m_ws_socket <> -1 Then
+        WsApi_shutdownSocket m_ws_socket, WS_SD_BOTH
+        WsApi_closesocket m_ws_socket
+        m_ws_socket = -1
+    End If
+    On Error GoTo 0
+
+    m_ws_state = WsTransportFailed
+
+    If WS_DEBUG_MODE Then
+        Debug.Print "BiDiSocketCommunicator[IntegratedWinsock] FAILED " & errorCode & ": " & description
+    End If
+End Sub
+
+Private Function WsParseLoopbackUrl(ByVal wsUrl As String) As Boolean
+    If Len(wsUrl) = 0 Then Exit Function
+    If LCase$(Left$(wsUrl, 5)) <> "ws://" Then Exit Function
+
+    Dim authorityStart As Long
+    authorityStart = 6
+
+    Dim pathStart As Long
+    pathStart = InStr(authorityStart, wsUrl, "/", vbBinaryCompare)
+
+    Dim authority As String
+    If pathStart = 0 Then
+        authority = Mid$(wsUrl, authorityStart)
+        m_ws_path = "/"
+    Else
+        authority = Mid$(wsUrl, authorityStart, pathStart - authorityStart)
+        m_ws_path = Mid$(wsUrl, pathStart)
+    End If
+
+    If Len(authority) = 0 Then Exit Function
+
+    Dim portText As String
+
+    If Left$(authority, 1) = "[" Then
+        Dim closeBracket As Long
+        closeBracket = InStr(1, authority, "]", vbBinaryCompare)
+        If closeBracket = 0 Then Exit Function
+
+        m_ws_host = LCase$(Left$(authority, closeBracket))
+        If m_ws_host <> "[::1]" Then Exit Function
+
+        If Len(authority) > closeBracket Then
+            If Mid$(authority, closeBracket + 1, 1) <> ":" Then Exit Function
+            portText = Mid$(authority, closeBracket + 2)
+        End If
+    Else
+        Dim colonPos As Long
+        colonPos = InStrRev(authority, ":", -1, vbBinaryCompare)
+
+        If colonPos > 0 Then
+            m_ws_host = LCase$(Left$(authority, colonPos - 1))
+            portText = Mid$(authority, colonPos + 1)
+        Else
+            m_ws_host = LCase$(authority)
+        End If
+
+        If m_ws_host <> "localhost" And m_ws_host <> "127.0.0.1" Then Exit Function
+    End If
+
+    If Len(portText) = 0 Then
+        m_ws_port = 80
+    Else
+        If Not IsNumeric(portText) Then Exit Function
+        m_ws_port = CLng(portText)
+        If m_ws_port < 1 Or m_ws_port > 65535 Then Exit Function
+    End If
+
+    If m_ws_host = "[::1]" Then
+        m_ws_hostHeader = "[::1]:" & CStr(m_ws_port)
+    Else
+        m_ws_hostHeader = m_ws_host & ":" & CStr(m_ws_port)
+    End If
+
+    WsParseLoopbackUrl = True
+End Function
+
+Private Function WsHostToNetworkShort(ByVal value As Long) As Integer
+    Dim swapped As Long
+    swapped = ((value And &HFF&) * &H100&) Or ((value \ &H100&) And &HFF&)
+
+    If swapped > 32767 Then swapped = swapped - 65536
+    WsHostToNetworkShort = CInt(swapped)
+End Function
+
+Private Function WsEncodeAscii(ByVal text As String) As Byte()
+    Dim result() As Byte
+    Dim count As Long
+    count = Len(text)
+
+    If count = 0 Then
+        WsEncodeAscii = result
+        Exit Function
+    End If
+
+    ReDim result(0 To count - 1)
+
+    Dim i As Long
+    For i = 1 To count
+        result(i - 1) = CByte(AscW(Mid$(text, i, 1)) And &HFF&)
+    Next
+
+    WsEncodeAscii = result
+End Function
+
+Private Function WsEncodeUtf8(ByVal text As String) As Byte()
+    Dim stream As ADODB.stream
+    Set stream = New ADODB.stream
+
+    stream.Type = adTypeText
+    stream.Charset = "utf-8"
+    stream.Open
+    stream.WriteText text
+    stream.position = 0
+    stream.Type = adTypeBinary
+
+    If stream.size <= 3 Then
+        Dim emptyResult() As Byte
+        stream.Close
+        WsEncodeUtf8 = emptyResult
+        Exit Function
+    End If
+
+    stream.position = 3
+    WsEncodeUtf8 = stream.Read
+    stream.Close
+End Function
+
+Private Function WsDecodeUtf8Chunks(ByVal chunks As Collection, _
+                                  ByVal totalBytes As Long) As String
+    If totalBytes <= 0 Then
+        WsDecodeUtf8Chunks = vbNullString
+        Exit Function
+    End If
+
+    Dim stream As ADODB.stream
+    Set stream = New ADODB.stream
+
+    stream.Type = adTypeBinary
+    stream.Open
+
+    Dim i As Long
+    Dim chunkValue As Variant
+
+    For i = 1 To chunks.count
+        chunkValue = chunks(i)
+        stream.Write chunkValue
+    Next
+
+    stream.position = 0
+    stream.Type = adTypeText
+    stream.Charset = "utf-8"
+    WsDecodeUtf8Chunks = stream.ReadText
+
+    stream.Close
+    Set stream = Nothing
+End Function
+
+Private Function WsByteArrayLength(ByRef Bytes() As Byte) As Long
+    On Error GoTo EmptyArray
+    WsByteArrayLength = UBound(Bytes) - LBound(Bytes) + 1
+    Exit Function
+
+EmptyArray:
+    WsByteArrayLength = 0
+End Function
+
+Private Function WsByteArrayCapacity(ByRef Bytes() As Byte) As Long
+    On Error GoTo EmptyArray
+    WsByteArrayCapacity = UBound(Bytes) - LBound(Bytes) + 1
+    Exit Function
+
+EmptyArray:
+    WsByteArrayCapacity = 0
+End Function

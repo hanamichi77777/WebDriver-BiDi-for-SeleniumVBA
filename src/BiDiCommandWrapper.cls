@@ -8,111 +8,48 @@ Attribute VB_Creatable = False
 Attribute VB_PredeclaredId = False
 Attribute VB_Exposed = True
 Option Explicit
-' ==========================================================================
-' WebDriver BiDi for SeleniumVBA(https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA)
-' Version: 2.6
-' MIT License Copyright (c) hanamichi77777
-' ==========================================================================
-' Class Name: BiDiCommandWrapper (CDP Tunneling Enabled & AI-Optimized)
-' Summary   : High-Level Wrapper for Selenium WebDriver BiDi with CDP Integration
-' Features  :
-'   - Resource Blocking via CDP tunneling (Network.setBlockedURLs).
-'     Network-layer blocking that does not stall window.load, unlike the BiDi
-'     network.failRequest path, which interferes with HTML parser script loads.
-'   - Smart Frame Recovery (Auto-handles frame reloads/stale contexts)
-'   - Centralized Event Dispatching (Fixes event conflicts)
-'   - Anti-Freeze Alert Handling
-'   - AI-Ready Discovery Recorder
-'   - Advanced Wait Strategies (Network Idle, DOM Stability, SPA Idle)
-'   - Completion-Signal Gate (ArmContentSignal / ArmNetworkSignal /
-'     ArmVisibilitySignal): opt-in AND-condition on the SPA consensus that
-'     holds the wait open until a caller-designated completion signal
-'     (target-subtree DOM mutation, API response, or element visibility)
-'     has arrived, then re-measures a full minStableMs quiet window.
+' WebDriver BiDi for SeleniumVBA
+' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
+' Version 2.7 / MIT License / Copyright (c) hanamichi77777
 '
-' ==========================================================================
-' AI NAVIGATION MAP  (upper layer; transport lives in BiDiSocketCommunicator)
-' Read before editing any single method. This class is large by design (single
-' socket ownership); the risk is editing one method without seeing the funnel
-' or invariant it belongs to. See also the 4 Golden Rules block further below.
+' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
+' BiDiSocketCommunicator owns transport and request IDs.
 '
-' [FUNNELS]  Route through these; never call the inner layers directly.
-'   User actions   : ExecuteClickByXPath / ExecuteInputValueByXPath /
-'                    ExecuteSelectValueByXPath / ExecuteNavigateAndGetStatus
-'   Result JS       : CallScript -> (WrapInSafetyShell auto) -> ExecuteBiDiCommand -> socket_.SendAndReceive
-'                     (infra JS bypasses CallScript: script.evaluate probe, addPreloadScript, getRealms, PostScript)
-'   DOM actions     : ExecuteBaseAction = TryPreparePhase / TryExecutePhase / TrySyncPhase
-'                     (navigation, file-input, prompt & context ops do not route here)
-'   Central waits   : MasterWaitEngine -> EvaluateWaitCondition -> EvaluateSpaIdleCondition
-'                     (URL-contains & SPA-idle only; WaitForUrlStability, XPath & iframe use own loops)
-'   Timing args     : SanitizeMs, except documented exact-0 immediate-check
-'                     sentinels in ExecuteIsUrlContains and ExecuteIsElementVisible.
+' Main funnels:
+'   Result JS: CallScript -> WrapInSafetyShell -> ExecuteBiDiCommand.
+'   DOM action: ExecuteBaseAction -> Prepare -> Execute -> Sync.
+'   SPA wait: MasterWaitEngine -> EvaluateWaitCondition -> EvaluateSpaIdleCondition.
 '
-' [STATE OWNERSHIP]  Mutate via the owner only; do not duplicate.
-'   Request ids     : BiDiSocketCommunicator (socket_), NOT this class
-'   Inflight counts : this class (JS idle probe: inflightFetchCount / inflightXhrCount)
-'   Main context / realm cache   : this class (m_mainContextId, m_cachedRealmIds)
-'   Event subscriptions          : m_activeSubscriptions (delta-subscribe)
-'   Recorder state               : m_isRecording + ProcessRecorderQueue
-'   Idle filters                 : AddIdleIgnoreSelector / AddIdleIgnoreNetworkPattern
-'   Completion-signal gate       : m_sig* via ArmContentSignal / ArmNetworkSignal /
-'                                  ArmVisibilitySignal / DisarmSignal. One-shot:
-'                                  consumed (ConsumeSignalArms) when the next
-'                                  SPA-idle wait ends, whatever the outcome.
+' Preserve these invariants:
+'   - m_waitStackDepth alone owns Application.Interactive.
+'   - Do not pump Office messages during SendAndReceive correlation.
+'   - State-changing ambiguous outcomes are never replayed.
+'   - ERR_CONSENSUS_HALT propagates; ordinary post-action sync failure is best-effort.
+'   - Completion arms are one-shot and consumed by the next SPA-idle wait.
+'   - PostScript id 2 is reserved, send-only, and its response is discarded.
 '
-' [INVARIANTS]  Breaking these = deadlock, zombie UI lock, or protocol violation.
-'   UI LOCK        : m_waitStackDepth owns Application.Interactive; lock at depth 1 and
-'                    restore ONLY at depth 0 (CleanExit forces depth 0 on error).
-'   JS PATH        : result-bearing JS uses CallScript, which auto-applies WrapInSafetyShell
-'                    (watchdog) and the heartbeat hb() closure. See Golden Rules below.
-'   RE-ENTRANCY    : do not DoEvents / PumpMessages while socket_ is mid SendAndReceive.
-'   CONSENSUS HALT : TrySyncPhase re-raises ONLY ERR_CONSENSUS_HALT; a plain 504 (DOM-only)
-'                    is swallowed best-effort. Keep the remap or network stalls stop halting.
-'   CDP RETENTION  : Network.setBlockedURLs via goog:cdp.sendCommand is a deliberate strategic
-'                    retention (resource blocking), not a stray CDP dependency.
-'   POSTSCRIPT     : send-only, fixed POST_SCRIPT_ID(2) in reserved band [1..99]; never awaits a reply.
-' ==========================================================================
-'
-' NOTE ON ERROR HANDLING STRATEGY (Strategic Buffer):
-' This class utilizes "On Error Resume Next" (OERN) in specific interaction segments.
-' The WebDriver BiDi protocol is highly asynchronous. In high-speed scenarios (e.g.,
-' ServiceNow redirects), a "Race Condition" can occur where a Context ID or Realm
-' becomes invalid between the verification and execution phases.
-' OERN is used alongside ExecuteBiDiCommand's retry loop (MAX_CONTEXT_RECOVERY_RETRIES)
-' to provide two-tier resilience: the retry loop handles recoverable context-loss errors,
-' while OERN absorbs transient mismatches in non-critical paths (HUD updates, probe
-' injections, discovery logging) where a failed call is acceptable.
-'
-' Dependencies: BiDiSocketCommunicator, WebJsonConverter, Microsoft Scripting Runtime
+' OERN is limited to captured or deliberately best-effort scopes; it must not hide
+' the primary action result or structural response errors.
 Private socket_ As BiDiSocketCommunicator
 Private m_useTrustedClick As Boolean        ' default False -> synthetic JS clicks (proven path); True = trusted pointer clicks (opt-in)
 Private m_debugMode As Boolean              ' Backing field for the DebugMode property. Default On; set in Class_Initialize.
 
-' --- Foundation: ID Management ---
-' Request IDs are owned by BiDiSocketCommunicator (see AI NAVIGATION MAP).
-' Normal command IDs are generated internally by socket_.SendCommand;
-' the Wrapper does not allocate normal command IDs directly.
 
-' --- Recovery & Stability ---
 Private m_isRecovering As Boolean
 Private m_lastTelemetryTick As Currency
 Private Const MAX_CONTEXT_RECOVERY_RETRIES As Long = 5
 Private m_consecutiveCdpFailures As Long
 Private Const MAX_CONSECUTIVE_CDP_FAILURES As Long = 5
 
-' --- Navigation Detection (Predictive Probe Recovery) ---
 Private m_navigationDetected As Boolean   ' Flag: navigationStarted event received
 Private m_navigationContextId As String   ' Context ID where navigation was detected
 
-' --- UI & Interaction Settings ---
 Private m_waitStackDepth As Long ' Tracks recursion depth of active wait loops
 
-' --- HUD Telemetry State (UpdateWaitTelemetry) ---
 Private m_lastHudKey As String        ' Fingerprint of last HUD payload (msg+color)
 Private m_lastHudCtx As String        ' Context the last HUD was rendered into
 Private m_lastHudRetryTick As Currency ' Throttle timestamp for HUD send retries
 
-' --- Internal State Variables ---
 Private m_mainContextId As String
 Private m_cdpSessionId As String
 Private m_cachedRealmIds As Dictionary ' Cached Execution Realm ID
@@ -120,17 +57,10 @@ Private m_validatedContexts As Dictionary ' Context IDs confirmed present in the
 Private m_activeSubscriptions As Dictionary ' Event Management (Aggregation)
 Private m_isProcessingQueue As Boolean
 
-' --- Resource Blocking State ---
-'   m_blockingPatterns: Substring tokens of currently active block patterns
-'   (e.g. "fuseplatform.net" extracted from "*fuseplatform.net*"). Used to
-'   classify network.fetchError events as blocker-induced for the [BLOCK]
-'   log line. The chromium-bidi mapping of network.fetchError currently
-'   leaves params.errorText empty, so we cannot rely on the documented
-'   "net::ERR_BLOCKED_BY_CLIENT" string and instead match the URL against
-'   our installed patterns.
+' Chromium BiDi may leave fetchError.errorText empty for blocked requests;
+' classify [BLOCK] by matching the URL against the installed block patterns.
 Private m_blockingPatterns As Collection
 
-' --- Configuration Constants ---
 Private Const DEFAULT_IDLE_STABLE_MS As Long = 500
 Private Const DEFAULT_IDLE_TIMEOUT_MS As Long = 10000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
@@ -138,43 +68,27 @@ Private Const SHORT_WAIT_MS As Long = 500
 Private Const MAX_LOG_SIZE As Long = 500
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging
 Private Const MIN_MSG_SIZE As Long = 10     ' Ignore extremely short messages
-' Fixed reserved POSITIVE id for PostScript (fire-and-forget; ids are js-uint per spec).
-' Best-effort traffic: replies are always discarded via the socket's reserved-band check,
-' so duplicate outstanding ids are tolerated. Command ids start at CMD_ID_FLOOR (socket),
-' so 2 never collides with them.
+' PostScript uses reserved id 2. Normal command IDs start at 100 and replies to
+' reserved IDs are discarded by the communicator.
 Private Const POST_SCRIPT_ID As Long = 2
 
-' --- Noise Filtering State ---
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
 
-' --- Internal Recorder Storage ---
 Private m_recorderLogs As Collection
 Private m_isRecording As Boolean
 Private m_recorderStartTime As Double
 Private m_excludeResources As Boolean
-' [AI-Log] Suppression bookkeeping for the discovery log.
-' NOTE: network.beforeRequestSent is subscribed (in StartDiscoveryLog) and emits
-' the [REQ] start marker, paired to [RES] on the shared id. Its per-request
-' flood once produced oversized inbound frames that broke receive assembly; the
-' MaxIncomingSize cap now discards those cleanly, so the subscription is safe to
-' keep on permanently. Handling is recording-only (FormatAndStoreLog) and never
-' wired to consensus. dur= is not computed: start/end latency pairing is out of scope.
+' beforeRequestSent is recorder-only. No request/response latency pairing is kept;
+' oversized traffic is bounded by the communicator's MaxIncomingSize.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_droppedHeadCount As Long          ' count of oldest timeline lines evicted by the MAX_LOG_SIZE ring buffer (0 = none)
 
-' --- Completion-Signal Gate (ArmContentSignal / ArmNetworkSignal / ArmVisibilitySignal) ---
-' One-shot, opt-in gate ANDed into the SPA consensus: while any *Armed flag is
-' True and its *Seen latch is False, EvaluateSpaIdleCondition cannot declare
-' STABLE. A signal hit sets the latch, resets the consensus window
-' (ctx("stableStart")), and thereby guarantees a full minStableMs observation
-' window AFTER the signal (closes the settle-to-render gap for net/vis hits).
-' All flags are consumed at the end of the next SPA-idle wait (ConsumeSignalArms).
-' dom/vis latches live browser-side in __vbaIdleProbe (monotonic sigCount /
-' visSeen); the net latch lives here (DispatchGlobalEvents matches
-' network.responseCompleted BEFORE any recorder noise/idle filtering).
+' Completion arms add positive evidence to the negative SPA-idle consensus.
+' A hit opens the gate and restarts the full minStableMs window. DOM/visibility
+' latches live in the probe; network latching occurs before recorder filtering.
 Private m_sigDomArmed As Boolean            ' ArmContentSignal active (existing-element rewrite)
 Private m_sigDomSeen As Boolean             ' latched: target-subtree mutation observed
 Private m_sigDomXPath As String             ' armed target (diagnostics only)
@@ -187,16 +101,8 @@ Private m_sigVisXPath As String             ' armed target (diagnostics only)
 Private m_sigLostWarned As Boolean          ' one-shot [SPA-SIGNAL-LOST] warning guard
 Private m_lastProbeQuietMs As Double        ' last polled domQuiet; quietAtHit for net hits
 
-' --- Settle-to-render carryover NOTICE (log-only; ANDs NOTHING into consensus) ---
-' A lightweight, adjacent-wait-only heads-up -- NOT an owner-attribution engine.
-' Two independent signals, deliberately kept simple (no gap math, no counts, no
-' pairing): a wait that reaches STABLE while a tracked json/API it saw has no
-' content render is flagged [SPA-CONSENSUS-SUSPECT] ("this wait is not clean"),
-' and it arms a ONE-SHOT hint for the IMMEDIATELY next wait only. If that next
-' wait then shows a content render, a single [SPA-CARRYOVER-NOTE] fires ("this
-' render MAY belong to the previous action"). The hint never survives past one
-' wait, so stale correlations to unrelated later renders are structurally
-' impossible. Confirming the actual owner + gap is left to an armed re-run.
+' Carryover is diagnostic only: a suspect wait reserves one hint for the immediately
+' following wait. It never changes consensus or survives beyond that wait.
 Private m_unresolvedJsonThisWait As Boolean       ' this wait saw a tracked json/API, no content render yet
 Private m_unresolvedJsonFirstKeyThisWait As String ' first such json's key (SUSPECT line only; NOT used by NOTE)
 Private m_unresolvedJsonFirstSecThisWait As Double ' first such json's arrival relTime (SUSPECT line only)
@@ -204,7 +110,6 @@ Private m_hasCarryoverHintForNextWait As Boolean  ' reservation: hand a one-shot
 Private m_carryoverNoteArmedThisWait As Boolean   ' this wait may emit ONE carryover note (consumed from the reservation)
 Private m_carryoverNoteEmittedThisWait As Boolean ' this wait already emitted its one note (1-per-wait cap)
 
-' Error Codes & Enumerations
 Private Const ERR_BIDI_PROTOCOL As Long = vbObjectError + 1001
 Private Const ERR_JS_EXCEPTION As Long = vbObjectError + 1002
 Private Const ERR_ACTION_FAILED As Long = vbObjectError + 1003
@@ -225,135 +130,86 @@ Private Enum waitMode
     WaitMode_UrlContains
     WaitMode_SpaIdle
 End Enum
-' DEVELOPMENT & EXTENSION RULES FOR STABILITY
-' To maintain "Anti-Freeze" architecture and "AI-Ready" predictability,
-' all new interaction methods MUST adhere to the following 4 Golden Rules:
-' 1. [BASE UTILIZATION]: Result-bearing action JavaScript MUST normally go
-'    through Me.CallScript.
-'    Infrastructure exceptions include probe injection, preload-script
-'    registration, realm discovery, and fire-and-forget PostScript.
-'    - Rationale: This ensures the 'WrapInSafetyShell' is automatically applied,
-'      bounding the VBA-side wait for cooperative/asynchronous JavaScript
-'      without cancelling the browser-side task.
-' 2. [HEARTBEAT INTEGRATION (hb)]: For JS involving loops, polling, or long waits:
-'    - Action: Call 'hb()' inside the loop.
-'    - Rationale: hb() is provided via closure from WrapInSafetyShell.
-'      Do NOT write 'const hb = arguments[0]' -> hb is NOT passed as an argument,
-'      and doing so will overwrite your actual parameters (like sharedId).
-'      Calling hb() refreshes the Safety-Shell watchdog and prevents a premature
-'      VBA_TIMEOUT while cooperative browser-side work is still progressing.
-' 3. [TIMEOUT DELEGATION]: Public interaction methods SHOULD expose a 'timeoutMs' parameter.
-'    - Action: Pass this parameter down to 'CallScript'.
-'    Utility methods (ClearState, GetMainContextId, etc.) are exempt.
-' 4. [VBA UI RESPONSIVENESS]: For any loop logic created within VBA (Do...Loop):
-'    - Action: You MUST call 'WaitHeartbeat' or 'socket_.PumpMessages'.
-'    - Rationale: This pumps the Windows message queue, preventing Excel from
-'      entering a "Not Responding" state during high-precision waits.
+' Extension contracts:
+'   - Result-bearing JS normally uses CallScript and the Safety Shell.
+'   - Long browser loops yield and call the hb() closure.
+'   - Public timeouts pass through the shared validation path.
+'   - Wrapper waits yield only where communicator correlation is not active.
 
-' Initialization: Setup WebSocket and validate High-Resolution Timer frequency.
 Private Sub Class_Initialize()
-    ' --- 1. Collection & Dictionary Initializations ---
-    ' Ensures all tracking objects are instantiated for re-entrancy safety.
     Set socket_ = New BiDiSocketCommunicator
+
+
     Set m_activeSubscriptions = New Dictionary
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
     Set m_blockingPatterns = New Collection
     
-    ' --- 2. Request ID Ownership ---
-    ' Request ID generation is managed by BiDiSocketCommunicator.
 
-    ' --- 3. State Reset ---
     m_waitStackDepth = 0
     m_consecutiveCdpFailures = 0
     m_isProcessingQueue = False
     ResetSignalState  ' Completion-signal gate starts disarmed
 
-    ' --- 4. Diagnostics ---
-    ' DebugMode defaults On (developer protocol/action trace -> Immediate window).
-    ' User-settable at runtime via the public DebugMode property. NOTE: this governs
-    ' only this class's high-level trace; the low-level wire log is the separate
-    ' DEBUG_MODE constant inside BiDiSocketCommunicator.
     m_debugMode = True
 End Sub
 
-' METHOD: ConnectTo
-'  Connects to the WebSocket and subscribes to prompt events.
 Public Sub ConnectTo(ByVal webSocketUrl As String)
-    ' INVARIANT: validate BEFORE ClearState. Wiping Wrapper state first and only then
-    ' discovering the URL is empty (or the socket is already connected) would leave the
-    ' Wrapper cleared while the live socket/browser keeps its real subscriptions --
-    ' a transport/Wrapper desync. All fail-fast checks therefore precede ClearState.
+    ' Validate before ClearState; otherwise a rejected reconnect can erase wrapper state
+    ' while the existing browser/socket session remains live.
     
-    ' WHY: fail fast on an empty URL. The most common cause is forgetting to call
-    ' caps.EnableBiDiMode before OpenBrowser, which leaves GetWebSocketUrl empty.
     If Len(Trim$(webSocketUrl)) = 0 Then
         Err.Raise ERR_CONNECT_FAILED, "BiDiCommandWrapper:ConnectTo", _
             "webSocketUrl is empty. Call caps.EnableBiDiMode BEFORE driver.OpenBrowser, " & _
             "then pass driver.GetWebSocketUrl to ConnectTo."
     End If
     
-    ' Already-connected guard: reconnecting over a live socket would ClearState while
-    ' the socket stays up (Connect() returns False on StateConnected/Connecting).
-    If socket_.State = StateConnected Or socket_.State = StateConnecting Then
+    If socket_.state = StateConnected Or socket_.state = StateConnecting Then
         Err.Raise ERR_CONNECT_FAILED, "BiDiCommandWrapper:ConnectTo", _
             "The BiDi socket is already connected. Call Shutdown before reconnecting."
     End If
     
     Me.ClearState
 
-    ' WHY: AttemptAutoConnect returns False on failure instead of raising, so the
-    ' result must be checked here; otherwise failure surfaces later inside the first
-    ' subscribe call as a misleading recovery error (600). A short retry additionally
-    ' absorbs transient WebSocket-handshake timeouts on a busy machine.
+    ' AttemptAutoConnect returns False rather than raising. Check it here so connection
+    ' failure is reported at the connection boundary.
     Dim attempt As Long
     Dim connected As Boolean
     For attempt = 1 To 3
         connected = socket_.AttemptAutoConnect(webSocketUrl)
         If connected Then Exit For
-        ' Brief backoff WITHOUT DoEvents (no re-entrancy during the connection phase)
         If attempt < 3 Then socket_.YieldExecution 250 * attempt, False
     Next attempt
 
     If Not connected Then
         Err.Raise ERR_CONNECT_FAILED, "BiDiCommandWrapper:ConnectTo", _
             "Failed to establish the BiDi WebSocket connection to: " & webSocketUrl & vbCrLf & _
-            "Checks: (1) the URL must point to localhost/127.0.0.1/[::1], " & _
+            "Checks: (1) the URL must use ws:// and point to localhost/127.0.0.1/[::1], " & _
             "(2) it must contain ""/session"" (i.e. a webSocketUrl issued by the driver), " & _
             "(3) the browser/driver session must still be alive."
     End If
     
     Me.ExecuteSessionSubscribe Array("log.entryAdded", "browsingContext.navigationStarted"), , True
     
-    ' 4. GLOBAL SHADOW DOM UNLOCKER (Auto-Injection):
-    ' Ensures all 'closed' shadow roots are accessible as 'open' across all frames.
-    ' Called silently to keep the connection phase logs clean.
     Me.ExecuteEnableGlobalShadowUnlocker
+
 End Sub
 
-' Class_Terminate: Resource cleanup including explicit CDP session detachment
 Private Sub Class_Terminate()
-    ' OERN SCOPE = ENTIRE PROCEDURE. There is no matching "On Error GoTo 0" below;
-    ' this is deliberate. Teardown must never raise during object destruction (the
-    ' socket/CDP session may already be half-dead), so every statement here runs
-    ' best-effort and failures are silently swallowed through to End Sub.
+    ' Destructor cleanup is intentionally non-raising; the OERN scope covers the whole
+    ' procedure because teardown must continue after any individual failure.
     On Error Resume Next
     
-    ' EMERGENCY UI RESTORATION: Ensures Excel returns to a usable state
-    ' even if the macro was forcefully stopped.
     Application.Interactive = True
     Application.Cursor = xlDefault
     Application.StatusBar = False
     
-    ' ASYNCHRONOUS HUD REMOVAL
-    ' Uses Fire & Forget mode to attempt a clean browser-side cleanup
-    ' without risking a final hang/whiteout during object destruction.
     If m_mainContextId <> "" Then
         Call Me.PostScript(GetHudJs("remove"), Nothing, m_mainContextId)
     End If
     
-    ' RESOURCE RELEASE
-    ' Explicitly shuts down the socket and detaches any active CDP tunnels.
+    ' Default destructor shutdown force-closes the socket. The CDP tunnel is session-bound,
+    ' so no acknowledged detach is required on this emergency path.
     Call Shutdown
     
     If m_debugMode Then
@@ -363,48 +219,43 @@ End Sub
 Public Property Get GetSocket() As BiDiSocketCommunicator
     Set GetSocket = socket_
 End Property
-Public Property Set SetSocket(Socket As BiDiSocketCommunicator)
-    Set socket_ = Socket
+Public Property Set SetSocket(socket As BiDiSocketCommunicator)
+    Set socket_ = socket
 End Property
 
-' Central Event Dispatcher (Modified with Smart Filtering)
+' Compatibility shim: WinSock is the only transport; False is rejected.
+Public Property Let UseWinsockTransport(ByVal v As Boolean)
+    socket_.UseWinsockTransport = v
+End Property
+
+Public Property Get UseWinsockTransport() As Boolean
+    UseWinsockTransport = socket_.UseWinsockTransport
+End Property
+
 Private Sub DispatchGlobalEvents(ByVal json As Object)
     If Not json.Exists("method") Then Exit Sub
     Dim method As String: method = json("method")
 
-    ' NOTE: Network blocking uses Network.setBlockedURLs (set up by
-    ' ExecuteEnableResourceBlocking). That command works at the network layer
-    ' and the browser returns a synthetic net::ERR_BLOCKED_BY_CLIENT to the
-    ' page without firing any client-side intercept event we need to handle
-    ' here. Blocked requests surface in the standard network.* event stream
-    ' (typically as network.fetchError) and are classified by the normal
-    ' network event path below, so no CDP-specific intercept dispatching is required.
+    ' Blocked requests surface as fetchError. They remain visible to diagnostics but do
+    ' not participate in SPA-idle consensus because blocking is browser-side.
 
     Select Case method
-        ' --- BROWSER CONSOLE LOGS ---
         Case "log.entryAdded"
             Call HandleConsoleLog(json)
 
-        ' --- NAVIGATION DETECTION (Predictive Probe Recovery) ---
         Case "browsingContext.navigationStarted"
             m_navigationDetected = True
             m_navigationContextId = GetPathString(json, "params.context")
 
-            ' Invalidate the cached realm for the navigating context,
-            ' as the execution realm will be destroyed by the navigation.
             If m_cachedRealmIds.Exists(m_navigationContextId) Then
                 m_cachedRealmIds.Remove m_navigationContextId
             End If
 
-            ' Drop the validated-context entry too; it must be re-checked
-            ' against the tree on next use after a navigation.
+            ' Navigation invalidates the cached realm and validated-context entry for that context.
             If Not m_validatedContexts Is Nothing Then
                 If m_validatedContexts.Exists(m_navigationContextId) Then m_validatedContexts.Remove m_navigationContextId
             End If
 
-            ' Log only when the navigation occurs in the main context.
-            ' Sub-frame navigations (iframes) are handled silently to reduce log noise,
-            ' as they are not consumed by the Predictive Recovery path (context mismatch).
             If m_debugMode Then
                 If m_navigationContextId = m_mainContextId Then
                     Debug.Print "BiDi: Navigation detected in main context " & _
@@ -412,20 +263,9 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
                 End If
             End If
 
-        ' --- NETWORK REQUEST END (Success or Error) ---
         Case "network.responseCompleted", "network.fetchError"
-            ' --- [Signal Gate] ArmNetworkSignal matching ---
-            ' Matched on EVERY responseCompleted, and deliberately BEFORE the
-            ' recorder's noise/idle filtering (FormatAndStoreLog below), so a
-            ' pattern that also sits in an ignore/suppress list still fires.
-            ' One-shot latch: after the first hit the armed pattern is closed;
-            ' repeated responses to the same endpoint neither re-log nor re-match.
-            ' Any status latches (a 500 on the awaited endpoint still opens the
-            ' gate); the status is logged so the caller can judge the outcome.
-            ' The hit is event-triggered rather than poll-detected.
-            ' Its timestamp is recorded at VBA dispatch time, so queue backlog
-            ' can add positive lag relative to the actual browser event.
-            ' dom/vis hits are detected on the ~100ms poll.
+            ' Network-signal matching runs on every responseCompleted before noise filtering;
+            ' an ignored endpoint may still be an explicitly armed completion signal.
             If method = "network.responseCompleted" And m_sigNetArmed And Not m_sigNetSeen Then
                 Dim sigUrl As String: sigUrl = GetPathString(json, "params.response.url")
                 If Len(sigUrl) > 0 Then
@@ -439,16 +279,8 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
                 End If
             End If
 
-            ' BLOCK VISIBILITY: Network.setBlockedURLs ends a request silently
-            ' -- there is no dedicated "blocked" event. The request lands here
-            ' as network.fetchError, but the chromium-bidi mapping currently
-            ' leaves params.errorText empty (the underlying CDP error code
-            ' net::ERR_BLOCKED_BY_CLIENT is not propagated through the BiDi
-            ' bridge). We therefore classify the error by matching the URL
-            ' against the patterns we installed -- if it hits one of our
-            ' tokens, the failure is unambiguously our doing. Other fetchError
-            ' causes (DNS failure, server hangup, unrelated cancellation) do
-            ' not match any token and fall through silently.
+            ' Because blocked fetchError often lacks errorText, URL-pattern matching distinguishes
+            ' [BLOCK] from ordinary network failures.
             If m_debugMode And method = "network.fetchError" Then
                 Dim blockedUrl As String
                 blockedUrl = GetPathString(json, "params.request.url")
@@ -465,18 +297,12 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
 
     End Select
 
-    ' Store event in Discovery Recorder if active
     If m_isRecording Then
         FormatAndStoreLog json
     End If
 End Sub
 
-' [PUBLIC] GetIframeContextIdByUrl
-'  Searches for a specific iframe context ID by its partial URL.
-'              This method implements a "Fail-Fast" strategy by raising a VBA error
-'              if the target frame is not located within the specified timeout.
 Public Function GetIframeContextIdByUrl(ByVal partialUrl As String, Optional ByVal timeoutMs As Long = 5000) As String
-    ' --- Input Validation ---
     Dim vTimeout As Long
     If timeoutMs = 0 Then
         vTimeout = 0
@@ -494,20 +320,15 @@ Public Function GetIframeContextIdByUrl(ByVal partialUrl As String, Optional ByV
         If Not contexts Is Nothing Then
             ctxId = RecursiveFrameSearch(contexts, partialUrl)
             If ctxId <> "" Then
-                ' Return found Context ID and exit function
                 GetIframeContextIdByUrl = ctxId
                 Exit Function
             End If
         End If
 
-        ' Immediate exit if the user specified no wait (0ms)
         If vTimeout <= 0 Then Exit Do
 
-        ' WaitHeartbeat calls DoEvents internally to prevent Excel from freezing.
         WaitHeartbeat SHORT_WAIT_MS
         
-        ' --- Fail-Fast Logic ---
-        ' Raise a runtime error if the element is not found within the timeout period.
         If IsTimeout(startTick, CDbl(vTimeout)) Then
             Err.Raise ERR_ACTION_FAILED, "BiDi:GetIframeContextIdByUrl", _
                       "Iframe context not found within " & vTimeout & "ms (Target URL pattern: " & partialUrl & ")"
@@ -515,12 +336,10 @@ Public Function GetIframeContextIdByUrl(ByVal partialUrl As String, Optional ByV
     Loop
 End Function
 
-' [FIXED] Recursive search with Stack Guard and Depth Limit
 Private Function RecursiveFrameSearch(ByVal contextList As Collection, _
                                       ByVal partialUrl As String, _
                                       Optional ByVal currentDepth As Long = 0) As String
     
-    ' Guard: Recursion depth limit
     Const MAX_RECURSION_DEPTH As Long = 20
     
     On Error GoTo StackGuard
@@ -535,13 +354,11 @@ Private Function RecursiveFrameSearch(ByVal contextList As Collection, _
     Dim childRes As String
 
     For Each ctx In contextList
-        ' URL Check
         If InStr(ctx("url"), partialUrl) > 0 Then
             RecursiveFrameSearch = ctx("context")
             Exit Function
         End If
 
-        ' Recursive search for children (iframes)
         If ctx.Exists("children") Then
             If IsObject(ctx("children")) Then
                 If Not ctx("children") Is Nothing Then
@@ -568,8 +385,6 @@ StackGuard:
     End If
 End Function
 
-' [PUBLIC] ExecuteFindWindowContextId
-'  Locates a window context (tab/window) by URL or Title.
 Public Function ExecuteFindWindowContextId(ByVal matchType As BiDiMatchBy, _
                                            ByVal matchValue As String, _
                                            Optional ByVal timeoutMs As Long = 5000, _
@@ -597,7 +412,6 @@ Public Function ExecuteFindWindowContextId(ByVal matchType As BiDiMatchBy, _
                     If Not waitForComplete Then
                         ExecuteFindWindowContextId = ctx("context"): Exit Function
                     Else
-                        ' Leverage the new simplified pipeline
                         res = GetCleanResult(CallScript("return document.readyState;", , ctx("context")))
                         If CStr(res) = "complete" Then
                             ExecuteFindWindowContextId = ctx("context"): Exit Function
@@ -615,8 +429,6 @@ Public Function ExecuteFindWindowContextId(ByVal matchType As BiDiMatchBy, _
     Loop
 End Function
 
-' FUNCTION: ExecuteCreateContext
-'  Creates a new browsing context (tab or window).
 Public Function ExecuteCreateContext(Optional ByVal createType As BiDiContextType = ContextTypeTab) As String
     Dim typeStr As String
     If createType = ContextTypeWindow Then
@@ -631,7 +443,6 @@ Public Function ExecuteCreateContext(Optional ByVal createType As BiDiContextTyp
     Dim strRes As String
     strRes = ExecuteBiDiCommand("browsingContext.create", params, allowAmbiguousRetry:=False)
     
-    ' Validate + parse: surface a create error JSON instead of returning "".
     Dim json As Object
     Set json = ValidateProtocolResponse(strRes, "browsingContext.create")
     ExecuteCreateContext = GetPathString(json, "result.context")
@@ -643,20 +454,16 @@ Public Function ExecuteCloseContext(ByVal contextId As String) As String
     Dim closeRes As String
     closeRes = ExecuteBiDiCommand("browsingContext.close", params, _
                                   allowAmbiguousRetry:=False, allowRecoveryRetry:=False)
-    ' Validate BEFORE ClearState: a close that returned an error JSON must NOT wipe
-    ' Wrapper state (main context / caches / subscriptions / CDP) while the tab is
-    ' still alive, which would desync the Wrapper from the live socket/browser.
+    ' Validate close before ClearState. An error response means the context may still be
+    ' alive, so clearing wrapper state would desynchronize it from the browser.
     ValidateProtocolResponse closeRes, "browsingContext.close"
     ExecuteCloseContext = closeRes
     If contextId = m_mainContextId Then ClearState
 End Function
 
-' [PUBLIC] ExecuteGetTitleByContextId (Optimized)
 Public Function ExecuteGetTitleByContextId(ByVal contextId As String) As String
-    ' Note: CallScript internally handles the realm discovery and shell unwrapping
     Dim strRes As String: strRes = CallScript("return document.title || '';", , contextId)
     
-    ' Return the plain string extracted from the JSON response
     ExecuteGetTitleByContextId = CStr(GetCleanResult(strRes))
 End Function
 
@@ -670,12 +477,13 @@ Public Function ExecuteHandleUserPrompt(ByVal Accept As Boolean, Optional ByVal 
     On Error Resume Next
     ExecuteHandleUserPrompt = ExecuteBiDiCommand("browsingContext.handleUserPrompt", params, _
                                 allowAmbiguousRetry:=False, allowContextRetarget:=(targetCtx = m_mainContextId))
+    ValidateProtocolResponse ExecuteHandleUserPrompt, "browsingContext.handleUserPrompt"
     Dim capturedErr As Long: capturedErr = Err.Number
     Dim capturedDesc As String: capturedDesc = Err.description
     Dim capturedSrc As String: capturedSrc = Err.source
     On Error GoTo 0
     
-    ' Tolerate "no such alert" (prompt absent) but propagate socket/fatal errors
+    ' Ignore only the expected 'no such alert'; propagate transport and fatal errors.
     If capturedErr <> 0 Then
         If InStr(1, capturedDesc, "no such alert", vbTextCompare) = 0 And _
            InStr(1, capturedDesc, "no user prompt", vbTextCompare) = 0 Then
@@ -684,25 +492,17 @@ Public Function ExecuteHandleUserPrompt(ByVal Accept As Boolean, Optional ByVal 
     End If
 End Function
 
-' [PUBLIC] ExecuteIsUrlContains
-'  Checks whether the current URL contains the partial string.
-'              With waitNetworkIdle=False and maxTimeoutMs=0, performs one immediate check;
-'              otherwise polls until a match is found or the timeout expires.
-'              Optionally waits for SPA stability.
-' RETURNS    : True if URL contains the string within timeout, False otherwise.
 Public Function ExecuteIsUrlContains(ByVal partialUrl As String, _
                                      Optional ByVal waitNetworkIdle As Boolean = True, _
                                      Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
                                      Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                      Optional ByVal contextId As String = "") As Boolean
     
-    ' --- [ENTRY GUARD] Guard against 0ms when sync is requested ---
     If waitNetworkIdle Then
         If minStableMs = 0 Then minStableMs = DEFAULT_IDLE_STABLE_MS
         If maxTimeoutMs = 0 Then maxTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS
     End If
-    ' When waitNetworkIdle=False, exactly 0ms performs one immediate URL check.
-    ' This is a pure live protocol read and does not add event subscriptions.
+    ' Exactly 0ms is a deliberate one-shot read only when SPA synchronization is disabled.
     If Not waitNetworkIdle And maxTimeoutMs = 0 Then
         Dim immediateCtx As String
         immediateCtx = ResolveTargetContext(contextId)
@@ -717,31 +517,22 @@ Public Function ExecuteIsUrlContains(ByVal partialUrl As String, _
     
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
-    ' Subscribe to navigation events required for monitoring.
-    '    network.fetchError is included so blocked requests (errored out with
-    '    ERR_BLOCKED_BY_CLIENT from Network.setBlockedURLs) surface as [BLOCK]
-    '    log lines via DispatchGlobalEvents.
     Me.ExecuteSessionSubscribe Array("network.responseCompleted", "network.fetchError", "browsingContext.load", "browsingContext.fragmentNavigated")
     
     Dim waitCtx As New Dictionary
     waitCtx.Add "contextId", targetCtx
     waitCtx.Add "partialUrl", partialUrl
     
-    ' Start the engine. Internally calls EvaluateWaitCondition -> GetCurrentUrl (Clean)
     Dim isMatched As Boolean
     isMatched = MasterWaitEngine(WaitMode_UrlContains, vMaxTimeout, 200, waitCtx)
     
     If isMatched And waitNetworkIdle Then
-        ' vMinStable and vMaxTimeout are guaranteed to be valid due to our Entry Guard.
         SyncAfterAction targetCtx, vMinStable, vMaxTimeout
     End If
 
     ExecuteIsUrlContains = isMatched
 End Function
 
-' FUNCTION: ExecuteNavigateAndGetStatus
-'  Public entry point for navigation. Returns "200" on success or "500" on error.
-'          This high-level method leverages the private navigation engine.
 Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
                                     Optional ByVal waitNetworkIdle As Boolean = True, _
                                     Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
@@ -752,9 +543,8 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     Dim vMaxTimeout As Long: vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim attempt As Long
-    ' MAX_NAV_RETRIES bounds total navigate attempts. A COMMITTED navigate is never
-    ' re-sent; re-navigation happens only for provable non-commit transport failures
-    ' (IsRetryableNavFailure). In mode "none" it also bounds the liveness re-check.
+    ' A committed navigation is never resent. Retries are limited to explicitly classified
+    ' ordinary-navigation network failures and liveness verification.
     Const MAX_NAV_RETRIES As Long = 2
     
     Dim isNavigated As Boolean
@@ -768,10 +558,6 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     For attempt = 0 To MAX_NAV_RETRIES
         isNavigated = False
         
-        ' --- PHASE A: Navigation Command ---
-        ' Re-sent only for explicitly classified network failures (IsRetryableNavFailure).
-        ' Once accepted, it is never re-sent, so a transient PHASE B verify failure can
-        ' no longer re-execute a navigation that already succeeded.
         If Not navigationAccepted Then
             On Error Resume Next
             Call ExecuteBrowsingContextNavigate(targetUrl, modeStr, vMinStable, vMaxTimeout, targetCtx)
@@ -780,38 +566,29 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
             Dim navSrc As String: navSrc = Err.source
             On Error GoTo 0
             
-            ' CONSENSUS HALT is a deliberate stop signal: never absorb it.
             If navErr = ERR_CONSENSUS_HALT Then
                 Err.Raise navErr, navSrc, navDesc
             End If
             
-            ' A committed navigation is never re-sent. Selected Chromium network
-            ' failures that normally indicate no usable document was committed may be
-            ' retried under the navigation-recovery policy below. These failures do NOT
-            ' prove the server received no request or performed no processing: the reset
-            ' can occur after the request was sent. This retry is therefore intended for
-            ' ordinary page navigation, NOT one-time or side-effecting URLs. Gated by
-            ' MESSAGE, not Err.Number, because ERR_BIDI_PROTOCOL cannot separate a
-            ' network failure from a post-commit context loss.
+            ' Selected Chromium network failures are retryable only for ordinary page navigation.
+            ' They do not prove the server saw no request; never rely on this policy for one-time,
+            ' download, or otherwise side-effecting URLs.
             If navErr <> 0 Then
                 If IsRetryableNavFailure(navDesc) Then
                     WaitHeartbeat 1000
                     GoTo NextNavAttempt   ' re-navigate next iteration (not accepted yet)
                 End If
-                ' Every other error is terminal: Err.Number alone cannot prove the
-                ' browser failed to accept or begin the navigation; re-sending an
-                ' ambiguous / post-commit failure risks a double navigation.
+                ' All ambiguous or post-commit failures are terminal because resending may duplicate
+                ' navigation or server-side work.
                 ExecuteNavigateAndGetStatus = "500"
                 Exit Function
             End If
             
-            ' Navigate committed. From here only PHASE B verification is retried.
+            ' After commit, retry verification only; never issue another navigate command.
             navigationAccepted = True
         End If
         
-        ' --- PHASE B: Liveness Verification (retryable, no re-navigation) ---
         If Not waitNetworkIdle Then
-            ' Mode "none": quick URL validation since the protocol returns immediately.
             On Error Resume Next
             Dim curUrl As String: curUrl = GetCurrentUrl(targetCtx, True)
             On Error GoTo 0
@@ -819,7 +596,6 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
                 isNavigated = True
             End If
         Else
-            ' Mode "complete": success is implied by a committed navigate + best-effort settle.
             isNavigated = True
         End If
         
@@ -828,7 +604,6 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
             Exit Function
         End If
 
-        ' Wait for the environment to settle before re-verifying.
         WaitHeartbeat 1000
 NextNavAttempt:
     Next attempt
@@ -836,46 +611,22 @@ NextNavAttempt:
     ExecuteNavigateAndGetStatus = "500"
 End Function
 
-' EnsureCdpBlockingInitialized: Enables the CDP Network domain that
-' Network.setBlockedURLs depends on. Idempotent -> safe to call repeatedly.
-'
-' DESIGN NOTE: Resource blocking uses the declarative CDP Network.setBlockedURLs,
-' NOT request interception. Two interception-based alternatives were evaluated
-' and rejected:
-'
-' A) CDP Fetch domain (Fetch.enable + Fetch.failRequest):
-'   (1) Fetch.enable with no urlPatterns pauses EVERY request, including the
-'       page's own data fetches, swamping the receive loop.
-'   (2) Fetch.failRequest, when called from an event handler, would re-enter
-'       the synchronous receive loop and risk a deadlock.
-'
-' B) Standard BiDi network.addIntercept + failRequest:
-'   (3) Answering intercepts on the single shared socket starves the consensus
-'       engine: this class serialises all traffic through one synchronous
-'       SendAndReceive (a single in-flight command at a time), so the drain that
-'       responds to intercepts monopolises that socket and blocks the idle-probe
-'       poll (script.callFunction) the consensus engine depends on -- stalling
-'       settlement (forces the minStableMs*2 Hard-Sync) and triggering an
-'       input-rebind retry storm. Verified against Google Flights.
-'   (4) failRequest on parser-blocking subresources stalls window.load.
-'
-' Network.setBlockedURLs avoids all of the above: it blocks at the network
-' layer with zero per-request client adjudication.
+' Resource blocking deliberately uses CDP Network.setBlockedURLs.
+' Fetch/BiDi interception would require per-request replies on the shared synchronous
+' correlation path, starving SPA-probe polls and risking re-entry. Failing parser-blocking
+' subresources can also stall load. Browser-side declarative blocking avoids both.
 Private Function EnsureCdpBlockingInitialized() As Boolean
     Dim res As Object
     
-    ' Force Silent:=True for infrastructure setup commands
     Set res = ExecuteCDPCommand("Network.enable", New Dictionary, True, True)
     EnsureCdpBlockingInitialized = res("Ok")
 End Function
 
-' ExecuteEnableResourceBlocking: Sets URL patterns to be blocked via CDP.
 Public Function ExecuteEnableResourceBlocking(ByVal patterns As Variant) As String
     Dim params As New Dictionary
     Dim urlList As New Collection
     Dim Item As Variant
 
-    ' Normalize input patterns into a Collection
     If IsArray(patterns) Then
         For Each Item In patterns: urlList.Add CStr(Item): Next
     Else
@@ -883,29 +634,22 @@ Public Function ExecuteEnableResourceBlocking(ByVal patterns As Variant) As Stri
     End If
     params.Add "urls", urlList
 
-    ' Ensure the CDP Network domain is enabled before setting blocked URLs.
     If Not EnsureCdpBlockingInitialized() Then
         ExecuteEnableResourceBlocking = "{""error"":""CDP_INIT_FAILURE"",""message"":""Failed to enable Network domain.""}"
         Exit Function
     End If
 
-    ' Issue the blocking command via the CDP tunnel.
     Dim resObj As Object: Set resObj = ExecuteCDPCommand("Network.setBlockedURLs", params, True, True)
     
     If Not resObj("Ok") Then
         ExecuteEnableResourceBlocking = "{""error"":""CDP_FAILURE""}"
     Else
-        ' Cache the substring tokens of each pattern (stripped of surrounding
-        ' wildcards) so DispatchGlobalEvents can classify subsequent fetchError
-        ' events as blocker-induced and emit the [BLOCK] log line. Without this
-        ' cache we'd have to rely on params.errorText, which chromium-bidi
-        ' currently leaves empty for ERR_BLOCKED_BY_CLIENT.
+        ' Cache normalized block tokens because Chromium may omit ERR_BLOCKED_BY_CLIENT text
+        ' from fetchError events.
         Set m_blockingPatterns = New Collection
         Dim pat As Variant
         For Each pat In urlList
             Dim token As String: token = CStr(pat)
-            ' Strip leading/trailing '*' characters and whitespace so InStr
-            ' can match against raw URLs. "*foo.com*" -> "foo.com".
             Do While Len(token) > 0 And (Left$(token, 1) = "*" Or Left$(token, 1) = " ")
                 token = Mid$(token, 2)
             Loop
@@ -922,11 +666,8 @@ Public Function ExecuteEnableResourceBlocking(ByVal patterns As Variant) As Stri
     End If
 End Function
 
-' [PUBLIC] ExecuteIsElementVisible
-'  Checks whether an element is connected, style-visible, and has visual dimensions.
-'              Tests isConnected, display/visibility/opacity, and width/height/ClientRect.
-'              Does NOT test viewport intersection or occlusion by another element.
-'              Supports 0ms searchTimeoutMs for high-speed immediate polling.
+' Visibility means connected, style-visible, and non-zero geometry; it does not test
+' viewport intersection or occlusion.
 Public Function ExecuteIsElementVisible(ByVal xpath As String, _
                                         Optional ByVal searchTimeoutMs As Long = 10000, _
                                         Optional ByVal waitNetworkIdle As Boolean = False, _
@@ -934,15 +675,10 @@ Public Function ExecuteIsElementVisible(ByVal xpath As String, _
                                         Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                         Optional ByVal contextId As String = "") As Boolean
     
-    ' --- [ENTRY GUARD] Guard against 0ms only when sync is requested ---
-    ' Enforce safety floor for stability consensus parameters.
     If waitNetworkIdle Then
         If minStableMs <= 0 Then minStableMs = DEFAULT_IDLE_STABLE_MS
         If maxTimeoutMs <= 0 Then maxTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS
     End If
-    ' Exactly 0 is the public immediate-check sentinel.
-    ' Negative values intentionally retain the existing SanitizeMs normalization;
-    ' GetFindElementSharedIdByXPath's <= 0 handling remains an internal safeguard.
     Dim vSearchTimeout As Long
     If searchTimeoutMs = 0 Then
         vSearchTimeout = 0
@@ -955,11 +691,9 @@ Public Function ExecuteIsElementVisible(ByVal xpath As String, _
     
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
-    ' Returns a sharedId if found within vSearchTimeout.
     Dim sharedId As String
     sharedId = GetFindElementSharedIdByXPath(xpath, vSearchTimeout, targetCtx)
     
-    ' Early Exit: If the element is not found, it cannot be visible.
     If sharedId = "" Then
         ExecuteIsElementVisible = False
         Exit Function
@@ -967,27 +701,22 @@ Public Function ExecuteIsElementVisible(ByVal xpath As String, _
     Dim args As New Collection
     Dim arg1 As New Dictionary: arg1.Add "sharedId", sharedId: args.Add arg1
 
-    ' strRes will be a flattened JSON string returned by the response pipeline.
     Dim strRes As String
     strRes = ExecuteBaseAction(targetCtx, "visibility_check", args, waitNetworkIdle, vMinStable, True, DEFAULT_STALE_RETRIES, vMaxTimeout)
     
-    ' 7. [FIXED] Parse Result using the unified pipeline.
     On Error Resume Next
     Dim resultVal As Variant
     resultVal = GetCleanResult(strRes)
     
-    ' If the result is not Empty, convert the JS boolean to a VBA Boolean.
     If Not IsEmpty(resultVal) Then
         ExecuteIsElementVisible = CBool(resultVal)
     End If
     On Error GoTo 0
 End Function
 
-' ExecuteSessionSubscribe: Subscribes to BiDi events with optional context filtering.
 Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
                                          Optional ByVal contexts As Collection = Nothing, _
                                          Optional ByVal Silent As Boolean = False) As String
-    ' Normalize events into a String array.
     Dim eventArray() As String
     Dim i As Long, v As Variant
     If IsArray(events) Then
@@ -1000,9 +729,8 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
         eventArray(0) = CStr(events)
     End If
 
-    ' Build the target context list. Nothing/empty => one global entry ("");
-    ' otherwise one entry per context, so the registry is keyed per
-    ' (event, context) pair instead of only the first context (contexts(1)).
+    ' Subscription registry keys include both event and context; an empty context denotes
+    ' a global subscription.
     Dim targetCtxs As Collection: Set targetCtxs = New Collection
     Dim c As Variant
     If contexts Is Nothing Then
@@ -1022,9 +750,7 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
     Dim tc As Variant
     Dim lastRes As String: lastRes = "{""status"":""already_subscribed""}"
 
-    ' Subscribe per context so each (event, context) pair is delta-checked and
-    ' tracked independently (no orphaned keys on partial overlap). The global
-    ' case is a single iteration, identical to the previous behavior.
+    ' Delta-subscribe each event/context pair independently to avoid partial-overlap gaps.
     For Each tc In targetCtxs
         ctxId = IIf(CStr(tc) = "", "", "|" & CStr(tc))
 
@@ -1052,7 +778,7 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
                 params.Add "contexts", oneCtx
             End If
 
-            strRes = ExecuteBiDiCommand("session.subscribe", params, Silent)
+            strRes = ExecuteBiDiCommand("session.subscribe", params, Silent, allowAmbiguousRetry:=False)
             lastRes = strRes
 
             subId = GetPathString(ValidateProtocolResponse(strRes, "session.subscribe"), "result.subscription")
@@ -1067,9 +793,8 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
     ExecuteSessionSubscribe = lastRes
 End Function
 
-' [PRIVATE] ExecuteBrowsingContextNavigate (Refactored for Anti-Freeze)
-'  Initiates navigation without blocking at the socket level.
-'          Uses VBA-side polling to monitor stability and handle timeouts.
+' browsingContext.navigate uses wait=none; requested completion is observed afterward
+' by bounded wrapper-side polling.
 Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
                                     Optional ByVal waitMode As String = "complete", _
                                     Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
@@ -1078,13 +803,9 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
                                                 
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
-    ' WHY: reset only transient navigation/network state.
     
-    ' INVARIANT (ORDERING): capture the TARGET URL's origin before the navigate command fires.
-    ' This is compared against the post-navigation URL (from the BiDi response) to
-    ' detect redirect-induced cross-origin transitions. If the browser redirected to
-    ' a different origin, the CDP session attached to the previous target is invalid.
-    ' NOTE: We intentionally extract from the 'url' parameter, NOT from GetCurrentUrl().
+    ' Capture the requested origin before navigation. Redirected cross-origin completion
+    ' invalidates the CDP session attached to the previous target.
     Dim preNavOrigin As String
     preNavOrigin = socket_.ExtractOrigin(url)
     
@@ -1096,22 +817,16 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
     params.Add "url", url
     params.Add "wait", bidiWaitLevel
     
-    ' Context-retarget policy: permit recovery to retarget to the refreshed MAIN only
-    ' when this navigation is main-directed. An explicit non-main target (child tab /
-    ' iframe / popup) must never be retargeted, or a context-lost recovery would drive
-    ' the surviving main tab to the wrong URL.
+    ' Only main-directed navigation may recover by retargeting to a refreshed main context;
+    ' explicit child/popup/frame targets must never be hijacked.
     Dim allowRetarget As Boolean: allowRetarget = (targetCtx = m_mainContextId)
     Dim strRes As String
     strRes = ExecuteBiDiCommand("browsingContext.navigate", params, _
                                 allowAmbiguousRetry:=False, allowContextRetarget:=allowRetarget)
     Dim navJson As Object: Set navJson = ValidateProtocolResponse(strRes, "browsingContext.navigate")
 
-    ' WHY: cross-origin CDP session invalidation.
-    ' If the navigation target is a different origin, the CDP session attached to
-    ' the previous document is no longer valid. Clearing m_cdpSessionId forces
-    ' lazy re-acquisition via GetCdpSessionId on the next CDP command.
-    ' We extract the post-navigation URL from the BiDi response ("result.url")
-    ' instead of calling GetCurrentUrl(), for the same safety reasons as above.
+    ' Compare the response URL with the captured target origin and drop the cached CDP
+    ' session on cross-origin completion.
     Dim postNavUrl As String
     postNavUrl = GetPathString(navJson, "result.url")
     Dim postNavOrigin As String
@@ -1126,13 +841,9 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
         End If
     End If
 
-    ' Stability Consensus Phase (BEST-EFFORT).
-    ' INVARIANT: the navigate command already committed above, so a failure in the
-    ' post-navigate settle must NOT be reported as a navigation failure -- otherwise
-    ' ExecuteNavigateAndGetStatus would re-send a navigation that already succeeded
-    ' (double download / one-time-URL reuse / duplicate SPA init). Only ERR_CONSENSUS_HALT
-    ' propagates (a network that never settles is a loud stop); every other settle error
-    ' is swallowed, mirroring TrySyncPhase's best-effort contract.
+    ' Once navigate commits, post-navigation settling is best-effort. Reporting an ordinary
+    ' settle failure as navigation failure could replay a successful navigation. Only
+    ' ERR_CONSENSUS_HALT propagates.
     If LCase(waitMode) = "complete" Then
         On Error GoTo SettleErr
         Me.WaitForUrlStability targetCtx, 1000, maxTimeoutMs
@@ -1152,13 +863,11 @@ SettleErr:
         On Error GoTo 0
         Err.Raise haltNum, haltSrc, haltDesc
     End If
-    ' Navigate committed; the settle failure is advisory only.
     If m_debugMode Then Debug.Print "BiDi: navigate settle best-effort skip: " & Err.description
     On Error GoTo 0
     ExecuteBrowsingContextNavigate = strRes
 End Function
 
-' [PUBLIC] ExecuteClickByXPath
 Public Function ExecuteClickByXPath(ByVal xpath As String, _
                                     Optional ByVal searchTimeoutMs As Long = 10000, _
                                     Optional ByVal waitNetworkIdle As Boolean = True, _
@@ -1175,7 +884,6 @@ Public Function ExecuteClickByXPath(ByVal xpath As String, _
     Dim args As New Collection
     Dim arg1 As New Dictionary: arg1.Add "sharedId", sharedId: args.Add arg1
 
-    '    The checkUrl flag is passed down to SyncAfterAction to determine the wait strategy.
     ExecuteClickByXPath = ExecuteBaseAction(targetCtx, _
                                             "click", _
                                             args, _
@@ -1187,7 +895,6 @@ Public Function ExecuteClickByXPath(ByVal xpath As String, _
                                             checkUrl)
 End Function
 
-' [PUBLIC] ExecuteInputValueByXPath
 Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
                                          ByVal valueToSet As String, _
                                          Optional ByVal searchTimeoutMs As Long = 10000, _
@@ -1208,54 +915,37 @@ Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
     Dim a2 As New Dictionary: a2.Add "type", "string": a2.Add "value", valueToSet: args.Add a2
 
     If useNativeKeys Then
-        ' NATIVE KEYS MODE: Synthesized keyboard events via BiDi input.performActions.
-        ' Equivalent to W3C Classic "Element Send Keys" -- fires real keydown/keypress/
-        ' keyup so separator characters (e.g. ';') and Enter are recognized by host
-        ' widgets such as Outlook's People Picker. Whole string is sent in one call,
-        ' which is dramatically faster than the per-character execCommand polling in
-        ' KEY EVENTS MODE below.
-        '
-        ' Phase 1: focus the target by clicking it (re-uses standard click pipeline).
         Dim focusArgs As New Collection
         Dim fDic As New Dictionary: fDic.Add "sharedId", sharedId: focusArgs.Add fDic
         Call ExecuteBaseAction(targetCtx, "click", focusArgs, False, minStableMs, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
         
-        ' Phase 2: dispatch keystrokes via input.performActions on the active element.
         ExecuteInputValueByXPath = PerformNativeKeyInput(targetCtx, valueToSet, maxTimeoutMs, waitNetworkIdle, minStableMs)
         If m_debugMode Then Debug.Print "BiDi: Action 'native_keys' completed."
     ElseIf Not useKeyEvents Then
-        ' FAST MODE: Bulk execCommand('insertText') via standard pipeline.
         ExecuteInputValueByXPath = ExecuteBaseAction(targetCtx, "input", args, waitNetworkIdle, minStableMs, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
     Else
-        ' KEY EVENTS MODE: Bypasses ExecuteBaseAction to prevent SPA probe/sync
-        ' from interfering with the combobox active state. The entire
-        ' click -> delete -> type sequence runs as one uninterrupted JS function.
-        '
         Dim keySafetyMs As Long
         keySafetyMs = maxTimeoutMs
         If keySafetyMs < 20000 Then keySafetyMs = 20000
         
-        ExecuteInputValueByXPath = CallScript( _
+        Dim keyResult As String
+        keyResult = CallScript( _
             GetActionJs("input_keys"), args, targetCtx, False, False, keySafetyMs, _
             allowAmbiguousRetry:=False)
+
+        ' Key-events mode bypasses ExecuteBaseAction only during its uninterrupted JS sequence;
+        ' it must still run post-action sync so any Arm* signal is consumed by this action.
+        Dim vStable As Long
+        Dim vTimeout As Long
+        vStable = SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS)
+        vTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
+        Call TrySyncPhase(targetCtx, waitNetworkIdle, vStable, vTimeout, False)
+
+        ExecuteInputValueByXPath = keyResult
         If m_debugMode Then Debug.Print "BiDi: Action 'input_keys' completed."
     End If
 End Function
 
-' [PUBLIC] ExecuteSetFilesByXPath
-' SUMMARY : Attaches one or more local files to a <input type="file"> element via
-'           the BiDi 'input.setFiles' command. Dedicated method -- analogous to
-'           the W3C Classic UploadFile / SendKeys-on-file-input behavior.
-'
-'           No file picker dialog is shown: the browser registers the files
-'           directly as if the user had selected them in the OS file dialog.
-'
-' filePaths accepts:
-'   - String                          : single absolute file path
-'   - String containing vbLf / vbCrLf : multiple paths (Excel "Alt+Enter" cells)
-'   - Variant array (e.g. Array(...)) : multiple paths
-'
-' Multi-file support requires the target <input> to carry the 'multiple' attribute.
 Public Function ExecuteSetFilesByXPath(ByVal xpath As String, _
                                        ByVal filePaths As Variant, _
                                        Optional ByVal searchTimeoutMs As Long = 10000, _
@@ -1276,10 +966,6 @@ Public Function ExecuteSetFilesByXPath(ByVal xpath As String, _
     If m_debugMode Then Debug.Print "BiDi: Action 'set_files' completed."
 End Function
 
-' [INTERNAL] NormalizeFilePaths
-' Converts caller-supplied value (String, Variant array, or vbLf-delimited String)
-' into a clean VBA String array of trimmed, non-empty paths. Handles Excel
-' "Alt+Enter" multi-line cells via vbLf / vbCrLf splitting.
 Private Function NormalizeFilePaths(ByVal value As Variant) As Variant
     Dim out() As String
     Dim count As Long: count = 0
@@ -1316,18 +1002,6 @@ Private Function NormalizeFilePaths(ByVal value As Variant) As Variant
     End If
 End Function
 
-' [INTERNAL] PerformSetFiles
-' SUMMARY : Attaches one or more local files to a <input type="file"> element via
-'           the BiDi 'input.setFiles' command. Equivalent in spirit to the W3C
-'           Classic "Element Send Keys" file-upload mode -- caller just passes
-'           file paths and the browser registers them as if the user picked them
-'           via the OS file dialog.
-'
-' NOTES   : - The 'files' parameter is a JSON array of absolute path strings on
-'             the local filesystem (as seen by the browser process).
-'           - input.setFiles is the ONLY supported way to attach multiple files
-'             at once via BiDi; SendKeys-style newline-separated paths are not
-'             portable. This function shields callers from that distinction.
 Private Function PerformSetFiles(ByVal contextId As String, _
                                  ByVal sharedId As String, _
                                  ByVal paths As Variant, _
@@ -1335,7 +1009,6 @@ Private Function PerformSetFiles(ByVal contextId As String, _
                                  Optional ByVal waitNetworkIdle As Boolean = True, _
                                  Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS) As String
     
-    ' Guard: empty path list is a programmer error; surface it explicitly.
     If Not IsArray(paths) Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:PerformSetFiles", "Internal: paths must be an array."
     End If
@@ -1349,7 +1022,6 @@ Private Function PerformSetFiles(ByVal contextId As String, _
         files.Add CStr(paths(i))
     Next i
     
-    '    { context, element: { sharedId }, files: [...] }
     Dim elemRef As New Dictionary
     elemRef.Add "sharedId", sharedId
     
@@ -1358,15 +1030,12 @@ Private Function PerformSetFiles(ByVal contextId As String, _
     params.Add "element", elemRef
     params.Add "files", files
     
-    ' Dispatch via the standard wrapper (gets retry / context recovery for free).
     Dim strRes As String
     strRes = ExecuteBiDiCommand("input.setFiles", params, _
                                 allowAmbiguousRetry:=False, allowContextRetarget:=(contextId = m_mainContextId))
-    ' Validate: a setFiles error JSON must not pass as success into the SPA wait.
+    ' Validate setFiles before SPA synchronization; an error JSON is not successful upload.
     ValidateProtocolResponse strRes, "input.setFiles"
     
-    ' Optional: wait for the page to settle after the attachment registers
-    '    (file picker close, network probe for inline upload, etc.).
     If waitNetworkIdle Then
         WaitForNetworkIdleSpa minStableMs, maxTimeoutMs, contextId
     End If
@@ -1374,23 +1043,6 @@ Private Function PerformSetFiles(ByVal contextId As String, _
     PerformSetFiles = strRes
 End Function
 
-' [INTERNAL] PerformNativeKeyInput
-' SUMMARY : Dispatches a string as synthesized keyboard events to the active element
-'           via the BiDi 'input.performActions' command. Equivalent in behavior to
-'           the W3C Classic "Element Send Keys" endpoint -- each character produces a
-'           real keydown / keyup pair, allowing separator keys (e.g. ';') and Enter
-'           to be recognized by host widgets (Outlook People Picker, autocomplete
-'           comboboxes, etc.) without requiring caller-side per-token loops.
-'
-' NOTES   : - The target element MUST already be focused (clicked) before this is
-'             called. Caller is responsible for that step.
-'           - 'input.performActions' targets the document's active element; there is
-'             no per-element targeting in the BiDi key input source by design.
-'           - Special tokens supported in 'text':
-'               vbCr / vbLf / vbCrLf        -> single Enter keystroke
-'               Chr(9)  (Tab)               -> Tab keystroke
-'               Chr(8)  (Backspace)         -> Backspace keystroke
-'             All other characters are sent as-is (one keyDown + keyUp per char).
 Private Function PerformNativeKeyInput(ByVal contextId As String, _
                                        ByVal text As String, _
                                        Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
@@ -1405,7 +1057,6 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
 
     For i = 1 To Len(text)
         If skipNext Then
-            ' Consume the LF half of a CRLF pair that was already emitted as Enter.
             skipNext = False
         Else
             ch = Mid$(text, i, 1)
@@ -1440,15 +1091,13 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
     params.Add "context", contextId
     params.Add "actions", sources
 
-    ' Dispatch via the standard wrapper (gets retry / context recovery for free).
     Dim strRes As String
     strRes = ExecuteBiDiCommand("input.performActions", params, _
                                 allowAmbiguousRetry:=False, allowContextRetarget:=(contextId = m_mainContextId))
-    ' A protocol error JSON is returned as-is by ExecuteBiDiCommand (only context-lost
-    ' is a failure), so validate before treating the key input as applied.
+    ' Validate performActions because ExecuteBiDiCommand otherwise returns non-context
+    ' protocol error JSON to the caller.
     ValidateProtocolResponse strRes, "input.performActions"
 
-    ' Optional: wait for the page to settle after the input burst.
     If waitNetworkIdle Then
         WaitForNetworkIdleSpa minStableMs, maxTimeoutMs, contextId
     End If
@@ -1456,10 +1105,6 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
     PerformNativeKeyInput = strRes
 End Function
 
-' [INTERNAL] AppendKeyStroke
-' Adds a (keyDown, keyUp) pair for the given single-character value to the actions
-' collection passed by reference. Centralizes the action shape so the main loop
-' stays focused on character classification.
 Private Sub AppendKeyStroke(ByRef actions As Collection, ByVal value As String)
     Dim dn As New Dictionary
     dn.Add "type", "keyDown"
@@ -1472,17 +1117,15 @@ Private Sub AppendKeyStroke(ByRef actions As Collection, ByVal value As String)
     actions.Add up
 End Sub
 
-' Fires a trusted pointer click only when the target (or a descendant) is topmost at its center.
-' Otherwise (covered/hidden) it node-addresses the correct target via an untrusted JS click.
+' Trusted click is used only when the target is topmost at its center; otherwise the
+' fallback is a node-addressed synthetic click.
 Private Function PerformTrustedClick(ByVal contextId As String, _
                                      ByVal args As Collection, _
-                                     ByVal timeout As Long) As String
+                                     ByVal TIMEOUT As Long) As String
 
     Dim elemArg As Object: Set elemArg = args(1)
     Dim sharedId As String: sharedId = CStr(elemArg("sharedId"))
 
-    ' Scroll + hit-test: is the target (or a descendant) topmost at its center?
-    ' Returns 'hit=1' or 'hit=0'.
     Dim verdict As String
     On Error Resume Next
     verdict = CStr(GetCleanResult(CallScript(HitTestJs(), args, contextId, True, , 5000)))
@@ -1490,7 +1133,6 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
     Dim onTarget As Boolean: onTarget = (InStr(verdict, "hit=1") > 0)
 
     If onTarget Then
-        ' --- Trusted click (origin = element, center) ---
         Dim ptrActions As New Collection
         ptrActions.Add BuildPointerMove(sharedId, 0, 0)
         ptrActions.Add BuildPointerButton("pointerDown", 0)
@@ -1514,38 +1156,26 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
         trustedOk = (tcErrNum = 0)
         On Error GoTo 0
         If trustedOk Then
-            ' ExecuteBiDiCommand only treats context-lost as failure, so a
-            ' performActions error JSON would otherwise pass as a successful click.
-            ' ValidateProtocolResponse raises on non-ignorable protocol errors.
+            ' Validate performActions; a protocol error JSON must not be treated as a click.
             ValidateProtocolResponse res, "input.performActions"
             If m_debugMode Then Debug.Print "BiDi: TRUSTED click (on-target)."
             PerformTrustedClick = res
             Exit Function
         End If
-        ' AMBIGUOUS OUTCOME: a soft timeout (604) / connection loss (600) means the trusted
-        ' pointer click may ALREADY have fired. Falling back to a JS click here would
-        ' double-click, so re-raise instead of falling through.
-        If IsAmbiguousOutcome(tcErrNum) Then Err.Raise tcErrNum, tcErrSrc, tcErrDesc
-        ' On-target but pointer failed for a NON-ambiguous reason (element moved, etc.):
-        ' the trusted click did not fire, so the node-click fallback below is safe.
+        ' Timeout or connection loss after dispatch is ambiguous: the pointer click may already
+        ' have fired, so never fall back to a second JS click.
+        If IsAmbiguousDispatchFailure(tcErrNum, tcErrSrc, tcErrDesc) Then Err.Raise tcErrNum, tcErrSrc, tcErrDesc
+        ' Fallback is safe only after a non-ambiguous pointer failure.
     Else
-        ' --- Covered/hidden: a coordinate click would hit the wrong (front)
-        '     element, so do NOT fire a trusted pointer here. ---
-        ' Default (lenient): node click below addresses the correct target (untrusted).
-        ' For strict mode (never click hidden/covered), enable instead:
-        '   Err.Raise ERR_ACTION_FAILED, "BiDi:PerformTrustedClick", _
-        '       "Target not hittable at center (covered/hidden)."
+        ' A covered target must not receive a coordinate click because it would hit the front
+        ' element; the default fallback addresses the intended node directly.
         If m_debugMode Then Debug.Print "BiDi: not on-target; node click fallback."
     End If
 
-    ' Node-addressed untrusted JS click: always hits the correct target.
-    ' Handles both "trusted unreachable" and "covered/hidden".
-    PerformTrustedClick = CallScript(GetActionJs("click"), args, contextId, True, , timeout, _
+    PerformTrustedClick = CallScript(GetActionJs("click"), args, contextId, True, , TIMEOUT, _
                                      allowAmbiguousRetry:=False)
 End Function
 
-' Add: scroll + center hit-test. 'hit=1' if target (or descendant) is topmost.
-' Recurses into shadow roots so custom-element overlays are detected.
 Private Function HitTestJs() As String
     Dim js As String
     js = "const e=arguments[0]; e.scrollIntoView({block:'center',inline:'center'}); "
@@ -1558,9 +1188,6 @@ Private Function HitTestJs() As String
     HitTestJs = js
 End Function
 
-' [INTERNAL] BuildPointerMove
-' Builds a BiDi 'pointerMove' action whose origin is the element referenced by
-' sharedId. x/y are offsets (CSS px) from the element's in-view center point.
 Private Function BuildPointerMove(ByVal sharedId As String, _
                                   ByVal x As Long, _
                                   ByVal y As Long) As Dictionary
@@ -1580,9 +1207,6 @@ Private Function BuildPointerMove(ByVal sharedId As String, _
     Set BuildPointerMove = mv
 End Function
 
-' [INTERNAL] BuildPointerButton
-' Builds a BiDi 'pointerDown' / 'pointerUp' action for the given mouse button
-' (0 = left, 1 = middle, 2 = right).
 Private Function BuildPointerButton(ByVal actionType As String, _
                                     ByVal button As Long) As Dictionary
     Dim a As New Dictionary
@@ -1591,9 +1215,6 @@ Private Function BuildPointerButton(ByVal actionType As String, _
     Set BuildPointerButton = a
 End Function
 
-' [PUBLIC] ExecuteSelectValueByXPath (Upgraded: Auto-Detect Hybrid Engine)
-'  Centrally handles both standard HTML <select> tags and semantic pseudo
-'              dropdowns (Wiz/React comboboxes) seamlessly without user awareness.
 Public Function ExecuteSelectValueByXPath(ByVal xpath As String, _
                                           ByVal valueOrText As String, _
                                           Optional ByVal selectByText As Boolean = False, _
@@ -1611,20 +1232,13 @@ Public Function ExecuteSelectValueByXPath(ByVal xpath As String, _
     isStandardSelect = CBool(GetCleanResult(Me.CallScript("return arguments[0].tagName==='SELECT';", chkArgs, targetCtx, False, False, 2000, True)))
     
     If isStandardSelect Then
-        ' Path A: Native HTML <select> element tracking
         Dim jsKey As String: If selectByText Then jsKey = "select_text" Else jsKey = "select"
         Dim args As New Collection: args.Add tDic
         Dim a2 As New Dictionary: a2.Add "type", "string": a2.Add "value", valueOrText: args.Add a2
         ExecuteSelectValueByXPath = ExecuteBaseAction(targetCtx, jsKey, args, waitNetworkIdle, DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
     Else
-        ' Path B: Semantic Pseudo Dropdown element (Wiz/React / W3C Combobox)
-        ' Phase 1: Click the combo box wrapper to trigger option list population
         Dim clickArgs As New Collection: clickArgs.Add tDic
         Call ExecuteBaseAction(targetCtx, "click", clickArgs, True, DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
-        ' Phase 2: Resolve the dynamic option node and fire the final selection click
-        '   - No quotes:    'text'
-        '   - Single only:  "text"
-        '   - Both:         concat('part1',"'","part2")
         Dim optXPath As String: optXPath = "//*[@role='option'][contains(., " & EscapeXPathString(valueOrText) & ")]"
         Dim optSharedId As String: optSharedId = ResolveXPathOrThrow(optXPath, targetCtx, searchTimeoutMs, "ExecuteSelectValueByXPath")
         Dim optClickArgs As New Collection, oDic As New Dictionary: oDic.Add "sharedId", optSharedId: optClickArgs.Add oDic
@@ -1633,7 +1247,6 @@ Public Function ExecuteSelectValueByXPath(ByVal xpath As String, _
     
 End Function
 
-' Locator Helpers
 Private Function ExecuteBrowsingContextLocateNodes(ByVal xpath As String, _
                                                   Optional ByVal contextId As String = "", _
                                                   Optional ByVal Silent As Boolean = False) As String
@@ -1642,25 +1255,18 @@ Private Function ExecuteBrowsingContextLocateNodes(ByVal xpath As String, _
     locator.Add "type", "xpath": locator.Add "value", xpath
     params.Add "context", targetCtx: params.Add "locator", locator
     
-    ' Pass Silent flag down
     ExecuteBrowsingContextLocateNodes = ExecuteBiDiCommand("browsingContext.locateNodes", params, Silent, _
                                 allowContextRetarget:=(targetCtx = m_mainContextId))
 End Function
 
-' [INTERNAL] GetFindElementSharedIdByXPath
-'  Elements may not be ready immediately. This loop polls with a throttle
-'              to prevent CPU saturation and "Unresponsive" Excel state.
 Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
                                                ByVal searchTimeoutMs As Long, _
                                                ByVal targetCtx As String) As String
     
-    ' 1. Logic Guard: Determine if this is an immediate (one-shot) check.
-    ' IMPORTANT: We must check the ORIGINAL searchTimeoutMs here.
-    ' SanitizeMs will enforce a minimum floor (e.g., 50ms), which would otherwise
-    ' make (vTimeoutMs <= 0) always False.
+    ' Test the original timeout before SanitizeMs; otherwise the exact-zero one-shot path
+    ' would be converted to the minimum polling interval.
     Dim isImmediate As Boolean: isImmediate = (searchTimeoutMs <= 0)
     
-    ' 2. Sanitization: Ensure a valid timeout for the IsTimeout comparison.
     Dim vTimeoutMs As Long: vTimeoutMs = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
     Dim startTick As Currency: startTick = socket_.NowTicks()
     Dim strRes As String, json As Object, nodes As Collection
@@ -1674,8 +1280,6 @@ Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
     Do
         attemptCount = attemptCount + 1
         
-        ' --- Step A: Navigation Guard ---
-        ' Abort search every 5 attempts if the tab has navigated to a blank/invalid page.
         If attemptCount Mod 5 = 0 Then
             Dim currentUrl As String: currentUrl = GetCurrentUrl(targetCtx, True)
             If InStr(1, currentUrl, "about:blank", vbTextCompare) > 0 Or currentUrl = "" Then
@@ -1684,47 +1288,34 @@ Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
             End If
         End If
 
-        ' --- Step B: Protocol Search ---
-        ' Use Silent:=True to prevent log flooding during high-speed polling.
         strRes = ExecuteBrowsingContextLocateNodes(xpath, targetCtx, True)
         Set json = WebJsonConverter.ParseJson(strRes)
         Set nodes = GetPathObject(json, "result.nodes")
 
-        ' --- Step C: Result Extraction ---
         If Not nodes Is Nothing Then
             If nodes.count > 0 Then
                 If nodes(1).Exists("sharedId") Then
                     sid = CStr(nodes(1)("sharedId"))
-                    ' SUCCESS: Return the ID and exit immediately.
                     GetFindElementSharedIdByXPath = sid
                     Exit Function
                 End If
             End If
         End If
 
-        ' --- Step D: Exit Strategy ---
-        ' If 0ms (or less) was requested, exit NOW without hitting WaitHeartbeat.
         If isImmediate Then Exit Do
 
-        ' Yield control to Windows and process background socket messages.
-        ' Using 500ms for element discovery polling is a balanced trade-off
-        ' between CPU usage and responsiveness.
         WaitHeartbeat 500
         
-        ' Standard Timeout Check for designated wait periods.
         If IsTimeout(startTick, CDbl(vTimeoutMs)) Then Exit Do
     Loop
     
-    ' FAILURE: Return empty string if not found within the designating window.
     GetFindElementSharedIdByXPath = ""
 End Function
 
-' [PUBLIC] GetCurrentUrl (Robust Version)
 Public Function GetCurrentUrl(Optional ByVal contextId As String = "", _
                               Optional ByVal Silent As Boolean = False) As String
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
-    ' Relay the Silent flag to the 7th parameter (Silent) of CallScript
     Dim strRes As String: strRes = CallScript("return window.location.href;", Nothing, targetCtx, False, False, 10000, Silent)
     
     GetCurrentUrl = CStr(GetCleanResult(strRes))
@@ -1735,11 +1326,12 @@ Public Function ExecuteWebExtensionInstall(ByVal extensionPath As String) As Str
     extData.Add "type", "path"
     extData.Add "path", extensionPath
     params.Add "extensionData", extData
-    ExecuteWebExtensionInstall = ExecuteBiDiCommand("webExtension.install", params, allowAmbiguousRetry:=False)
+    Dim strRes As String
+    strRes = ExecuteBiDiCommand("webExtension.install", params, allowAmbiguousRetry:=False)
+    ValidateProtocolResponse strRes, "webExtension.install"
+    ExecuteWebExtensionInstall = strRes
 End Function
 
-' [PUBLIC] ExecuteShadowClick
-'  Penetrates Shadow DOM boundaries to click a nested element.
 Public Function ExecuteShadowClick(ByVal selectorsArray As Variant, _
                                    Optional ByVal searchTimeoutMs As Long = 10000, _
                                    Optional ByVal waitNetworkIdle As Boolean = True, _
@@ -1747,55 +1339,24 @@ Public Function ExecuteShadowClick(ByVal selectorsArray As Variant, _
                                    Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                    Optional ByVal contextId As String = "") As String
     
-    ' --- Input Validation Layer ---
-    ' 1. Validate searchTimeoutMs locally because it bypasses the ResolveXPath bottleneck.
     Dim vSearchTimeout As Long: vSearchTimeout = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 5000)
     
-    ' 2. Validation for other parameters will be handled by ExecuteBaseAction,
-    '    but we pass minStableMs and maxTimeoutMs directly through.
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
-    ' Prepare JS arguments: [selectorsArray, searchTimeout]
     Dim args As New Collection
     args.Add BuildShadowSelectorArg(selectorsArray)
     
-    ' Use the validated vSearchTimeout for the browser-side script
     Dim argTime As New Dictionary
     argTime.Add "type", "number": argTime.Add "value", vSearchTimeout
     args.Add argTime
     
-    ' Execute via Master Runner (vMinStable and vMaxTimeout are validated inside this call)
     ExecuteShadowClick = ExecuteBaseAction(targetCtx, "shadow_click", args, waitNetworkIdle, minStableMs, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
 End Function
 
-' =====================================================================
-' [PUBLIC] ExecuteLazyLoadScroll
-'   Drives a Lazy-Load / infinite-scroll page to the bottom, then (by
-'   default) does a best-effort SPA-quiescence wait so late chunks are likely present.
-'
-'   DESIGN (Plan A - reuse existing assets):
-'     * The "lazy_scroll" JS owns ONLY the scroll-loop control: it keeps
-'       jumping to the page bottom until scrollHeight stops growing.
-'     * The best-effort SPA-quiescence assessment is delegated
-'       to WaitForNetworkIdleSpa (triggered via waitNetworkIdle=True inside
-'       ExecuteBaseAction), which already consenses on network silence +
-'       MutationObserver quiescence through the installed __vbaIdleProbe.
-'
-'   CRITICAL TIMING CONTRACT:
-'     ExecuteBaseAction feeds maxTimeout into BOTH the JS safety shell
-'     (CallScript safetyTimeoutMs) AND the trailing WaitForNetworkIdleSpa.
-'     Therefore the JS scroll budget MUST stay strictly below maxTimeout,
-'     or the Safety Shell may stop waiting and report VBA_TIMEOUT while the
-'     browser-side scroll task keeps running. We enforce a margin
-'     below and auto-raise maxTimeout when needed so callers can't foot-gun.
-'
-'   PARAMS:
-'     scrollTimeoutMs  - max time the JS scroll loop may run (browser-side).
-'     waitNetworkIdle  - if True, run WaitForNetworkIdleSpa after scrolling.
-'     minStableMs      - idle-consensus stability window for the SPA wait.
-'     maxTimeoutMs     - overall safety/sync ceiling (see timing contract).
-'     contextId        - target tab/window; "" = active context.
-' =====================================================================
+' Lazy scrolling delegates only the scroll loop to JS; final quiescence remains the
+' SPA-idle wait. The JS budget must stay below the Safety Shell timeout because a shell
+' timeout stops waiting but does not cancel the browser task. Auto-reserve headroom to
+' avoid an ambiguous still-running scroll.
 Public Function ExecuteLazyLoadScroll(Optional ByVal scrollTimeoutMs As Long = 20000, _
                                       Optional ByVal waitNetworkIdle As Boolean = True, _
                                       Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
@@ -1805,9 +1366,6 @@ Public Function ExecuteLazyLoadScroll(Optional ByVal scrollTimeoutMs As Long = 2
 
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
 
-    ' --- [POLL GUARD] Validate scrollPollMs range ---
-    ' Too short: scrollHeight re-measured before fetch completes -> premature bottom detection.
-    ' Too long : scroll budget (scrollTimeoutMs) consumed by waits, fewer scroll iterations.
     Const MIN_POLL_MS As Long = 100
     Const MAX_POLL_MS As Long = 5000
     If scrollPollMs < MIN_POLL_MS Or scrollPollMs > MAX_POLL_MS Then
@@ -1815,12 +1373,8 @@ Public Function ExecuteLazyLoadScroll(Optional ByVal scrollTimeoutMs As Long = 2
                   "scrollPollMs must be between " & MIN_POLL_MS & " and " & MAX_POLL_MS & "ms. Got: " & scrollPollMs
     End If
 
-    ' --- [TIMING GUARD] Keep the JS scroll budget strictly inside the safety ceiling ---
-    ' The scroll loop runs inside the CallScript safety shell whose timeout == maxTimeout.
-    ' If scrollTimeoutMs were >= maxTimeoutMs, the wrapper could stop waiting
-    ' before the scroll task returns, leaving an ambiguous still-running task.
-    ' We reserve SCROLL_SAFETY_MARGIN_MS as headroom for the final scrollTo(0,0) + return,
-    ' and auto-raise maxTimeout if the caller under-provisioned it.
+    ' Keep scrollTimeoutMs strictly below maxTimeoutMs so the browser task can return before
+    ' the Safety Shell stops waiting.
     Const SCROLL_SAFETY_MARGIN_MS As Long = 5000
     Dim vScrollTimeout As Long: vScrollTimeout = SanitizeMs(scrollTimeoutMs, "scrollTimeoutMs", 20000)
     Dim vMaxTimeout As Long:    vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
@@ -1832,9 +1386,6 @@ Public Function ExecuteLazyLoadScroll(Optional ByVal scrollTimeoutMs As Long = 2
                         "ms to fit scroll budget (" & vScrollTimeout & "ms) + margin."
     End If
 
-    ' JS args:
-    '   arguments[0] = scrollTimeoutMs : max scroll-loop budget (ms)
-    '   arguments[1] = scrollPollMs    : per-iteration wait after scrollTo (ms)
     Dim args As New Collection
     Dim argTimeout As New Dictionary
     argTimeout.Add "type", "number": argTimeout.Add "value", vScrollTimeout
@@ -1843,9 +1394,7 @@ Public Function ExecuteLazyLoadScroll(Optional ByVal scrollTimeoutMs As Long = 2
     argPoll.Add "type", "number": argPoll.Add "value", scrollPollMs
     args.Add argPoll
 
-    ' awaitPromise=True is mandatory: the lazy_scroll JS is async (await inside the loop).
-    ' Passing waitNetworkIdle through lets ExecuteBaseAction run WaitForNetworkIdleSpa
-    ' afterwards; a non-HALT sync timeout is advisory and does not invalidate the scroll.
+    ' awaitPromise must remain True because the scroll action is asynchronous.
     ExecuteLazyLoadScroll = ExecuteBaseAction(targetCtx, "lazy_scroll", args, _
                                               waitNetworkIdle, minStableMs, True, _
                                               DEFAULT_STALE_RETRIES, vMaxTimeout)
@@ -1858,7 +1407,6 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                                      Optional ByVal allowRecoveryRetry As Boolean = True, _
                                      Optional ByVal allowContextRetarget As Boolean = True) As String
     
-    ' Guard: Ensure the communication socket is available.
     If socket_ Is Nothing Then Err.Raise 91, "ExecuteBiDiCommand", "Socket object is not set."
 
     Dim retryCount As Long
@@ -1866,83 +1414,50 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
     Dim localErrNum As Long
     Dim localErrDesc As String
     
-    ' Retry Loop: Attempt to recover from transient environment or socket failures.
     Do While retryCount <= MAX_CONTEXT_RECOVERY_RETRIES
         
-        ' 1. Delegate ID generation, payload construction, size validation,
-        '    serialization, and transmission to Communicator's SendCommand.
-        '    Logging is also handled by SendCommand when Silent=False.
         On Error Resume Next
         strRes = socket_.SendCommand(method, params, Silent)
         localErrNum = Err.Number: localErrDesc = Err.description
         On Error GoTo 0
         
-        ' 2. Protocol & Business Validation
         If localErrNum = 0 Then
-            ' Check for "Context Lost" errors which indicate the tab/frame was destroyed.
             If IsContextLostError(strRes) Or (InStr(1, strRes, "chrome-error", vbTextCompare) > 0) Then
                 localErrNum = ERR_BIDI_PROTOCOL
                 localErrDesc = "Environment desync (Context Lost) detected in response."
-                ' Flush validated-context cache so a dead entry can't be reused;
-                ' each context is re-checked against the tree on next use.
                 Set m_validatedContexts = New Dictionary
             End If
             
-            ' SUCCESS PATH: If no errors occurred during transmission and validation.
             If localErrNum = 0 Then
-                ' Clear the internal error counter of the socket upon a verified healthy response.
                 socket_.ClearInternalErrorCounter
                 ExecuteBiDiCommand = strRes
                 
-                ' Exit the function immediately to prevent reaching the recovery block.
                 Exit Function
             End If
         End If
 
-        ' --- FAIL-FAST LOGIC ---
-        ' If the error is an explicit action failure (e.g., Element not found),
-        ' do NOT attempt recovery. Stop the loop and propagate the error immediately.
         If localErrNum = ERR_ACTION_FAILED Then Exit Do
 
-        ' --- AMBIGUOUS-OUTCOME GUARD (non-idempotent callers pass allowAmbiguousRetry:=False) ---
-        ' A soft timeout (604), connection-loss (600), send-failure (601) or Safety-Shell
-        ' timeout (517) all mean the command was SENT but its outcome is unknown -- the
-        ' browser may have already executed it (all four are in IsAmbiguousOutcome).
-        ' Context-lost (ERR_BIDI_PROTOCOL) is ALSO ambiguous for a state-changing op: a
-        ' click / navigate can SUCCEED and thereby destroy its own document / Realm /
-        ' context, so a context-lost response does NOT prove the action did not run.
-        ' Re-sending any of these risks a DOUBLE action, so non-idempotent callers stop
-        ' and propagate. Idempotent callers (allowAmbiguousRetry:=True) keep self-healing
-        ' on context-lost through the recovery block below.
+        ' Ambiguous outcomes for state-changing commands include 604, 600, 601, 517, and
+        ' context loss after dispatch. The browser may already have executed the action, so
+        ' allowAmbiguousRetry=False must stop rather than risk a duplicate click/input/navigation.
         If Not allowAmbiguousRetry And _
            (IsAmbiguousOutcome(localErrNum) Or localErrNum = ERR_BIDI_PROTOCOL) Then Exit Do
 
-        ' --- RECOVERY-RETRY GUARD (non-retargetable callers pass allowRecoveryRetry:=False) ---
-        ' browsingContext.close targets a SPECIFIC context that is being destroyed. The
-        ' recovery block below rewrites params("context") to the refreshed MAIN context,
-        ' so ANY retry -- ambiguous (604/600) OR context-lost (ERR_BIDI_PROTOCOL) -- would
-        ' re-issue the command against the WRONG context (e.g. close the surviving tab).
-        ' Callers that must never be retargeted disable recovery retry entirely.
+        ' Commands bound to a specific disappearing context (notably close) disable recovery
+        ' retry because the generic recovery path may retarget parameters to the surviving main
+        ' context and act on the wrong tab.
         If Not allowRecoveryRetry Then Exit Do
 
-        ' --- CONTEXT-RETARGET GUARD (explicit non-main callers pass allowContextRetarget:=False) ---
-        ' If retargeting to MAIN is forbidden and the failure is a context-lost, both
-        ' options are wrong: retrying hits the same dead context, and retargeting would
-        ' hijack the surviving main tab. Stop and surface the error to the caller.
+        ' When main retargeting is forbidden, context loss is terminal: retrying the dead target
+        ' and hijacking the main target are both incorrect.
         If Not allowContextRetarget And localErrNum = ERR_BIDI_PROTOCOL Then Exit Do
 
-        ' --- RECOVERY LOGIC ---
-        ' If we haven't exhausted our retries, attempt to heal the environment.
         If retryCount < MAX_CONTEXT_RECOVERY_RETRIES And Not m_isRecovering Then
             
-            ' Pre-recovery check: fast-fail ONLY when recovery is genuinely impossible --
-            ' the socket is down AND auto-reconnect is disabled. With auto-reconnect on
-            ' (the default self-healing config) do NOT abort here: the recovery path below
-            ' and SendCommand/SendAndReceive on the retry drive AttemptRecovery, so a
-            ' transient drop or post-hard-timeout state can still heal within this command.
-            ' State-changing commands are already protected from double execution by the
-            ' ambiguous-outcome guard above, so letting recovery proceed cannot re-fire a
-            ' click/keystroke/navigation.
+            ' If auto-reconnect is enabled, recovery may continue for retry-safe commands even when
+            ' the socket is currently down. Non-idempotent commands have already been stopped by the
+            ' ambiguous-outcome guard.
             If Not socket_.IsConnected And Not socket_.AutoReconnect Then
                 Debug.Print "BiDi [FATAL]: Socket down and auto-reconnect disabled. Aborting command retries."
                 Exit Do
@@ -1950,62 +1465,50 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
             
             m_isRecovering = True
             
-            ' Progressive Wait: Increase wait time based on the retry attempt.
             WaitHeartbeat 800 * (retryCount + 1)
             
             If m_debugMode Then
                 Debug.Print "BiDi [RECOVERY]: Attempting to refresh context (" & (retryCount + 1) & "/" & MAX_CONTEXT_RECOVERY_RETRIES & ")..."
             End If
             
-            ' Attempt to refresh the main context mapping silently.
             On Error Resume Next
             Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
             Dim recoveryErr As Long: recoveryErr = Err.Number
             On Error GoTo 0
             
-            ' If context refresh succeeded, update the IDs within the original 'params' dictionary.
             If recoveryErr = 0 Then
-                ' Retarget params("context") to the refreshed MAIN only when permitted.
-                ' Explicit non-main targets keep their original context (see guard above).
+                ' Retarget only when the caller explicitly permits main-context recovery.
                 If m_mainContextId <> "" And allowContextRetarget Then Call UpdateContextAndRealm(params, m_mainContextId)
                 m_isRecovering = False
                 retryCount = retryCount + 1
             Else
-                ' If we cannot even refresh the context tree, the session is likely unrecoverable.
                 Debug.Print "BiDi [RECOVERY FAIL]: Failed to identify any valid browsing context."
                 m_isRecovering = False
                 Exit Do
             End If
         Else
-            ' Max retries reached or already in a recovery state.
             Exit Do
         End If
     Loop
 
-    ' --- FINAL ERROR PROPAGATION ---
-    ' Ensure the total retry count and the last error message are propagated to the user.
     Err.Raise IIf(localErrNum = 0, ERR_ACTION_FAILED, localErrNum), _
               "BiDi:ExecuteBiDiCommand", _
               "Command '" & method & "' failed after " & retryCount & " recovery attempt(s). " & _
               "Last Error: " & localErrDesc
 End Function
 
-' INTERNAL HELPER: IsContextLostError (STRICT VERSION)
 Private Function IsContextLostError(ByVal response As String) As Boolean
-    ' Early Exit: If the word "result" exists at the root, it is a protocol SUCCESS.
     If InStr(1, response, """result"":", vbBinaryCompare) > 0 Then
         IsContextLostError = False
         Exit Function
     End If
 
-    ' Parse under OERN; if ParseJson fails, json remains Nothing and we exit.
     On Error Resume Next
     Dim json As Object: Set json = WebJsonConverter.ParseJson(response)
     On Error GoTo 0
     
     If json Is Nothing Then Exit Function
     
-    ' ONLY trigger if there is a root "error" key (BiDi Protocol level error)
     If json.Exists("error") And json.Exists("message") Then
         Dim errType As String: errType = LCase(CStr(json("error")))
         Dim errMsg As String: errMsg = LCase(CStr(json("message")))
@@ -2020,8 +1523,6 @@ Private Function IsContextLostError(ByVal response As String) As Boolean
     End If
 End Function
 
-' UpdateContextAndRealmRecursive: Recursively scans a node to update context and realm IDs.
-' This ensures that even deeply nested IDs in script arguments are refreshed after recovery.
 Private Function UpdateContextAndRealmRecursive(ByRef node As Variant, _
                                                 ByVal newCtx As String, _
                                                 Optional ByVal newRealm As String = "") As Boolean
@@ -2036,7 +1537,6 @@ Private Function UpdateContextAndRealmRecursive(ByRef node As Variant, _
                 ElseIf LCase(CStr(k)) = "realm" And Len(newRealm) > 0 Then
                     node(k) = newRealm
                 End If
-                ' Deep walk through nested parameters
                 Call UpdateContextAndRealmRecursive(node(k), newCtx, newRealm)
             Next k
             UpdateContextAndRealmRecursive = True
@@ -2044,7 +1544,6 @@ Private Function UpdateContextAndRealmRecursive(ByRef node As Variant, _
         ElseIf TypeName(node) = "Collection" Then
             Dim i As Long
             For i = 1 To node.count
-                ' Recurse through collection items
                 Call UpdateContextAndRealmRecursive(node(i), newCtx, newRealm)
             Next i
             UpdateContextAndRealmRecursive = True
@@ -2060,11 +1559,9 @@ ErrH:
     UpdateContextAndRealmRecursive = False
 End Function
 
-' UpdateContextAndRealm: Entry point for refreshing IDs within a parameter dictionary.
 Private Function UpdateContextAndRealm(ByRef params As Dictionary, ByVal newCtx As String) As Boolean
     On Error GoTo ErrorHandler
     
-    ' Fetch a fresh Realm ID silently to prevent log spam during recovery
     Dim newRealm As String
     newRealm = GetScriptRealmId(newCtx, True, True) ' Silent:=True
     
@@ -2073,7 +1570,6 @@ Private Function UpdateContextAndRealm(ByRef params As Dictionary, ByVal newCtx 
         Exit Function
     End If
 
-    ' Delegate to the recursive walker to update all instances of context/realm keys
     UpdateContextAndRealm = UpdateContextAndRealmRecursive(params, newCtx, newRealm)
     Exit Function
 
@@ -2081,50 +1577,34 @@ ErrorHandler:
     UpdateContextAndRealm = False
 End Function
 
-' ClearState: Resets internal state and cleans up browser-side side effects.
 Public Sub ClearState()
     m_cdpSessionId = ""
     m_mainContextId = ""
     
 
-    ' INVARIANT (JIT INIT): use New Dictionary instead of Nothing for m_cachedRealmIds.
-    ' Prevents Error 424 if other methods access the cache before JIT initialization.
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
 
-    ' Reset the subscription registry.
-    ' Using a New Dictionary ensures that the wrapper re-subscribes on the next connection.
     Set m_activeSubscriptions = New Dictionary
     
-    ' Reset blocking pattern tracker. The CDP-side block list dies with the
-    ' WebSocket connection, so we just drop the local tokens used to classify
-    ' fetchError events as blocker-induced.
     Set m_blockingPatterns = New Collection
     
-    ' Reset the completion-signal gate. Browser-side observers die with the
-    ' page/connection; only the local flags need clearing here.
+    ' Clear local completion flags because page/connection loss destroys browser observers.
     ResetSignalState
 
-    ' Reset HUD fingerprint cache so the next UpdateWaitTelemetry re-emits the payload.
     m_lastHudKey = ""
     m_lastHudCtx = ""
     m_lastHudRetryTick = 0
 End Sub
 
-' FUNCTION: GetMainContextId
-'  Returns the currently active main context ID.
-'              If not yet set, it triggers a discovery of the browser tree.
 Public Function GetMainContextId() As String
     If m_mainContextId = "" Then
-        ' MACHINERY: Pass True to the 'Silent' parameter to hide id:2
         GetMainContextId = UpdateMainContextId(True, True)
     Else
         GetMainContextId = m_mainContextId
     End If
 End Function
 
-' FUNCTION: UpdateMainContextId
-'  Refreshes the browsing context tree. Raises error if no context is available.
 Public Function UpdateMainContextId(Optional ByVal forceRefresh As Boolean = False, _
                                     Optional ByVal Silent As Boolean = False) As String
                                     
@@ -2134,7 +1614,6 @@ Public Function UpdateMainContextId(Optional ByVal forceRefresh As Boolean = Fal
     End If
 
     Dim jsonRes As String
-    ' Suppress background noise during tree discovery
     jsonRes = ExecuteBiDiCommand("browsingContext.getTree", New Dictionary, Silent)
     
     Dim jsonTree As Object: Set jsonTree = WebJsonConverter.ParseJson(jsonRes)
@@ -2144,37 +1623,29 @@ Public Function UpdateMainContextId(Optional ByVal forceRefresh As Boolean = Fal
         m_mainContextId = contextId
         UpdateMainContextId = contextId
     Else
-        ' Error must be reported even if Silent is True
         Err.Raise ERR_ACTION_FAILED, "BiDi:UpdateMainContextId", "Failed to identify any browsing context."
     End If
 End Function
 
-' Resolves the target browsing context ID.
-' Returns the provided contextId if not empty, otherwise falls back to the main context.
 Private Function ResolveTargetContext(ByVal contextId As String) As String
-    ' Empty => cached main context (or discover one).
     If contextId = "" Then
         ResolveTargetContext = GetMainContextId()
         Exit Function
     End If
 
-    ' The main context is always valid; no tree lookup needed.
     If contextId = m_mainContextId Then
         ResolveTargetContext = contextId
         Exit Function
     End If
 
-    ' Fast path: skip the getTree round-trip for a context already validated
-    ' this session. Entries are dropped on navigationStarted for that context
-    ' and on context-lost in ExecuteBiDiCommand, and cleared by ClearState,
-    ' mirroring the m_cachedRealmIds lifecycle.
+    ' Validated-context cache entries are dropped on navigation, context loss, and ClearState;
+    ' only then is skipping getTree safe.
     If m_validatedContexts Is Nothing Then Set m_validatedContexts = New Dictionary
     If m_validatedContexts.Exists(contextId) Then
         ResolveTargetContext = contextId
         Exit Function
     End If
 
-    ' First use: validate once against the live tree, then cache.
     Dim treeJson As String
     treeJson = ExecuteBiDiCommand("browsingContext.getTree", New Dictionary, True)
     If InStr(1, treeJson, contextId, vbTextCompare) > 0 Then
@@ -2187,9 +1658,6 @@ Private Function ResolveTargetContext(ByVal contextId As String) As String
     End If
 End Function
 
-' FUNCTION: GetScriptRealmId (Improved for Service Worker environments)
-'  Retrieves and caches the Execution Realm ID for a specific context.
-'              Prioritizes "window" type realms to ensure UI/DOM script compatibility.
 Private Function GetScriptRealmId(Optional ByVal contextId As String = "", _
                                  Optional ByVal forceRefresh As Boolean = False, _
                                  Optional ByVal Silent As Boolean = False) As String
@@ -2197,10 +1665,8 @@ Private Function GetScriptRealmId(Optional ByVal contextId As String = "", _
     If contextId <> "" Then targetCtx = contextId Else targetCtx = GetMainContextId()
     If targetCtx = "" Then Exit Function
 
-    ' Initialize the cache dictionary JIT (Just-In-Time)
     If m_cachedRealmIds Is Nothing Then Set m_cachedRealmIds = New Dictionary
 
-    ' Check for context-specific cached realm ID
     If Not forceRefresh Then
         If m_cachedRealmIds.Exists(targetCtx) Then
             GetScriptRealmId = m_cachedRealmIds(targetCtx)
@@ -2213,7 +1679,6 @@ Private Function GetScriptRealmId(Optional ByVal contextId As String = "", _
     
     Dim jsonRes As String
     On Error Resume Next
-    ' RELAY: Pass the Silent flag to suppress REQ/RES logs for realm discovery
     jsonRes = ExecuteBiDiCommand("script.getRealms", params, Silent, _
                                 allowContextRetarget:=(targetCtx = m_mainContextId))
     Dim realmErr As Long: realmErr = Err.Number
@@ -2239,19 +1704,16 @@ Private Function GetScriptRealmId(Optional ByVal contextId As String = "", _
             Dim r As Dictionary
             For Each r In realms
                 If r.Exists("type") Then
-                    ' Priority: Window realms are standard for DOM manipulation
                     If r("type") = "window" Then
                         foundRealmId = CStr(r("realm"))
                         Exit For
                     End If
                 End If
             Next r
-            ' Fallback: Use the first available realm if no window realm is found
             If foundRealmId = "" Then foundRealmId = CStr(realms(1)("realm"))
         End If
     End If
     
-    ' Cache the found Realm ID using the contextId as the unique key
     If foundRealmId <> "" Then
         m_cachedRealmIds(targetCtx) = foundRealmId
     End If
@@ -2259,7 +1721,6 @@ Private Function GetScriptRealmId(Optional ByVal contextId As String = "", _
     GetScriptRealmId = foundRealmId
 End Function
 
-' Gets the current CDP session ID, creating a new one if necessary.
 Private Function GetCdpSessionId(Optional ByVal forceUpdate As Boolean = False) As String
     If m_mainContextId = "" Then UpdateMainContextId True, True
     
@@ -2269,7 +1730,6 @@ Private Function GetCdpSessionId(Optional ByVal forceUpdate As Boolean = False) 
 
     Dim params As New Dictionary: params.Add "context", m_mainContextId
     
-    ' Execute BiDi command Silently to hide internal session acquisition
     Dim strRes As String: strRes = ExecuteBiDiCommand("goog:cdp.getSession", params, True)
     Dim json As Object: Set json = WebJsonConverter.ParseJson(strRes)
     Dim sessionId As String: sessionId = GetPathString(json, "result.session")
@@ -2281,8 +1741,6 @@ Private Function GetCdpSessionId(Optional ByVal forceUpdate As Boolean = False) 
     End If
 End Function
 
-' FUNCTION: DetachCurrentCdpSession
-'  Manually releases the CDP tunnel. Useful for switching contexts or resetting.
 Public Sub DetachCurrentCdpSession()
     If m_cdpSessionId = "" Then Exit Sub
     
@@ -2296,36 +1754,20 @@ Public Sub DetachCurrentCdpSession()
     m_consecutiveCdpFailures = 0
 End Sub
 
-' [PUBLIC] ExecuteRegisterAutoClickerByXPath
-'  Registers a background observer via BiDi preloadScript to click a button
-'              as soon as it appears.
-'
-' MIGRATION    : Replaces CDP Page.addScriptToEvaluateOnNewDocument with
-'                BiDi script.addPreloadScript. This eliminates the last
-'                CDP dependency outside of resource blocking, putting the
-'                wrapper one step closer to full BiDi-only operation once
-'                ExecuteEnableResourceBlocking is also migrated.
-'
-' AUTHORING    : The injected JS is now an argument-less function expression
-'                (see GetActionJs "autoclicker" case). XPath and timeout are
-'                embedded as inline constants because BiDi invokes
-'                functionDeclaration with no arguments.
+' AutoClicker uses script.addPreloadScript; XPath and timeout are inlined because the
+' preload function is invoked without arguments.
 Public Sub ExecuteRegisterAutoClickerByXPath(ByVal xpath As String, _
                                              Optional ByVal timeoutMs As Long = 30000)
                                              
-    ' Subscribe silently to log entries for AutoClicker confirmation
     Me.ExecuteSessionSubscribe "log.entryAdded", , True
     
     Dim sourceJs As String: sourceJs = GetActionJs("autoclicker")
-    ' JSON-encode the XPath into a complete JS string literal (handles quotes,
-    ' backslashes, newlines). The template placeholder is unquoted to match.
     Dim safeXpath As String: safeXpath = WebJsonConverter.ConvertToJson(xpath)
     sourceJs = Replace(sourceJs, "{{XPATH}}", safeXpath)
     sourceJs = Replace(sourceJs, "{{TIMEOUT}}", CStr(timeoutMs))
     
     Dim params As New Dictionary: params.Add "functionDeclaration", sourceJs
     
-    ' Execute silently. Returns "" on failure; script ID on success.
     Dim strRes As String: strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True, allowAmbiguousRetry:=False)
     Dim scriptId As String
     scriptId = GetPathString(WebJsonConverter.ParseJson(strRes), "result.script")
@@ -2337,9 +1779,6 @@ Public Sub ExecuteRegisterAutoClickerByXPath(ByVal xpath As String, _
     End If
 End Sub
 
-' INTERNAL HELPER: BuildShadowSelectorArg
-'  Normalizes input to a JSON array. Accepts either a single String
-'              or a VBA Array of Strings for nested Shadow DOM penetration.
 Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dictionary
     Dim arg As New Dictionary
     arg.Add "type", "array"
@@ -2347,9 +1786,7 @@ Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dict
     Dim valList As New Collection
     Dim valItem As Dictionary
     
-    ' Determine if input is a single value or an array
     If IsArray(selectorsArray) Then
-        ' Case: Multiple selectors (e.g. Array("shadow-host", "button"))
         Dim i As Long
         For i = LBound(selectorsArray) To UBound(selectorsArray)
             Set valItem = New Dictionary
@@ -2358,7 +1795,6 @@ Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dict
             valList.Add valItem
         Next i
     Else
-        ' Case: Single selector (e.g. "button" or ".my-class")
         Set valItem = New Dictionary
         valItem.Add "type", "string"
         valItem.Add "value", CStr(selectorsArray)
@@ -2369,31 +1805,17 @@ Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dict
     Set BuildShadowSelectorArg = arg
 End Function
 
-' Discovery & Recorder API
-' Call this AFTER navigation; post-nav capture is enough for noise discovery.
-' beforeRequestSent IS subscribed here to emit [REQ] start lines (recording-only,
-' never wired to consensus). Its flood once caused oversized inbound frames; the
-' MaxIncomingSize cap now absorbs them, so the subscription is safe to keep on.
 Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = True)
     Set m_recorderLogs = New Collection
     m_isRecording = True
-    ' NowMs() returns milliseconds; /1000 converts to seconds. m_recorderStartTime
-    ' is therefore stored in SECONDS, and every relTime calculation below subtracts
-    ' it from (NowMs()/1000) so the displayed offset is in seconds (e.g. "1.23s").
-    m_recorderStartTime = socket_.NowMs() / 1000
-    ' [Carryover notice] Fresh run: drop every carryover-notice field (all are
-    ' class-level and survive across StartDiscoveryLog on a reused instance).
+    ' Recorder timestamps are seconds; NowMs values are divided by 1000 consistently.
+    m_recorderStartTime = socket_.nowMs() / 1000
+    ' A reused wrapper starts recording with all carryover diagnostics cleared.
     m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
     m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
     m_excludeResources = excludeImagesAndCss
     Set m_recSuppByKey = New Dictionary
     m_droppedHeadCount = 0
-    ' Include network.fetchError so blocked requests (Network.setBlockedURLs
-    ' returns ERR_BLOCKED_BY_CLIENT through this event) are visible in the
-    ' discovery log.
-    ' network.beforeRequestSent emits [REQ] start lines (recording-only, handled
-    ' by FormatAndStoreLog, never wired to consensus). Kept on permanently: the
-    ' MaxIncomingSize cap absorbs the oversized frames its flood once caused.
     Dim events(4) As String
     events(0) = "network.responseCompleted"
     events(1) = "network.fetchError"
@@ -2405,53 +1827,37 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Debug.Print "BiDi Recorder: Started. (Filter Resources: " & excludeImagesAndCss & ")"
 End Sub
 
-' [FIXED] StopAndSaveDiscoveryLog with explicit memory cleanup
 Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
-    ' Flush the incoming message queue first.
-    ' Since ProcessRecorderQueue calls DispatchGlobalEvents, which checks m_isRecording,
-    ' we must process the queue while the flag is still True.
+    ' Drain the queue before setting m_isRecording=False because event dispatch records only
+    ' while that flag is True.
     Call ProcessRecorderQueue
 
-    ' Now safely stop the recording flag.
     m_isRecording = False
 
     If m_recorderLogs Is Nothing Then Exit Sub
 
-    ' [AI-Log] Append the end-of-run summary to the timeline tail: a tally of
-    ' suppressed (filtered) events by endpoint so nothing is hidden without a
-    ' trace. (Open-request flushing was removed along with the dur=
-    ' machinery -- see the NOTE at the m_recSuppByKey declaration. [REQ] start
-    ' lines themselves are emitted; only per-request latency is not computed.)
     AppendSuppressedSummary
     
-    ' Save logic
     If m_recorderLogs.count > 0 Then
-        ' [MOD] Write as UTF-8 (BOM stripped) via ADODB.Stream.
-        '   FileSystemObject's TextStream supports only ASCII or UTF-16, so
-        '   UTF-8 requires ADODB.Stream (already used elsewhere in this project).
-        Dim stm As ADODB.Stream
-        Set stm = New ADODB.Stream
+        ' ADODB.Stream is used to write UTF-8 without a BOM.
+        Dim stm As ADODB.stream
+        Set stm = New ADODB.stream
         stm.Type = 2                      ' adTypeText
         stm.Charset = "utf-8"
         stm.Open
 
         stm.WriteText "=== BiDi Discovery Log (Optimized for AI Analysis) ===" & vbCrLf
         stm.WriteText "Timestamp | Type | Method/Status | MIME | URL/Detail" & vbCrLf
-        ' [ADD] Echo the idle/wait settings in effect so the analyzer can judge
-        '       whether the observed consensus timing reflects a good setting or luck.
         stm.WriteText "CONFIG | minStableMs(default)=" & DEFAULT_IDLE_STABLE_MS & _
                       " | maxTimeoutMs(default)=" & DEFAULT_IDLE_TIMEOUT_MS & _
                       " | excludeResources=" & m_excludeResources & vbCrLf
-        ' [AI-Log] Head-truncation honesty: if the ring buffer evicted any oldest
-        '          lines during recording, declare it here (next to CONFIG, where the
-        '          analyzer reads meta first) so a shortened timeline is never mistaken
-        '          for a complete one. Silent in the common case (no eviction).
+        ' Ring-buffer head eviction is reported so a truncated timeline is never mistaken for
+        ' a complete capture.
         If m_droppedHeadCount > 0 Then
             stm.WriteText "TRUNCATED | dropped " & m_droppedHeadCount & _
                           " oldest timeline line(s); only the most recent " & MAX_LOG_SIZE & _
                           " event(s) are shown. Earlier events existed but were evicted (ring buffer)." & vbCrLf
         End If
-        ' [AI-Log] Legend so a reader can interpret fields without external context.
         stm.WriteText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
         stm.WriteText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). [REQ] pairs with [RES] on the shared id. Per-request latency (dur=) is not computed." & vbCrLf
         stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
@@ -2521,16 +1927,15 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
             stm.WriteText logItem & vbCrLf
         Next logItem
 
-        ' Strip the UTF-8 BOM (first 3 bytes) so the file is plain UTF-8.
-        stm.Position = 0
+        stm.position = 0
         stm.Type = 1                      ' adTypeBinary
-        stm.Position = 3                  ' skip EF BB BF
+        stm.position = 3                  ' skip EF BB BF
         Dim utf8Bytes() As Byte
         utf8Bytes = stm.Read
         stm.Close
 
-        Dim outStm As ADODB.Stream
-        Set outStm = New ADODB.Stream
+        Dim outStm As ADODB.stream
+        Set outStm = New ADODB.stream
         outStm.Type = 1                   ' adTypeBinary
         outStm.Open
         outStm.Write utf8Bytes
@@ -2543,77 +1948,52 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
     Set m_recSuppByKey = Nothing
 End Sub
 
-' [PUBLIC] RecordEventsForSeconds
-'  Keeps the WebSocket queue moving for a specified duration to record events.
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
     If seconds <= 0 Then Exit Sub
 
-    ' INVARIANT: arm the error handler and validate the socket BEFORE locking the UI.
-    ' If socket_ is Nothing (e.g. after Shutdown), socket_.NowMs() raises error 91; with
-    ' the handler armed first and no UI lock yet, ErrorHandler -> Cleanup restores the UI
-    ' (Application.Interactive = True) instead of leaving Excel permanently unusable.
+    ' Arm the handler and validate socket_ before locking Application.Interactive; otherwise
+    ' an early error could leave Excel locked.
     On Error GoTo ErrorHandler
 
     If socket_ Is Nothing Then
         Err.Raise 91, "BiDi:RecordEventsForSeconds", "Socket object is not available."
     End If
 
-    Dim startMs As Double: startMs = socket_.NowMs()
+    Dim startMs As Double: startMs = socket_.nowMs()
     Dim durationMs As Double: durationMs = CDbl(seconds) * 1000#
 
-    ' --- UI LOCKING ---
-    ' Disable user interaction to prevent entering "Cell Edit Mode" during recording.
     Application.Interactive = False
     Application.Cursor = xlWait
 
-    Do While (socket_.NowMs() - startMs) < durationMs
-        ' Process the incoming WebSocket message queue
+    Do While (socket_.nowMs() - startMs) < durationMs
         ProcessRecorderQueue
 
-        ' Unified wait with re-entrancy protection via YieldExecution.
-        ' The 5-second threshold is preserved to suppress excessive DoEvents
-        ' side-effects during long recording sessions (add-in/COM interrupts).
         If durationMs > 5000 Then
-            ' Long recording: Throttled PumpMessages + sleep-only YieldExecution
             socket_.PumpMessages 100
             socket_.YieldExecution 100, False
         Else
-            ' Short recording: Higher responsiveness with guarded DoEvents
             socket_.YieldExecution 100, socket_.AllowUiPump
         End If
     Loop
 
 Cleanup:
-    ' WHY: always reset the processing lock regardless of how the loop finished.
-    ' If an error occurred inside ProcessRecorderQueue, this flag must be cleared
-    ' to allow subsequent message processing.
+    ' Always release the recorder processing lock after an error.
     m_isProcessingQueue = False
     
-    ' --- UI RESTORATION ---
-    ' Always ensure the UI is unlocked before returning control to the user.
     Application.Interactive = True
     Application.Cursor = xlDefault
     Exit Sub
 
 ErrorHandler:
-    ' WHY: properly deactivate the error handler via Resume before cleanup.
-    ' Without Resume, VBA's error handler remains "active" after GoTo Cleanup.
-    ' If any statement in Cleanup raises a new error while the handler is active,
-    ' VBA terminates the call stack immediately instead of handling it gracefully.
+    ' Use Resume before Cleanup to deactivate VBA's active error handler; otherwise an error
+    ' inside Cleanup can terminate the call stack instead of being handled.
     Debug.Print "BiDi Warning in RecordEventsForSeconds: " & Err.description
     Resume Cleanup
 End Sub
 
-' PUBLIC SUB: ProcessRecorderQueue
-'  Processes the incoming message queue with re-entrancy protection.
-'          Simplified: JSON retrieval, validation, and parsing are now
-'          delegated to Communicator's GetParsedEvent(). This method focuses purely
-'          on dispatch logic and error management.
 Public Sub ProcessRecorderQueue()
-    ' --- 1. Re-entrancy Guard ---
     If m_isProcessingQueue Then Exit Sub
     
-    ' Set the lock
     m_isProcessingQueue = True
     Dim json As Object
     Dim processedCount As Long
@@ -2622,15 +2002,10 @@ Public Sub ProcessRecorderQueue()
     
     On Error GoTo Cleanup
     
-    ' Main processing loop
     Do While processedCount < MAX_MESSAGES_PER_BATCH
-        ' Delegate message retrieval + size validation + JSON parse
-        ' to Communicator. Returns Nothing if buffer is empty or message invalid.
         Set json = socket_.GetParsedEvent(MIN_MSG_SIZE, MAX_MSG_SIZE)
         If json Is Nothing Then Exit Do
         
-        ' --- ISOLATED DISPATCH ---
-        ' Protect the loop from individual event processing failures
         On Error Resume Next
         DispatchGlobalEvents json
         
@@ -2641,13 +2016,11 @@ Public Sub ProcessRecorderQueue()
             End If
             Err.Clear
         Else
-            ' Reset counter on any successful dispatch
             consecutiveErrors = 0
         End If
         On Error GoTo Cleanup ' Restore main handler
         
-        ' --- CIRCUIT BREAKER ---
-        ' If the protocol is consistently failing, stop to prevent Excel hang.
+        ' Repeated dispatch failures trip a circuit breaker rather than looping indefinitely.
         If consecutiveErrors >= 10 Then
             Debug.Print "BiDi Critical: 10 consecutive dispatch errors. Abandoning queue."
             Exit Do
@@ -2655,12 +2028,10 @@ Public Sub ProcessRecorderQueue()
         
         processedCount = processedCount + 1
         
-        ' Yield to OS every 100 messages to keep UI responsive
         If (processedCount Mod 100) = 0 Then socket_.PumpMessages 100
     Loop
 
 Cleanup:
-    ' --- 2. Release Lock ---
     m_isProcessingQueue = False
     
     If Err.Number <> 0 Then
@@ -2687,12 +2058,8 @@ Private Function IsIgnorableError(ByVal errType As String, ByVal errMsg As Strin
 End Function
 
 Private Sub FormatAndStoreLog(ByVal json As Object)
-    ' WHY: explicit key existence checks instead of On Error Resume Next.
-    ' OERN was masking structural errors (e.g., missing "url" key on a valid "request"
-    ' object). Each access is now guarded by Dictionary.Exists() or TypeName checks,
-    ' ensuring only genuinely missing payloads are skipped while real bugs surface.
+    ' Guard keys explicitly; blanket OERN would hide malformed event structures.
 
-    ' Store selected BiDi events into the discovery log with optional noise filtering.
     If Not json.Exists("method") Then Exit Sub
     Dim method As String: method = json("method")
 
@@ -2709,7 +2076,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
     If Not json.Exists("params") Then Exit Sub
     Set params = json("params")
 
-    relTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+    relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
 
     Select Case method
         Case "network.responseCompleted"
@@ -2735,35 +2102,25 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                 End If
             End If
 
-            ' [AI-Log] dur= not reported: even with the [REQ] start marker
-            ' present, start/end pairing for latency is out of scope (see the
-            ' m_recSuppByKey NOTE and StartDiscoveryLog).
 
             Dim resStatus As String: resStatus = ""
             If res.Exists("status") Then resStatus = CStr(res("status"))
-            ' [AI-Log] url= omitted (see [REQ] above) - key= is the analysis field.
             LogLine = "[" & relTime & "] [RES] " & resStatus & " [" & mime & "] | id=" & ShortId(resId) & _
                       " | key=" & resKey & " | idle=" & IIf(IsIdleIgnored(resUrl), "skip", "track")
 
-            ' [Carryover notice] A tracked json/API arrived WHILE a wait is active.
-            ' Mark this wait as having unresolved render activity (simple bool -- we
-            ' do not count or pair). Record the FIRST such response's key/sec for the
-            ' SUSPECT line only; the NOTE never uses it. Responses between waits
-            ' (m_waitStackDepth = 0) are not latched. Recording-gated.
+            ' Only tracked API responses arriving during an active wait can create this wait's
+            ' unresolved-render hint.
             If m_isRecording And m_waitStackDepth > 0 And Not IsIdleIgnored(resUrl) Then
                 If InStr(1, LCase$(mime), "json") > 0 Then
                     If Not m_unresolvedJsonThisWait Then
                         m_unresolvedJsonFirstKeyThisWait = resKey
-                        m_unresolvedJsonFirstSecThisWait = (socket_.NowMs() / 1000) - m_recorderStartTime
+                        m_unresolvedJsonFirstSecThisWait = (socket_.nowMs() / 1000) - m_recorderStartTime
                     End If
                     m_unresolvedJsonThisWait = True
                 End If
             End If
 
         Case "network.beforeRequestSent"
-            ' [AI-Log] Request-start marker. Same key normalization
-            ' and noise filter as [RES] so [REQ]/[RES] pair on the shared id.
-            ' No dur= is computed -- this is the start line only.
             If Not params.Exists("request") Then Exit Sub
             If Not IsObject(params("request")) Then Exit Sub
             Dim reqObj As Object: Set reqObj = params("request")
@@ -2776,21 +2133,13 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             If reqObj.Exists("request") Then reqId = CStr(reqObj("request"))
             Dim reqMethod As String: reqMethod = ""
             If reqObj.Exists("method") Then reqMethod = CStr(reqObj("method"))
-            ' IIf on IsIdleIgnored: read-only predicate, no side effects.
             LogLine = "[" & relTime & "] [REQ] " & reqMethod & " | id=" & ShortId(reqId) & _
                       " | key=" & NormalizeEndpointKey(reqUrl) & _
                       " | idle=" & IIf(IsIdleIgnored(reqUrl), "skip", "track")
 
         Case "network.fetchError"
-            ' Surface failed requests in the discovery log. Two sub-cases:
-            '   (a) Blocker hit: URL matches one of our installed patterns.
-            '       Log as [BLOCK] for clarity, mirroring the immediate-window
-            '       [BLOCK] line. chromium-bidi currently leaves errorText
-            '       empty for ERR_BLOCKED_BY_CLIENT so we rely on pattern
-            '       matching rather than parsing the error string.
-            '   (b) Other fetch failures (DNS failure, server hangup, etc).
-            '       Log as [ERR] with whatever errorText (often empty) BiDi
-            '       provides, so the cause is still visible in the trace.
+            ' Log blocker matches as [BLOCK] and all other fetch failures as [ERR], even when
+            ' Chromium supplies no error text.
             If Not params.Exists("request") Then Exit Sub
             If Not IsObject(params("request")) Then Exit Sub
             Dim ferReq As Object: Set ferReq = params("request")
@@ -2821,15 +2170,10 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
 
         Case "browsingContext.load", "browsingContext.domContentLoaded"
             If Not params.Exists("url") Then Exit Sub
-            ' [AI-Log] Route the navigated URL through the same normalizer so an
-            ' opaque auth blob (e.g. Okta stateHandle, ~9k chars) collapses to its
-            ' host+path instead of bloating the log.
+            ' Normalize navigation URLs so opaque authentication payloads cannot bloat the log.
             LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeEndpointKey(CStr(params("url")))
 
-            ' [Carryover notice] A hard navigation voids every carryover signal:
-            ' the old document, its unresolved response, and any pending hint are
-            ' gone. In-page (pushState) SPA transitions produce no browsingContext.load,
-            ' so they do NOT clear here -- the desired asymmetry.
+            ' A document load clears all carryover state; same-document SPA transitions do not.
             m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
             m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
 
@@ -2845,11 +2189,8 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
     If LogLine <> "" Then PushTimelineLine LogLine
 End Sub
 
-' [AI-Log] PushTimelineLine -- the SINGLE choke point for appending a timeline
-'   entry, so the ring-buffer eviction + head-drop accounting live in ONE place.
-'   Evicts the OLDEST line when full and counts the drop; StopAndSaveDiscoveryLog
-'   surfaces the count as a TRUNCATED notice so a shortened timeline is never
-'   mistaken for a whole one.
+' PushTimelineLine is the sole ring-buffer append point and accounts for evicted head
+' lines.
 Private Sub PushTimelineLine(ByVal s As String)
     If m_recorderLogs Is Nothing Then Exit Sub
     If m_recorderLogs.count >= MAX_LOG_SIZE Then
@@ -2859,15 +2200,8 @@ Private Sub PushTimelineLine(ByVal s As String)
     m_recorderLogs.Add s
 End Sub
 
-' [Pattern] UrlMatchesPattern -- unified URL/pattern matcher shared by the block
-' list, the idle-ignore list and the [BLOCK] detector, so one notation works
-' everywhere (no more InStr-vs-CDP mismatch):
-'   pattern WITHOUT '*'  -> case-insensitive substring (back-compat with existing
-'                           literal patterns like "gstatic.com" or "/log?"; here
-'                           '?' is literal).
-'   pattern WITH '*'     -> glob, same '*' notation as CDP Network.setBlockedURLs,
-'                           matched as "contains". Inside a glob '*'=any run and
-'                           '?'=one char (VBA Like). Malformed glob -> no match.
+' Shared pattern semantics: no '*' means case-insensitive substring; '*' enables a
+' contains-style glob. Malformed globs do not match.
 Private Function UrlMatchesPattern(ByVal url As String, ByVal pat As String) As Boolean
     If Len(pat) = 0 Then Exit Function
     Dim u As String: u = LCase$(url)
@@ -2884,12 +2218,9 @@ Private Function UrlMatchesPattern(ByVal url As String, ByVal pat As String) As 
     On Error GoTo 0
 End Function
 
-' Determines whether a URL should be excluded from Discovery Logs and stability checks.
-' This version is updated to filter out framework-specific noise (Next.js) and ads found in recent logs.
 Private Function IsNoiseUrl(ByVal url As String) As Boolean
     Dim lUrl As String: lUrl = LCase(url)
     
-    ' --- 1. Framework & Static Resource Noise ---
     If InStr(lUrl, "/_next/static/") > 0 Or _
        InStr(lUrl, "webworker.js") > 0 Or _
        InStr(lUrl, ".png") > 0 Or InStr(lUrl, ".jpg") > 0 Or InStr(lUrl, ".jpeg") > 0 Or _
@@ -2900,7 +2231,6 @@ Private Function IsNoiseUrl(ByVal url As String) As Boolean
         Exit Function
     End If
     
-    ' --- 2. Ads, Analytics & Telemetry Noise ---
     If InStr(lUrl, "google-analytics") > 0 Or _
        InStr(lUrl, "googletagmanager") > 0 Or _
        InStr(lUrl, "doubleclick") > 0 Or _
@@ -2914,8 +2244,6 @@ Private Function IsNoiseUrl(ByVal url As String) As Boolean
         Exit Function
     End If
 
-    ' --- 3. Dynamic User-Defined Filters ---
-    ' Ensures patterns added via AddIdleIgnoreNetworkPattern are also respected here.
     If Not m_userIgnoreNetworkPatterns Is Nothing Then
         Dim pattern As Variant
         For Each pattern In m_userIgnoreNetworkPatterns
@@ -2934,20 +2262,13 @@ Private Function IsNoiseMime(ByVal mime As String) As Boolean
     IsNoiseMime = (InStr(lMime, "image/") > 0 Or InStr(lMime, "font/") > 0 Or InStr(lMime, "css") > 0)
 End Function
 
-' [AI-Log] NormalizeEndpointKey
-'   Collapses a full URL to host+path, dropping volatile query tokens (f.sid,
-'   _reqid, bl, hl, soc-*, nonce, ...) that change on every call. One high-signal
-'   discriminator (rpcids) is preserved when present, so e.g. the nine
-'   batchexecute calls collapse to one key and their repetition/periodicity is
-'   visible at a glance. This only re-shapes the URL; it makes no noise judgement.
+' Endpoint keys drop volatile query tokens but retain high-signal rpcids so repeated API
+' families collapse without losing their discriminator.
 Private Function NormalizeEndpointKey(ByVal url As String) As String
     On Error GoTo Fallback
     Dim s As String: s = url
-    ' [AI-Log] data: URIs (inlined fonts/images/SVG) carry a huge payload that is
-    ' pure noise. Keep only the "data:<mediatype>," header and drop the rest. This
-    ' MUST run before the "://" strip below, otherwise an embedded namespace URL
-    ' (e.g. xmlns='http://www.w3.org/2000/svg' inside an inline SVG) gets mistaken
-    ' for the real host and produces a mangled key.
+    ' Collapse data: URIs before URL parsing; embedded namespace URLs inside payloads are
+    ' not real hosts.
     If Left$(LCase$(s), 5) = "data:" Then
         Dim cm As Long: cm = InStr(s, ",")
         If cm > 0 Then NormalizeEndpointKey = Left$(s, cm) Else NormalizeEndpointKey = Left$(s, 40)
@@ -2967,9 +2288,6 @@ Private Function NormalizeEndpointKey(ByVal url As String) As String
     Dim keyStr As String: keyStr = pathPart
     Dim rp As String: rp = ExtractQueryToken(queryPart, "rpcids")
     If Len(rp) > 0 Then keyStr = keyStr & "?rpcids=" & rp
-    ' Some cache-bust junk (e.g. gstatic JS bundles) lives in the PATH, not the
-    ' query, so also cap the key length. This shrinks giant keys AND lets the
-    ' otherwise near-identical bundle URLs collapse onto a single key.
     Const MAX_KEY_LEN As Long = 160
     If Len(keyStr) > MAX_KEY_LEN Then keyStr = Left$(keyStr, MAX_KEY_LEN) & "..."
     NormalizeEndpointKey = keyStr
@@ -2978,7 +2296,6 @@ Fallback:
     NormalizeEndpointKey = url
 End Function
 
-' [AI-Log] ExtractQueryToken: returns the value of a single query parameter, or "".
 Private Function ExtractQueryToken(ByVal query As String, ByVal name As String) As String
     If Len(query) = 0 Then Exit Function
     Dim parts() As String: parts = Split(query, "&")
@@ -2991,11 +2308,6 @@ Private Function ExtractQueryToken(ByVal query As String, ByVal name As String) 
     Next i
 End Function
 
-' [AI-Log] IsIdleIgnored
-'   Reports whether a URL matches the idle-ignore set actually fed to the SPA
-'   probe (DEFAULT_IGNORE_NETWORK plus any AddIdleIgnoreNetworkPattern). This is a
-'   faithful echo of an EXISTING configuration decision, surfaced per line as
-'   idle=skip / idle=track. It introduces no new classification of its own.
 Private Function IsIdleIgnored(ByVal url As String) As Boolean
     Dim lUrl As String: lUrl = LCase(url)
     Dim defToks() As String: defToks = Split(DEFAULT_IGNORE_NETWORK, ",")
@@ -3014,16 +2326,11 @@ Private Function IsIdleIgnored(ByVal url As String) As Boolean
     End If
 End Function
 
-' [AI-Log] ShortId: trims a BiDi request id for compact display while staying
-'   unique enough for a reader to pair [REQ] / [RES] lines.
 Private Function ShortId(ByVal idStr As String) As String
     If Len(idStr) = 0 Then ShortId = "-": Exit Function
     If Len(idStr) > 18 Then ShortId = Right$(idStr, 18) Else ShortId = idStr
 End Function
 
-' [AI-Log] BumpSuppressed: tallies a suppressed (filtered-out) event by endpoint
-'   key, so StopAndSaveDiscoveryLog can report WHAT was hidden instead of dropping
-'   it silently. The row stays omitted from the timeline; only the count is kept.
 Private Sub BumpSuppressed(ByVal keyStr As String)
     On Error Resume Next
     If m_recSuppByKey Is Nothing Then Exit Sub
@@ -3035,9 +2342,6 @@ Private Sub BumpSuppressed(ByVal keyStr As String)
     On Error GoTo 0
 End Sub
 
-' [AI-Log] AppendSuppressedSummary: at save time, emit the tally of filtered
-'   ("noise") events per endpoint, so the reader knows exactly what was hidden by
-'   excludeResources and how often, without bloating the timeline with each row.
 Private Sub AppendSuppressedSummary()
     On Error Resume Next
     If m_recorderLogs Is Nothing Or m_recSuppByKey Is Nothing Then Exit Sub
@@ -3049,8 +2353,6 @@ Private Sub AppendSuppressedSummary()
     Next k
     m_recorderLogs.Add "[end] [SUPPRESSED-TOTAL] " & total & " event(s) filtered, " & m_recSuppByKey.count & " distinct key(s) (excludeResources=" & m_excludeResources & ")"
 
-    ' Copy into arrays and sort by count desc so the most informative noise is on
-    ' top, then cap the number of lines so the tail can never dominate the log.
     Dim n As Long: n = m_recSuppByKey.count
     Dim ks() As Variant: ReDim ks(0 To n - 1)
     Dim cs() As Long: ReDim cs(0 To n - 1)
@@ -3078,13 +2380,8 @@ Private Sub AppendSuppressedSummary()
     On Error GoTo 0
 End Sub
 
-
-' FUNCTION: QuerySpaProbe
-'  Executes the JS query snippet and parses the result.
-'              Returns Nothing if the probe is missing or reports 'active: false'.
 Private Function QuerySpaProbe(Optional ByVal contextId As String = "") As Dictionary
     Dim strRes As String
-    ' Pass Silent:=True to CallScript
     strRes = CallScript(GetProbeJs("query"), Nothing, contextId, False, False, 10000, True)
     
     Dim innerJsonStr As String: innerJsonStr = CStr(GetCleanResult(strRes))
@@ -3095,67 +2392,18 @@ Private Function QuerySpaProbe(Optional ByVal contextId As String = "") As Dicti
     On Error GoTo 0
 End Function
 
-' ==========================================================================
-' COMPLETION-SIGNAL GATE (ArmContentSignal / ArmNetworkSignal / ArmVisibilitySignal)
-' ==========================================================================
-' WHY THIS EXISTS: the SPA consensus (netIdle AND domStable) is a NEGATIVE
-' condition -- "nothing is happening" -- and on sites with a settle-to-render
-' gap (XHR returns in ~200ms, the framework paints ~1.4s later) the gap itself
-' looks like quiet, so the wait can pass BEFORE the content the action was
-' supposed to produce ever appears. The gate adds an opt-in POSITIVE condition:
-' the caller names the completion evidence, and the consensus additionally
-' requires that evidence to have arrived (signalGateOpen) before STABLE.
-'
-' THREE SIGNAL TYPES = three shapes of completion evidence:
-'   ArmContentSignal    -- an EXISTING element gets rewritten (edge-trigger on a
-'                          scoped MutationObserver; the target must exist at arm
-'                          time, else immediate error).
-'   ArmNetworkSignal    -- a specific API response arrives (event-trigger on
-'                          network.responseCompleted; robust identifier, but
-'                          arrival is not render -- the post-hit quiet window
-'                          covers the residual gap up to minStableMs).
-'   ArmVisibilitySignal -- a NEW element becomes visible (level-trigger,
-'                          latched; the target must NOT already be visible at
-'                          arm time, else immediate error).
-' The fourth completion shape, "known target state, simple appearance", stays
-' with ExecuteIsElementVisible -- a standalone state query, not a gate.
-'
-' SEMANTICS (shared by all types):
-'   - A hit opens the gate AND resets the consensus window, guaranteeing at
-'     least minStableMs of observed quiet AFTER the signal.
-'   - Latches are live from the moment of arming (a hit landing between Arm
-'     and the wait is captured, not lost).
-'   - One-shot: consumed when the next SPA-idle wait ends (any outcome).
-'   - Multiple types may be armed together; the gate is their AND. Note that
-'     AND inherits every armed type's precondition -- only combine when EVERY
-'     armed signal is guaranteed to occur.
-'   - No dedicated timeout: the wait's existing maxTimeoutMs is the single
-'     deadline. Gated waits hold until the signal arrives, so size the
-'     per-operation maxTimeoutMs for the signal's worst case plus the tail.
-'
-' USAGE:
-'   bidi.ArmContentSignal "//*[@id='table-body']"
-'   bidi.ExecuteClickByXPath tabXPath          ' gate applies to this click's sync wait
-'
-'   bidi.ArmNetworkSignal "GetShoppingResults" ' UrlMatchesPattern notation
-'   bidi.ExecuteClickByXPath searchButtonXPath
-'
-' CAUTION: the arm is consumed by the FIRST SPA-idle wait that follows it. Do
-' not insert another synchronizing call (e.g. ExecuteIsElementVisible with
-' waitNetworkIdle:=True) between Arm and the intended action, or the gate will
-' bind to the wrong wait and time out.
-' ==========================================================================
+' COMPLETION SIGNAL GATE
+' SPA idle is negative evidence and can pass during a response-to-render gap. Arm* adds
+' caller-selected positive evidence:
+'   ArmContentSignal: existing subtree is rewritten.
+'   ArmNetworkSignal: matching responseCompleted arrives.
+'   ArmVisibilitySignal: previously absent/hidden element becomes visible.
+' A hit opens the gate and restarts minStableMs. Arms are live immediately, multiple arms
+' compose with AND, and the first following SPA-idle wait consumes them on any outcome.
+' Do not insert another synchronizing call between Arm* and the intended action.
 
-' [PUBLIC] ArmContentSignal
-'  Arms a DOM-rewrite completion signal on an EXISTING element's subtree.
-'  Fail-fast guards (both directions of misclassification fail loudly at arm
-'  time, never silently at wait time):
-'    target not found -> error. "Element that appears after the action" is the
-'    ArmVisibilitySignal / ExecuteIsElementVisible territory, not this method's.
-'    invalid XPath    -> error.
-'  includeAttributes: default False. Content rewrites are childList/characterData;
-'  attribute churn (spinner class flips, aria toggles) is exactly the noise the
-'  original accident hid behind, so it does not count as a signal unless opted in.
+' ArmContentSignal requires an existing valid target. By default only childList and
+' characterData count; attribute churn is opt-in.
 Public Sub ArmContentSignal(ByVal signalXPath As String, _
                             Optional ByVal includeAttributes As Boolean = False, _
                             Optional ByVal contextId As String = "")
@@ -3193,25 +2441,15 @@ Public Sub ArmContentSignal(ByVal signalXPath As String, _
     End Select
 End Sub
 
-' [PUBLIC] ArmNetworkSignal
-'  Arms an API-arrival completion signal. urlPattern uses the SAME notation as
-'  AddIdleIgnoreNetworkPattern / resource blocking (UrlMatchesPattern: no '*' =
-'  case-insensitive substring; with '*' = contains-glob), so one notation works
-'  across the whole class. Matching runs on every network.responseCompleted,
-'  BEFORE any recorder noise/idle filtering -- a pattern that also sits in an
-'  ignore list still fires. Any status latches; status is logged for the caller.
-'  LIMIT: arrival is not render. If the site's response-to-paint gap exceeds
-'  minStableMs, combine with ArmContentSignal or raise minStableMs per-operation.
+' ArmNetworkSignal uses the shared URL-pattern syntax and matches before ignore filters.
+' Arrival is not rendering; increase the tail or combine with a DOM signal when needed.
 Public Sub ArmNetworkSignal(ByVal urlPattern As String)
     If Len(Trim$(urlPattern)) = 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:ArmNetworkSignal", "urlPattern is empty."
     End If
 
-    ' Ensure responseCompleted events actually flow even when the discovery
-    ' recorder is off (ConnectTo subscribes only log/navigation events).
-    ' Delta-subscribe (m_activeSubscriptions) makes this a no-op when already
-    ' subscribed. Without this line, arming outside a recording session would
-    ' be a silent never-fires failure -- the worst kind.
+    ' Ensure responseCompleted is subscribed even without the recorder; otherwise a network
+    ' arm would silently never fire.
     Me.ExecuteSessionSubscribe Array("network.responseCompleted"), , True
 
     If m_sigNetArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=net | overwrite=true (previous net arm replaced)"
@@ -3219,16 +2457,8 @@ Public Sub ArmNetworkSignal(ByVal urlPattern As String)
     LogSignalLine "[SPA-SIGNAL-ARM] type=net | pattern=" & urlPattern
 End Sub
 
-' [PUBLIC] ArmVisibilitySignal
-'  Arms an element-appearance completion signal (level-trigger, latched: once
-'  visible, later occlusion/spinner overlays cannot re-close the gate).
-'  Fail-fast guard: target ALREADY visible at arm time -> error, because the
-'  gate would open on the first poll and the wait would silently degrade to an
-'  ungated one -- reproducing the exact accident class this gate prevents. If
-'  the target is already visible, the completion evidence you actually want is
-'  its REWRITE: use ArmContentSignal.
-'  COST NOTE: the XPath is re-evaluated once per poll (~100ms) until the latch;
-'  after the latch, evaluation stops. Dom/net arms carry no per-poll cost.
+' ArmVisibilitySignal rejects an already-visible target because that would silently
+' behave as an ungated wait. The XPath is polled only until the first visibility latch.
 Public Sub ArmVisibilitySignal(ByVal signalXPath As String, _
                                Optional ByVal contextId As String = "")
     If Len(Trim$(signalXPath)) = 0 Then
@@ -3265,19 +2495,15 @@ Public Sub ArmVisibilitySignal(ByVal signalXPath As String, _
     End Select
 End Sub
 
-' [PUBLIC] DisarmSignal
-'  Explicit all-type disarm for abnormal-flow recovery (e.g. the planned action
-'  was skipped after arming). Normal flows never need this: arms are consumed
-'  automatically when the next SPA-idle wait ends. One method for all types on
-'  purpose -- there is no scenario where partial disarming is safer than full.
+' DisarmSignal is abnormal-flow cleanup; normal arms are consumed automatically by the
+' next SPA-idle wait.
 Public Sub DisarmSignal(Optional ByVal contextId As String = "")
     Dim wasArmed As Boolean
     wasArmed = (m_sigDomArmed Or m_sigNetArmed Or m_sigVisArmed)
 
     ResetSignalState
 
-    ' Best-effort browser-side observer teardown; a dead context is fine (the
-    ' observer died with it).
+    ' Browser-side disarm is best-effort because a dead context already lost its observer.
     On Error Resume Next
     Call CallScript("var p=window.__vbaIdleProbe;if(p&&p.disarmSignal)p.disarmSignal();return 0;", _
                     Nothing, ResolveTargetContext(contextId), False, False, 5000, True)
@@ -3286,10 +2512,7 @@ Public Sub DisarmSignal(Optional ByVal contextId As String = "")
     If wasArmed Then LogSignalLine "[SPA-SIGNAL-DISARM] scope=all | by=user"
 End Sub
 
-' [INTERNAL] ConsumeSignalArms -- one-shot consumption at SPA-wait end.
-'  Called by MasterWaitEngine (WaitMode_SpaIdle only) AFTER WriteSpaWaitEnd, on
-'  every outcome. Silent by design: the END line's signal= field already tells
-'  the story; a per-wait DISARM line would be pure noise.
+' Consume all arm types after WriteSpaWaitEnd on every SPA-wait outcome.
 Private Sub ConsumeSignalArms(Optional ByVal contextId As String = "")
     If Not (m_sigDomArmed Or m_sigNetArmed Or m_sigVisArmed) Then Exit Sub
 
@@ -3301,17 +2524,8 @@ Private Sub ConsumeSignalArms(Optional ByVal contextId As String = "")
     On Error GoTo 0
 End Sub
 
-' [INTERNAL] IsContentRenderPath -- true if a DOM: (childList) mutation path is a
-'  TARGETED content render rather than root-level overlay churn. domPath is the
-'  part AFTER the "DOM:" prefix. childList mutations at the html/body/head root
-'  (script injection, notification/spinner/overlay mount) surface on real logs as
-'  "DOM:/html[1]/body[1]" and must NOT clear the settle-to-render carryover latch;
-'  a genuine render mutates a NESTED node. Two acceptance rules:
-'    - an ancestor-ID anchor (gX's ancestor-ID form, e.g. //*[@id='table-body'])
-'      is by construction a specific nested element -> always a content render;
-'    - otherwise require full-path depth >= 3 (html / body / <something deeper>).
-'  So "/html[1]/body[1]" (depth 2) is rejected; "//*[@id='table-body']" and
-'  "/html[1]/body[1]/div[3]/table[1]" (depth 4) are accepted.
+' Carryover render detection accepts targeted nested childList paths, not html/body root
+' churn. Ancestor-ID paths are always considered targeted.
 Private Function IsContentRenderPath(ByVal domPath As String) As Boolean
     Dim p As String: p = Trim$(domPath)
     If Len(p) = 0 Then IsContentRenderPath = False: Exit Function
@@ -3324,7 +2538,6 @@ Private Function IsContentRenderPath(ByVal domPath As String) As Boolean
     IsContentRenderPath = (depth >= 3)
 End Function
 
-' [INTERNAL] ResetSignalState -- clears every gate flag (no browser round-trip).
 Private Sub ResetSignalState()
     m_sigDomArmed = False: m_sigDomSeen = False: m_sigDomXPath = ""
     m_sigNetArmed = False: m_sigNetSeen = False: m_sigNetPattern = ""
@@ -3332,14 +2545,9 @@ Private Sub ResetSignalState()
     m_sigLostWarned = False
 End Sub
 
-' [INTERNAL] InvokeProbeArm -- shared dom/vis arm plumbing.
-'  Ensures the probe exists (idempotent injection via PrepareProbeForAction),
-'  runs the arm snippet, and returns its rc (-9 when the probe/result is absent).
 Private Function InvokeProbeArm(ByVal jsBody As String, ByVal contextId As String) As Long
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
 
-    ' Arming precedes the action, so TryPreparePhase has not run yet for this
-    ' interaction; ensure the probe here (injection is a no-op when installed).
     Call PrepareProbeForAction(targetCtx)
 
     Dim strRes As String
@@ -3353,8 +2561,6 @@ Private Function InvokeProbeArm(ByVal jsBody As String, ByVal contextId As Strin
     End If
 End Function
 
-' [INTERNAL] BuildSignalArmDesc -- armed types for [SPA-WAIT-BEGIN] ("dom,net").
-'  Empty string when nothing is armed (the field is then omitted entirely).
 Private Function BuildSignalArmDesc() As String
     Dim s As String
     If m_sigDomArmed Then s = "dom"
@@ -3363,8 +2569,6 @@ Private Function BuildSignalArmDesc() As String
     BuildSignalArmDesc = s
 End Function
 
-' [INTERNAL] BuildSignalEndDesc -- per-type outcome for [SPA-WAIT-END]
-'  ("net:hit,dom:miss"). Fixed dom,net,vis order; empty when nothing is armed.
 Private Function BuildSignalEndDesc() As String
     Dim s As String
     If m_sigDomArmed Then s = "dom:" & IIf(m_sigDomSeen, "hit", "miss")
@@ -3373,13 +2577,8 @@ Private Function BuildSignalEndDesc() As String
     BuildSignalEndDesc = s
 End Function
 
-' [INTERNAL] BuildSignalPendingDesc -- armed-but-not-yet-latched types ("net",
-'  "dom,vis"). Empty when the gate is fully open OR nothing is armed. Used by the
-'  HUD to distinguish a real consensus-blocking wait ("Awaiting signal") from a
-'  genuine Stable: the consensus (EvaluateSpaIdleCondition) AND-gates on these
-'  same flags, but UpdateWaitTelemetry keyed only off DOM-quiet time and so
-'  rendered a misleading green while the gate was still closed. A frozen HUD then
-'  reads correctly by colour: amber = blocked awaiting a signal that never came.
+' HUD pending-signal text is derived from the same arm/latch flags as consensus, so a
+' closed gate cannot be displayed as Stable.
 Private Function BuildSignalPendingDesc() As String
     Dim s As String
     If m_sigDomArmed And Not m_sigDomSeen Then s = "dom"
@@ -3388,22 +2587,16 @@ Private Function BuildSignalPendingDesc() As String
     BuildSignalPendingDesc = s
 End Function
 
-' [INTERNAL] LogSignalLine -- single choke point for [SPA-SIGNAL-*] output.
-'  Timeline (when recording, via the ring-buffered PushTimelineLine) plus the
-'  Immediate window (when DebugMode), so arm failures are diagnosable from the
-'  saved log alone -- the raised error is invisible there.
+' LogSignalLine is the single path to both the ring-buffered log and developer trace.
 Private Sub LogSignalLine(ByVal line As String)
     If m_isRecording Then
         Dim relTime As String
-        relTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+        relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
         PushTimelineLine "[" & relTime & "] " & line
     End If
     If m_debugMode Then Debug.Print "BiDi Signal: " & line
 End Sub
 
-' [INTERNAL] JsStringLiteral -- escapes a VBA string into a double-quoted JS
-'  string literal (backslash, quote, CR/LF). XPaths routinely contain single
-'  quotes ("//*[@id='table-body']"), hence double-quoted output.
 Private Function JsStringLiteral(ByVal s As String) As String
     Dim t As String
     t = Replace(s, "\", "\\")
@@ -3413,52 +2606,33 @@ Private Function JsStringLiteral(ByVal s As String) As String
     JsStringLiteral = """" & t & """"
 End Function
 
-' PUBLIC SUB: WaitForNetworkIdleSpa
-'  Entry point for deep SPA-aware synchronization.
-'          This version includes Entry Guards to handle 0ms inputs caused by the
-'          updated SanitizeMs logic, ensuring stability consensus isn't bypassed.
 Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
                                  ByVal maxTimeoutMs As Long, _
                                  Optional ByVal contextId As String = "")
     
-    ' --- [ENTRY GUARD] Guard against 0ms in stability check ---
     If minStableMs = 0 Then minStableMs = DEFAULT_IDLE_STABLE_MS
     If maxTimeoutMs = 0 Then maxTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS
     
-    ' Resolve the target browsing context (tab/window)
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
     
-    ' Process any pending WebSocket messages to sync current network request counts
-    ' before entering the stability consensus phase.
     ProcessRecorderQueue
 
-    ' Initialize the wait context dictionary with tracking metrics for SPA stability.
-    ' These keys are used defensively by EvaluateWaitCondition.
     Dim waitCtx As New Dictionary
     waitCtx.Add "contextId", targetCtx
     waitCtx.Add "minStableMs", minStableMs
-    waitCtx.Add "stableStart", socket_.NowMs()
+    waitCtx.Add "stableStart", socket_.nowMs()
     waitCtx.Add "missingProbeCount", 0 ' Used for multi-stage JIT recovery
-    ' [Tier1 Diagnostics] Pre-seed metric keys so they always exist when the
-    ' SPA-WAIT-END line is written, even if the probe never reports (e.g. an
-    ' immediate timeout). Diagnostic-only; not read by consensus.
+    ' Pre-seeded metrics are diagnostic only and guarantee a complete END line.
     waitCtx.Add "lastJsIdleDuration", 0#
     waitCtx.Add "lastInflFetch", 0
     waitCtx.Add "lastInflXhr", 0
-    ' [Signal Gate] Ack flag for the network-signal timer reset. A net hit is
-    ' latched asynchronously in DispatchGlobalEvents; the FIRST poll that sees
-    ' the latch resets the consensus window (once per wait). If the hit already
-    ' arrived BEFORE this wait began (fast API between Arm and the action's
-    ' sync), pre-ack it: stableStart above is fresh, so no reset is needed and
-    ' none is performed -- the arm-to-hit window is honored without penalty.
+    ' Network hits latch asynchronously. Reset stableStart once on the first poll that sees
+    ' the hit; pre-wait hits need no extra reset because stableStart is already fresh.
     waitCtx.Add "sigNetAcked", m_sigNetSeen
 
-    ' [Carryover notice] Start-of-wait state transitions:
-    '  (1) Consume the reservation from the previous wait into a ONE-SHOT arm that
-    '      is valid for THIS wait only, then clear the reservation immediately --
-    '      this is what limits any carryover note to the single adjacent wait.
-    '  (2) Reset this-wait unresolved-json tracking (it is per-wait by definition).
+    ' A carryover reservation becomes a one-wait arm at BEGIN and is cleared immediately;
+    ' this wait's unresolved state is reset independently.
     m_carryoverNoteArmedThisWait = m_hasCarryoverHintForNextWait
     m_carryoverNoteEmittedThisWait = False
     m_hasCarryoverHintForNextWait = False
@@ -3466,18 +2640,11 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     m_unresolvedJsonFirstKeyThisWait = ""
     m_unresolvedJsonFirstSecThisWait = 0#
     
-    ' [Tier1 Diagnostics] Record the EFFECTIVE wait parameters in force for this
-    ' action (not the compile-time CONFIG defaults) so the discovery log shows
-    ' per-action minStableMs / maxTimeoutMs. This is what lets an analyzer tell a
-    ' deliberate setting from an accidental one (e.g. a maxTimeoutMs below
-    ' minStableMs, which can never satisfy the consensus window).
+    ' Log effective per-operation minStableMs/maxTimeoutMs, not only class defaults.
     If m_isRecording Then
         Dim beginRelTime As String
-        beginRelTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
-        ' [Signal Gate] Armed types ride on the BEGIN line (same rationale as the
-        ' effective minStableMs/maxTimeoutMs: per-action truth beats CONFIG
-        ' defaults). Ungated waits omit the field entirely so their lines stay
-        ' byte-identical to the pre-gate format (diff-compatible with old logs).
+        beginRelTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+        ' BEGIN includes armed types only for gated waits.
         Dim sigArmDesc As String: sigArmDesc = BuildSignalArmDesc()
         m_recorderLogs.Add "[" & beginRelTime & "] [SPA-WAIT-BEGIN] minStableMs=" & minStableMs & _
                            " | maxTimeoutMs=" & maxTimeoutMs & _
@@ -3485,17 +2652,9 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
                            " | ctx=" & targetCtx
     End If
 
-    ' Execute the high-precision wait engine with SPA Idle mode.
-    ' MasterWaitEngine will perform final sanitization using the guarded values.
     MasterWaitEngine WaitMode_SpaIdle, maxTimeoutMs, 100, waitCtx
 End Sub
 
-' FUNCTION: EvaluateSpaIdleCondition
-'  Final consensus engine for SPA stability.
-'              Integrates:
-'              1. Network Silence (BiDi Protocol + JS Hooks)
-'              2. DOM Stability (MutationObserver + Prototype Hooks)
-'              3. Diagnostic Logging (Immediate Window + Discovery Recorder)
 Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                                           ByRef ctx As Dictionary, _
                                           ByVal currentMs As Double) As Boolean
@@ -3510,32 +2669,21 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
     inflFetch = CLng(probe("inflightFetchCount"))
     inflXhr = CLng(probe("inflightXhrCount"))
     
-    ' Cache inflight URL list into the context for diagnostic use on timeout.
-    ' Overwrites each poll cycle so the list is always current.
     If probe.Exists("inflightUrls") Then
         Set ctx("lastInflightUrls") = probe("inflightUrls")
     End If
     
-    ' Calculate current idle duration reported by the browser
     jsIdleDuration = jsNow - lastActivityTs
 
-    ' [Tier1 Diagnostics] Stash the latest probe-derived metrics into the wait
-    ' context so MasterWaitEngine can report the achieved DOM-quiet duration and
-    ' the inflight counters on the SPA-WAIT-END line (whether the wait ends in a
-    ' real consensus or a timeout). Diagnostic-only; never read by the consensus
-    ' logic below.
+    ' Cached exit metrics are diagnostic and never influence consensus.
     ctx("lastJsIdleDuration") = jsIdleDuration
     ctx("lastInflFetch") = inflFetch
     ctx("lastInflXhr") = inflXhr
 
-    ' --- [Signal Gate] Track the last polled DOM-quiet duration so an
-    ' asynchronous net hit (DispatchGlobalEvents) can report quietAtHit --
-    ' the quiet time its timer reset is about to discard. quietAtHit greater
-    ' than minStableMs is direct log evidence that the reset prevented a
-    ' premature consensus (the settle-to-render-gap accident class).
+    ' Keep the pre-hit DOM-quiet duration so logs can show when a network hit prevented a
+    ' premature consensus.
     m_lastProbeQuietMs = jsIdleDuration
 
-    ' --- 3. Activity Logging (Discovery Recorder Integration) ---
     If probe.Exists("changes") Then
         Dim changes As Collection: Set changes = probe("changes")
         If Not changes Is Nothing Then
@@ -3549,15 +2697,12 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                 
                 If m_isRecording Then
                     Dim relTime As String
-                    relTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+                    relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
                     m_recorderLogs.Add "[" & relTime & "] [SPA-ACT] " & logSummary
                 End If
 
-                ' [Carryover notice] Scan for a content render -- a non-ignored
-                ' DOM: (childList) entry that is a TARGETED nested mutation (not
-                ' root-level churn like DOM:/html[1]/body[1], which IsContentRenderPath
-                ' rejects). ATTR:/PROP: are toggles, not renders. Every DOM: entry
-                ' here already passed the browser-side ignore filter (iN in the probe).
+                ' Only non-ignored targeted DOM childList mutations count as a content render; root churn
+                ' and ATTR/PROP toggles do not.
                 Dim ce As Variant, renderXPath As String: renderXPath = ""
                 For Each ce In changes
                     If Left$(CStr(ce), 4) = "DOM:" Then
@@ -3567,15 +2712,11 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                     End If
                 Next
                 If Len(renderXPath) > 0 Then
-                    ' (a) This wait produced a content render -> its own json (if any)
-                    '     is considered resolved; do not flag it at STABLE.
                     m_unresolvedJsonThisWait = False
-                    ' (b) If the PREVIOUS wait left a one-shot hint, this adjacent
-                    '     render MAY be that earlier action's delayed paint. Emit a
-                    '     single, non-committal NOTE -- no owner claim, no gap.
+                    ' An adjacent render may emit one non-committal carryover note; it never claims ownership.
                     If m_carryoverNoteArmedThisWait And Not m_carryoverNoteEmittedThisWait And m_isRecording Then
                         Dim rt As String
-                        rt = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+                        rt = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
                         m_recorderLogs.Add "[" & rt & "] [SPA-CARRYOVER-NOTE]" & _
                             " reason=prev-wait-unresolved-json | render=" & renderXPath & _
                             " | note=this-render-may-belong-to-the-previous-action"
@@ -3587,21 +2728,11 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
         End If
     End If
 
-    ' --- [Signal Gate] Hit detection, arm-lost detection, and timer resets ---
-    ' All three signal types share one semantic: a hit OPENS the gate AND resets
-    ' the consensus window (ctx("stableStart") = now), guaranteeing a minimum of
-    ' minStableMs of observed quiet AFTER the signal. Without that reset, a wait
-    ' whose DOM went quiet long before the signal (e.g. slow server, quiet page)
-    ' would reach consensus on the very next poll after the hit -- before the
-    ' render the signal announces has had any chance to appear.
+    ' Every signal hit opens the gate and resets stableStart, guaranteeing a full quiet
+    ' window after the evidence rather than one polling interval.
     If m_sigDomArmed Or m_sigVisArmed Then
-        ' Arm-lost detection: probe state (sigArmed/visArmed) lives in the page.
-        ' A navigation destroys it; the JIT re-injected probe reports False while
-        ' the VBA-side flags are still True. Cross-document signal waiting has
-        ' broken semantics, so we do NOT silently re-arm or (worse) silently
-        ' un-gate: the gate STAYS CLOSED (fail-safe -- never passes early) and
-        ' the wait runs to TIMEOUT with signal=..:miss, plus a one-shot
-        ' [SPA-SIGNAL-LOST] line pinpointing the cause.
+        ' Navigation destroys browser-side arms. Do not silently re-arm or un-gate; keep the
+        ' gate closed, log SPA-SIGNAL-LOST, and let the wait time out visibly.
         Dim probeSigArmed As Boolean, probeVisArmed As Boolean
         If probe.Exists("sigArmed") Then probeSigArmed = CBool(probe("sigArmed"))
         If probe.Exists("visArmed") Then probeVisArmed = CBool(probe("visArmed"))
@@ -3632,8 +2763,6 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
         End If
     End If
     If m_sigNetArmed And m_sigNetSeen Then
-        ' Hit already latched by DispatchGlobalEvents and logged with the VBA
-        ' dispatch timestamp; this poll only performs the once-per-wait timer reset.
         If ctx.Exists("sigNetAcked") Then
             If Not CBool(ctx("sigNetAcked")) Then
                 ctx("sigNetAcked") = True
@@ -3642,33 +2771,23 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
         End If
     End If
 
-    ' --- 4. Consensus Evaluation ---
-    ' Network Idle: JS fetch/XHR hooks report zero activity (condition 2).
     netIdle = (inflFetch = 0) And (inflXhr = 0)
 
-    ' DOM Stability: No mutations within the required threshold.
     activityStable = (jsIdleDuration >= CDbl(minStableMs))
 
-    ' [Signal Gate] Open when nothing is armed (ungated waits are unchanged),
-    ' otherwise every armed type must have latched. AND-composition on purpose:
-    ' the gate inherits the STRICTEST precondition, never the weakest.
+    ' Multiple armed signal types compose with AND.
     Dim sigGateOpen As Boolean
     sigGateOpen = (Not m_sigDomArmed Or m_sigDomSeen) And _
                   (Not m_sigNetArmed Or m_sigNetSeen) And _
                   (Not m_sigVisArmed Or m_sigVisSeen)
 
-    ' --- 5. Final Consensus Window Check ---
     If netIdle And activityStable Then
         If Not sigGateOpen Then
-            ' Gate closed: an armed completion signal has not arrived. Deliberately
-            ' do NOT reset stableStart here -- the hit itself resets it, which is
-            ' exactly what guarantees the post-signal observation window. Resetting
-            ' per-poll instead would merely re-derive the same guarantee at higher
-            ' cost; not resetting at the hit would shrink it to one poll interval.
+            ' Do not reset stableStart while merely waiting for a signal; the hit itself owns the
+            ' single reset.
             EvaluateSpaIdleCondition = False
             Exit Function
         End If
-        ' Check if the stable state has persisted for the designated window.
         If (currentMs - CDbl(ctx("stableStart"))) >= CDbl(minStableMs) Then
             If m_debugMode Then
                 Call socket_.LogEvent("Consensus reached (" & minStableMs & "ms window satisfied)", "", ">>> [BiDi SPA Stable]")
@@ -3676,19 +2795,11 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
             
             If m_isRecording Then
                 Dim successRelTime As String
-                successRelTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+                successRelTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
                 m_recorderLogs.Add "[" & successRelTime & "] [SPA-STABLE] Consensus reached (minStableMs=" & minStableMs & ")"
 
-                ' [Carryover notice] Consensus reached while this wait saw a tracked
-                ' json/API but NO content render: the response settled yet nothing
-                ' rendered before STABLE -- this wait is NOT clean. Emit a SUSPECT
-                ' (a suspicion, not a gate; consensus already fired, behaviour is
-                ' unchanged) and reserve a ONE-SHOT carryover hint for the IMMEDIATELY
-                ' next wait only. The firstJson key/sec is shown HERE (SUSPECT) so the
-                ' carryover NOTE can stay a pure, non-committal heads-up.
-                ' Caveat: characterData renders (textContent rewrite, not childList)
-                ' emit no DOM: entry and can false-fire this; the confirming half is
-                ' an armed re-run, not this line.
+                ' Consensus with a tracked response but no content render emits a diagnostic SUSPECT and
+                ' reserves one adjacent-wait hint. It does not change the successful result.
                 If m_unresolvedJsonThisWait Then
                     m_recorderLogs.Add "[" & successRelTime & "] [SPA-CONSENSUS-SUSPECT]" & _
                         " reason=track-json-no-content-render" & _
@@ -3703,13 +2814,11 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
             EvaluateSpaIdleCondition = False ' Cooling down...
         End If
     Else
-        ' Active state detected: Reset the window start timer.
         ctx("stableStart") = currentMs
         EvaluateSpaIdleCondition = False
     End If
 End Function
 
-' ExecuteCDPCommand: Sends a raw CDP command via BiDi tunneling.
 Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
                                    ByVal cdpParams As Dictionary, _
                                    Optional ByVal useSession As Boolean = True, _
@@ -3722,9 +2831,7 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
         Set ExecuteCDPCommand = res: Exit Function
     End If
 
-    ' --- Trigger state reset if CDP failures exceed limit ---
     If m_consecutiveCdpFailures >= MAX_CONSECUTIVE_CDP_FAILURES Then
-        ' Correctly calls the actual Sub PerformFatalReset instead of jumping to a label
         Call PerformFatalReset
         res("Error") = "Fatal: CDP instability. Context state has been cleared."
         Set ExecuteCDPCommand = res
@@ -3759,7 +2866,6 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
         Set ExecuteCDPCommand = res: Exit Function
     End If
 
-    ' Evaluate internal CDP protocol errors
     If InStr(strRes, """error"":") > 0 Then
         res("Error") = "CDP Error: " & strRes: res("Json") = strRes
         m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
@@ -3774,23 +2880,16 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
     Set ExecuteCDPCommand = res
 End Function
 
-' Internal helper to clear all state and stop the bleed
 Private Sub PerformFatalReset()
     Debug.Print "BiDi Critical: Performing Fatal Reset due to protocol instability."
     ClearState
     m_consecutiveCdpFailures = 0
-    ' Optionally, close the socket if the connection itself is suspect
-    ' If Not socket_ Is Nothing Then socket_.CloseConnection
 End Sub
 
-' PROCEDURE: StartSpaIdleProbe
-'  Executes the JavaScript probe injection.
 Private Sub StartSpaIdleProbe(Optional ByVal contextId As String = "")
     Dim targetCtx As String
-    ' Ensure the tree refresh is also silent if triggered
     If contextId <> "" Then targetCtx = contextId Else targetCtx = UpdateMainContextId(True, True)
     
-    ' MANDATORY: Pass Silent:=True to GetScriptRealmId to kill id:16
     Dim targetRealm As String
     targetRealm = GetScriptRealmId(targetCtx, True, True)
     
@@ -3799,65 +2898,55 @@ Private Sub StartSpaIdleProbe(Optional ByVal contextId As String = "")
     p.Add "target", BuildContextTarget(targetCtx, targetRealm)
     p.Add "awaitPromise", False
 
-    ' Execute the injection silently
     Call ExecuteBiDiCommand("script.evaluate", p, True, _
                             allowContextRetarget:=(targetCtx = m_mainContextId))
 End Sub
 
-' JavaScript Error Decoder (Enhanced Debugging)
-' Formats BiDi exceptionDetails into a readable string including stack trace
 Private Function FormatJavaScriptError(ByVal details As Object) As String
-    Dim Msg As String
+    Dim msg As String
     Dim stack As String
-    Dim frames As Collection
+    Dim Frames As Collection
     Dim frame As Object
     Dim i As Long
 
-    Msg = "JS Exception: " & details("text")
+    msg = "JS Exception: " & details("text")
     
     If details.Exists("lineNumber") Then
-        Msg = Msg & " [Line: " & details("lineNumber") & ", Col: " & details("columnNumber") & "]"
+        msg = msg & " [Line: " & details("lineNumber") & ", Col: " & details("columnNumber") & "]"
     End If
     If details.Exists("exception") Then
         If details("exception").Exists("description") Then
-            Msg = Msg & vbCrLf & "Description: " & details("exception")("description")
+            msg = msg & vbCrLf & "Description: " & details("exception")("description")
         End If
     End If
     If details.Exists("stackTrace") Then
-        Set frames = details("stackTrace")("callFrames")
+        Set Frames = details("stackTrace")("callFrames")
         stack = "--- JS Stack Trace ---"
-        For i = 1 To frames.count
-            Set frame = frames(i)
+        For i = 1 To Frames.count
+            Set frame = Frames(i)
             stack = stack & vbCrLf & "  at " & frame("functionName") & " (" & frame("url") & ":" & frame("lineNumber") & ":" & frame("columnNumber") & ")"
         Next i
-        Msg = Msg & vbCrLf & stack
+        msg = msg & vbCrLf & stack
     End If
 
-    FormatJavaScriptError = Msg
+    FormatJavaScriptError = msg
 End Function
 
-' AddIdleIgnoreSelector: Registers a CSS selector to be ignored by MutationObserver.
-' Users can call this from a Standard Module to bypass noisy elements (e.g., clocks).
 Public Sub AddIdleIgnoreSelector(ByVal cssSelector As String)
     If m_userIgnoreSelectors Is Nothing Then Set m_userIgnoreSelectors = New Collection
     m_userIgnoreSelectors.Add cssSelector
 End Sub
 
-' AddIdleIgnoreNetworkPattern: Registers a URL substring to be ignored by Network tracking.
-' Useful for bypassing background logging, telemetry, or specific third-party ads.
 Public Sub AddIdleIgnoreNetworkPattern(ByVal urlPattern As String)
     If m_userIgnoreNetworkPatterns Is Nothing Then Set m_userIgnoreNetworkPatterns = New Collection
     m_userIgnoreNetworkPatterns.Add urlPattern
 End Sub
 
-' ClearIdleFilters: Resets all user-defined noise filters.
 Public Sub ClearIdleFilters()
     Set m_userIgnoreSelectors = Nothing
     Set m_userIgnoreNetworkPatterns = Nothing
 End Sub
 
-' MergeToJsArray: Combines a comma-separated default string and a VBA Collection
-' into a JSON-formatted JavaScript array string.
 Private Function MergeToJsArray(ByVal defaultItems As String, ByVal userItems As Collection) As String
     Dim items As New Collection
     Dim dArr() As String: dArr = Split(defaultItems, ",")
@@ -3883,16 +2972,9 @@ Private Function MergeToJsArray(ByVal defaultItems As String, ByVal userItems As
     MergeToJsArray = result
 End Function
 
-' INTERNAL JS HELPER: GetActionJs
-'  Provides centralized JavaScript snippets for all browser actions.
-'              Ensures the SPA watchdog is reset immediately before execution.
-' TRUE for errors where a command may have executed but its outcome is unknown, so a
-' non-idempotent action must NOT be re-run:
-'   604 - soft/hard receive timeout (sent, no response)
-'   600 - connection lost while waiting (sent, then dropped)
-'   517 - Safety Shell watchdog timeout. CRITICAL: Promise.race does NOT cancel the losing
-'         _tk(), so the browser-side JS keeps running and may still perform the click /
-'         keystroke AFTER we stop waiting -- re-running would double the action.
+' State-changing action keys are non-repeatable. 604/600/601/517 mean dispatch outcome
+' is unknown; Promise.race does not cancel the losing browser task, so it may execute after
+' VBA stopped waiting. Such actions must not be replayed.
 Private Function IsAmbiguousOutcome(ByVal errNum As Long) As Boolean
     Select Case errNum
         Case 604, 601, 600, 517
@@ -3900,12 +2982,34 @@ Private Function IsAmbiguousOutcome(ByVal errNum As Long) As Boolean
     End Select
 End Function
 
-' TRUE for selected Chromium network failures for which retrying an ORDINARY page
-' navigation is considered acceptable. This does NOT prove the request never reached
-' the server; a reset can occur after the request was sent. One-time URLs, downloads,
-' or server-side effects must not rely on this automatic retry policy. Context-loss /
-' invalid-argument / JS / ambiguous timeout errors are deliberately excluded and stay
-' terminal.
+Private Function IsAmbiguousDispatchFailure(ByVal errNum As Long, _
+                                            ByVal errSrc As String, _
+                                            ByVal errDesc As String) As Boolean
+    If IsAmbiguousOutcome(errNum) Then
+        IsAmbiguousDispatchFailure = True
+        Exit Function
+    End If
+
+    If errNum <> ERR_BIDI_PROTOCOL Then Exit Function
+
+    If StrComp(errSrc, "BiDi:ExecuteBiDiCommand", vbTextCompare) = 0 And _
+       InStr(1, errDesc, "Environment desync (Context Lost)", vbTextCompare) > 0 Then
+        IsAmbiguousDispatchFailure = True
+        Exit Function
+    End If
+
+    Dim d As String: d = LCase$(errDesc)
+    If InStr(d, "inspected target navigated or closed") > 0 Or _
+       InStr(d, "execution context was destroyed") > 0 Or _
+       (InStr(d, "context") > 0 And _
+        (InStr(d, "not found") > 0 Or InStr(d, "cannot find") > 0 Or _
+         InStr(d, "destroyed") > 0 Or InStr(d, "closed") > 0)) Then
+        IsAmbiguousDispatchFailure = True
+    End If
+End Function
+
+' Automatic navigation retry covers selected Chromium network failures only and remains
+' unsafe for one-time or side-effecting URLs.
 Private Function IsRetryableNavFailure(ByVal errDesc As String) As Boolean
     Dim d As String: d = LCase$(errDesc)
     Dim codes As Variant
@@ -3922,9 +3026,8 @@ Private Function IsRetryableNavFailure(ByVal errDesc As String) As Boolean
     Next i
 End Function
 
-' TRUE for action keys whose JS mutates page state and is NOT safely repeatable
-' (a re-run could double the effect): clicks, text entry, selections. Read-only /
-' idempotent keys (visibility_check, lazy_scroll) return False so their retry is kept.
+' Only click/input/select keys are classified non-idempotent; read-only operations keep
+' recovery retry.
 Private Function IsStateChangingActionKey(ByVal key As String) As Boolean
     Select Case LCase$(key)
         Case "click", "input", "input_keys", "select", "select_text", "shadow_click"
@@ -3935,7 +3038,6 @@ End Function
 Private Function GetActionJs(ByVal actionType As String) As String
     Dim js As String: js = ""
     
-    ' SPA probe reset: forces 'Busy' state in MasterWaitEngine to prevent race conditions.
     Dim rp As String
     rp = "if(window.__vbaIdleProbe) window.__vbaIdleProbe.lastMutationTs = performance.now(); "
     
@@ -3944,8 +3046,6 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "try { const e=arguments[0]; e.scrollIntoView({block:'center'}); e.focus(); " & rp & "e.click(); return true; } catch(err) { throw err; }"
                  
         Case "input"
-            ' Bulk execCommand('insertText') with select() overwrite. Fast for standard forms.
-            ' Uses e.select() to preserve framework state, then insertText replaces selected text.
             js = js & "try { const e=arguments[0],v=arguments[1]; e.scrollIntoView({block:'center',inline:'center'}); e.click(); e.focus(); " & rp & "e.select(); "
             js = js & "const s=document.execCommand('insertText',false,v); if(!s){e.value='';e.value=v;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));} "
             js = js & "e.blur(); return true;} catch(err){throw err;}"
@@ -3955,20 +3055,16 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); s.blur(); return true;} catch(err){throw err;}"
 
         Case "select_text"
-            ' Normalized text matching for <select> option elements.
             js = js & "try { const s=arguments[0],t=arguments[1],n=(str)=>str.replace(/[\s\u00A0]+/g,' ').trim(); let f=false; const target=n(t); "
             js = js & "for(let i=0;i<s.options.length;i++){if(n(s.options[i].text)===target){s.value=s.options[i].value;f=true;break;}} "
             js = js & "if(!f)throw new Error('Option text not found: '+t); s.scrollIntoView({block:'center'}); s.focus(); " & rp
             js = js & "s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); s.blur(); return true;} catch(err){throw err;}"
 
         Case "visibility_check"
-            ' Returns true if element is connected, not display:none/hidden, has opacity,
-            ' and occupies visual space (width/height > 0 or has client rects).
             js = js & "const e=arguments[0]; if(!e||!e.isConnected)return false; const s=window.getComputedStyle(e),r=e.getBoundingClientRect(); "
             js = js & "return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0));"
    
         Case "shadow_click"
-            ' Penetrate Shadow DOM boundaries to find and click a nested element.
             js = js & "const sels=arguments[0],tout=arguments[1],start=Date.now(); "
             js = js & "const fd=(r,s)=>{let n=r.querySelector(s);if(n)return n;for(let c of r.querySelectorAll('*')){if(c.shadowRoot&&(n=fd(c.shadowRoot,s)))return n;}return null;}; "
             js = js & "while(Date.now()-start<tout){ hb(); let el=document,lastS=null; "
@@ -3978,27 +3074,16 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "await new Promise(r=>setTimeout(r,100));} "
             
       Case "input_keys"
-            ' Wiz/Lit SPAs may destroy the trigger on click and respawn the <input>
-            ' (sometimes repeatedly). Resolve the real input by requiring the same
-            ' activeElement on two consecutive polls before locking on.
 
-            ' Phase 0: activate + resolve the real input
             js = js & "try{let e=arguments[0],v=arguments[1],o=e;e.scrollIntoView({block:'center',inline:'center'});e.click();e.focus();"
             js = js & "let prev=null,stb=0;for(let t=Date.now();Date.now()-t<3000;){hb();let a=document.activeElement;"
             js = js & "if(a&&a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type)&&typeof a.selectionStart==='number'){if(a===prev){stb++;if(stb>=2){e=a;break;}}else{prev=a;stb=1;}}else{prev=null;stb=0;}await new Promise(r=>setTimeout(r,15));}"
-            ' Phase 1: clear value
             js = js & "(e.select?e.select():document.execCommand('selectAll'));await new Promise(r=>setTimeout(r,80));document.execCommand('delete');await new Promise(r=>setTimeout(r,80));"
             js = js & "if(e.value){if(e.select)e.select();document.execCommand('forwardDelete');await new Promise(r=>setTimeout(r,80));}if(e.value){e.value='';e.dispatchEvent(new Event('input',{bubbles:true}));await new Promise(r=>setTimeout(r,80));}" & rp & "await new Promise(r=>setTimeout(r,40));"
-            ' Phase 2: per-char insertText, retracking activeElement
             js = js & "for(let c of v){hb();let s=(typeof e.selectionStart==='number'?e.selectionStart:0);document.execCommand('insertText',false,c);for(let k=0;k<80;k++){let a=document.activeElement;if(a&&a!==e&&a.tagName==='INPUT'&&(a.type==='text'||!a.type))e=a;if(document.activeElement===e&&typeof e.selectionStart==='number'&&e.selectionStart>=s+1)break;await new Promise(r=>setTimeout(r,10));}}"
-            ' Phase 3: validate
             js = js & "if(v.length>0&&(!e.value||e.value.length<v.length))throw new Error('Wiz Input Validation Failed: '+e.value);return true;}catch(err){throw err;}"
 
         Case "autoclicker"
-            ' Background MutationObserver clicker (script.addPreloadScript).
-            ' Preload runs with NO args per document -> xpath/timeout inlined via {{}};
-            ' {{XPATH}} receives a JSON-encoded string literal (quotes included).
-            ' wrapper is a function expression (BiDi executes it). Cf. ShadowUnlocker.
             js = js & "function(){const x={{XPATH}},t={{TIMEOUT}},s=Date.now();"
             js = js & "const f=()=>{const e=document.evaluate(x,document,null,9,null).singleNodeValue;"
             js = js & "if(e&&(e.offsetWidth>0||e.offsetHeight>0)){e.click();"
@@ -4007,13 +3092,6 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "o.observe(document.body||document,{childList:1,subtree:1,attributes:1});}"
 
         Case "lazy_scroll"
-            ' Infinite-scroll driver: JS runs only the scroll loop; the "all loaded"
-            ' verdict is left to WaitForNetworkIdleSpa (VBA) via __vbaIdleProbe.
-            ' Stops when scrollHeight stalls for 2 consecutive checks.
-            ' No 'rp' on purpose: the probe already tracks fetch/XHR/mutations, so
-            ' stamping here would inject phantom activity and skew idle consensus.
-            ' arguments[0]=scroll budget ms (< CallScript safetyTimeoutMs, enforced upstream).
-            ' arguments[1]=poll interval ms after each scrollTo (default 800; too short = early stop).
             js = js & "try{const tout=arguments[0],poll=arguments[1],start=Date.now();"
             js = js & "const se=document.scrollingElement||document.documentElement||document.body;"
             js = js & "let lastH=se.scrollHeight,stable=0;"
@@ -4028,29 +3106,10 @@ Private Function GetActionJs(ByVal actionType As String) As String
     GetActionJs = js
 End Function
 
-' CRITICAL: JS AUTHORING CONTRACT
-' Any JavaScript executed via this method must adhere to the following contract
-' to maintain communication with VBA.
-'
-' 1. [FORBIDDEN] Synchronous Blocking Loops
-'    Will trigger WinHttp timeouts and cause Excel to "Not Responding" (whiteout).
-'    BAD : while(true) { ... }
-'    GOOD: while(cond) { hb(); await new Promise(r => setTimeout(r, 50)); }
-'
-' 2. [REQUIRED] Asynchronous Chunking for Long Tasks
-'    Any process exceeding 100ms must yield control to the event loop using 'await'.
-'    GOOD: await heavyProcess();
-'
-' 3. [REQUIRED] Invoke hb() at the Loop Head
-'    The 'hb' (Heartbeat) closure is essential to reset VBA-side observation timeouts.
-'    GOOD: while(cond) { hb(); /* process */ }
-'
-' * NOTE: Due to VBA's single-threaded nature, it is impossible to forcibly terminate
-'   an infinite loop originating from the JS side.
-'   THIS CONTRACT IS EXPERIMENTALLY VERIFIED:
-'   Confirmed that Excel whites out and fails to recover even after 30 seconds
-'   when executing 'while(true) {}'.
-' ========================================================================================
+' JS AUTHORING CONTRACT
+' Long CallScript tasks must yield with await and call hb() inside loops. Never use a
+' synchronous blocking loop: it blocks the browser event loop and prevents a BiDi response.
+' VBA cannot forcibly terminate such browser-side JavaScript.
 Public Function CallScript(ByVal js As String, _
                            Optional ByVal args As Collection = Nothing, _
                            Optional ByVal contextId As String = "", _
@@ -4072,7 +3131,6 @@ Public Function CallScript(ByVal js As String, _
     Dim finalJs As String: finalJs = WrapInSafetyShell(js, safetyTimeoutMs)
 
     If forceRealmTarget Then
-        ' Pass the Silent flag to the internal realm discovery call
         targetDic.Add "realm", GetScriptRealmId(resolvedCtx, False, Silent)
     Else
         targetDic.Add "context", resolvedCtx
@@ -4081,16 +3139,10 @@ Public Function CallScript(ByVal js As String, _
     params.Add "functionDeclaration", finalJs
     params.Add "arguments", args
     params.Add "target", targetDic
-    ' [STRUCTURAL CONSTRAINT] awaitPromise is intentionally hardcoded to True.
-    ' WrapInSafetyShell wraps jsBody in an "async function" that returns a Promise
-    ' containing the JSON-stringified result. If awaitPromise were False, the BiDi
-    ' protocol would return the raw Promise object instead of the resolved value,
-    ' causing all result extraction (UnwrapSafetyShell / GetCleanResult) to fail.
-    ' The caller's awaitPromise parameter is therefore NOT forwarded here.
-    ' Fire-and-forget execution should use PostScript instead of CallScript.
+    ' CallScript always awaits the Safety Shell promise; otherwise BiDi returns a Promise
+    ' object instead of the resolved envelope. Use PostScript for send-only execution.
     params.Add "awaitPromise", True
     
-    ' Execute command with the Silent flag
     Dim rawRes As String: rawRes = ExecuteBiDiCommand("script.callFunction", params, Silent, allowAmbiguousRetry, _
                                 allowContextRetarget:=(resolvedCtx = m_mainContextId))
     Dim json As Object: Set json = ValidateProtocolResponse(rawRes, "script.callFunction")
@@ -4098,35 +3150,22 @@ Public Function CallScript(ByVal js As String, _
     CallScript = WebJsonConverter.ConvertToJson(procObj)
 End Function
 
-' IsTimeout: Precision-safe timeout check.
 Private Function IsTimeout(ByVal startTicks As Currency, ByVal timeoutMs As Double) As Boolean
     If timeoutMs <= 0 Then Exit Function
-    ' Simple comparison
-    IsTimeout = socket_.ElapsedMs(startTicks) > timeoutMs
+    IsTimeout = socket_.elapsedMs(startTicks) > timeoutMs
 End Function
 
-' Internal Helper: Centralizes background tasks during a wait loop.
-' Keeps the WebSocket queue moving and the Excel UI responsive.
 Private Sub WaitHeartbeat(Optional ByVal sleepMs As Long = 50)
-    ' 1. Logic-layer responsibility: Flush the incoming BiDi event queue.
-    ' Ensures VBA state stays in sync with the browser's network/DOM state.
     ProcessRecorderQueue
 
-    ' 2. Throttled DoEvents via PumpMessages (preserves existing 100ms gate).
     socket_.PumpMessages 100
 
-    ' 3. Delegate physical sleep to Communicator's YieldExecution.
-    ' DoEvents is set to False because PumpMessages above already handled it.
-    ' The 50ms floor guard preserves the original SanitizeMs safety behavior.
     Dim vSleep As Long: vSleep = sleepMs
     If vSleep < 50 Then vSleep = 50
 
     socket_.YieldExecution vSleep, False
 End Sub
 
-' FUNCTION: GetProbeJs
-'  Provides the comprehensive JavaScript payload for SPA monitoring.
-'              Integrated with Smart XPath generation (Ancestor-ID based).
 Private Function GetProbeJs(ByVal probeType As String) As String
     Dim js As String: js = ""
     Dim selArray As String: selArray = MergeToJsArray(DEFAULT_IGNORE_SELECTORS, m_userIgnoreSelectors)
@@ -4134,73 +3173,44 @@ Private Function GetProbeJs(ByVal probeType As String) As String
 
     Select Case LCase$(probeType)
         Case "inject"
-            ' --- SPA Monitoring Probe: Now filters out Sizzle noise ---
             js = js & "(function(){if(window.__vbaSpaProbeInstalled&&window.__vbaIdleProbe)return true;window.__vbaSpaProbeInstalled=true;var selectors=" & selArray & ",ignoreNetwork=" & netArray & ","
             js = js & "p=window.__vbaIdleProbe||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],inflightUrls:new Set()};window.__vbaIdleProbe=p;if(!p.inflightUrls)p.inflightUrls=new Set();"
-            ' --- [Signal Gate] state fields (idempotent: preserved when the probe already exists) ---
             js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath='';}"
             js = js & "var gX=function(e){if(!e||e.nodeType!==1)return '';var s=[];while(e&&e.nodeType===1){if(e.id){s.unshift('//*[@id=\''+e.id+'\']');return s.join('/')}"
             js = js & "var i=1,b=e.previousSibling;while(b){if(b.nodeType===1&&b.tagName===e.tagName)i++;b=b.previousSibling}s.unshift(e.tagName.toLowerCase()+'['+i+']');e=e.parentNode}return '/'+s.join('/')};"
 
-            ' --- [Signal Gate] browser-side arm/disarm + visibility predicate ---
-            ' vChk mirrors the 'visibility_check' action predicate (GetActionJs) so
-            ' ArmVisibilitySignal and ExecuteIsElementVisible agree on 'visible'.
             js = js & "p.vChk=function(e){if(!e||!e.isConnected)return false;var s=window.getComputedStyle(e),r=e.getBoundingClientRect();return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0))};"
-            ' armDomSignal(xpath, includeAttrs): rc 0=armed, -1=target not found, -2=bad XPath.
-            ' Scoped observer on the target subtree; sigCount is a MONOTONIC counter
-            ' (never read-and-clear), so the VBA poll is a pure >0 latch check.
-            ' childList+characterData by default; attributes only on request.
+            ' DOM signal counters are monotonic latches; content arms require an existing valid XPath.
             js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;"
             js = js & "if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;"
             js = js & "p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
-            ' armVisSignal(xpath): rc 0=armed, -2=bad XPath, -3=already visible (guard:
-            ' waiting for something already visible would open the gate instantly and
-            ' silently degrade to an ungated wait -- the exact accident this gate exists
-            ' to prevent). Target absence is VALID here (appearance is the signal).
+            ' Visibility arms reject an already-visible target; target absence is valid because
+            ' appearance is the signal.
             js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visXPath=x;p.visArmed=true;p.visSeen=false;return 0};"
             js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath=''};"
 
             
-            ' --- MutationObserver: tracks DOM/attribute changes for SPA idle detection ---
-            ' gX(node) computes a full XPath for the changed node.
-            ' iN(node, selectors) returns truthy if node matches any ignore selector (CSS).
-            ' lg(entry) appends to changeList (capped at 50) and updates lastMutationTs.
-            ' uT() updates the last-mutation timestamp (used for idle consensus).
             js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{"
             js = js & "if(e && !/sizzle|signon_javascript|conversation_button/.test(e) && p.changeList.indexOf(e)===-1){"
             js = js & "if(p.changeList.length<50)p.changeList.push(e);uT()}};"
             js = js & "iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;return t?s.some((x)=>t.closest(x)!==null):0};"
-            ' --- HTMLInputElement.value setter hook: detects programmatic value changes ---
             js = js & "try{const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');Object.defineProperty(HTMLInputElement.prototype,'value',{set:function(v){lg('PROP:'+gX(this)+'[value]');return d.set.call(this,v)},get:function(){return d.get.call(this)},configurable:true})}catch(e){}"
-            ' --- Observer registration: childList + attributes on entire document ---
             js = js & "try{new MutationObserver((ms)=>{ms.forEach((m)=>{if(iN(m.target,selectors))return;var path=gX(m.target),entry=(m.type==='attributes')?'ATTR:'+path+'['+m.attributeName+']':'DOM:'+path;"
             
-            ' Attribute Filtering: Ignore mutations on technical/transient attributes
             js = js & "if(entry.indexOf('sizzle')===-1) lg(entry);})}).observe(document,{childList:true,subtree:true,attributes:true})}catch(e){}"
             
-            ' --- fetch() wrapper: intercepts fetch calls to track inflight count ---
-            ' Wraps window.fetch once (__vbaWrapped flag). Increments inflightFetchCount on
-            ' call, decrements on resolve/reject. Skipped if URL matches ignoreNetwork.
-            ' A synchronous throw from the original fetch also decrements (a stuck
-            ' counter would block idle consensus until the next navigation).
+            ' fetch wrapping decrements on resolve, reject, and synchronous throw; a leaked counter
+            ' would permanently block idle consensus.
             js = js & "var __vbaMatch=function(u,pat){if(pat.indexOf('*')<0)return u.indexOf(pat)!==-1;var re=pat.replace(/[.+^${}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*').replace(/\?/g,'.');try{return new RegExp(re).test(u)}catch(e){return u.indexOf(pat)!==-1}};"
             js = js & "if(typeof window.fetch==='function'&&!window.fetch.__vbaWrapped){var oF=window.fetch;window.fetch=function(u,o){var r=(typeof u==='string')?u:(u&&u.url)||'';if(ignoreNetwork.some((pat)=>__vbaMatch(r,pat)))return oF.apply(this,arguments);"
             js = js & "p.inflightFetchCount++;p.inflightUrls.add(r);var dec=()=>{p.inflightFetchCount--;p.inflightUrls.delete(r);uT()};try{return oF.apply(this,arguments).then((r2)=>{dec();return r2}).catch((e)=>{dec();throw e})}catch(e2){dec();throw e2}};window.fetch.__vbaWrapped=true}"
-            ' --- XHR wrapper: intercepts XMLHttpRequest open/send to track inflight count ---
-            ' Wraps prototype.open to capture URL, prototype.send to increment counter.
-            ' Decrements on 'loadend' event. Skipped if URL matches ignoreNetwork.
-            ' A synchronous throw from send() decrements via dn(), since 'loadend'
-            ' never fires for a request that was never started.
+            ' XHR wrapping decrements on loadend and synchronous send failure for the same reason.
             js = js & "if(!XMLHttpRequest.prototype.__vbaWrapped){var oO=XMLHttpRequest.prototype.open,oS=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this.__vbaUrl=u;this.__vbaHooked=true;return oO.apply(this,arguments)};"
             js = js & "XMLHttpRequest.prototype.send=function(){var s=this,u=this.__vbaUrl||'';if(ignoreNetwork.some((pat)=>__vbaMatch(u,pat))){s.__vbaHooked=false;return oS.apply(this,arguments)}p.inflightXhrCount++;p.inflightUrls.add(u);"
             js = js & "var dn=()=>{if(s.__vbaHooked){p.inflightXhrCount--;p.inflightUrls.delete(u);s.__vbaHooked=false;uT()}s.removeEventListener('loadend',dn)};this.addEventListener('loadend',dn);try{return oS.apply(this,arguments)}catch(e2){dn();throw e2}};XMLHttpRequest.prototype.__vbaWrapped=true}return true})();"
         Case "query"
-            ' Returns JSON snapshot of probe state: active flag, timing, inflight counts,
-            ' pending DOM change list, and inflight URLs. Clears changeList after read.
             js = js & "var p=window.__vbaIdleProbe;if(!p)return JSON.stringify({active:false});"
-            ' [Signal Gate] visibility signal: evaluated per poll ONLY while armed and
-            ' not yet latched; after the latch the XPath evaluation is skipped entirely,
-            ' so the repeated-evaluation cost window is [arm .. first visible] only.
+            ' Visibility XPath polling stops after the first latch.
             js = js & "if(p.visArmed&&!p.visSeen&&p.visXPath){try{var vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
             js = js & "var res={active:true,now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,inflightUrls:Array.from(p.inflightUrls||[]),"
             js = js & "sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};"
@@ -4209,24 +3219,19 @@ Private Function GetProbeJs(ByVal probeType As String) As String
     GetProbeJs = js
 End Function
 
-' Internal Helper: Builds a target dictionary for BiDi script commands.
-' Priority: Uses Realm ID if provided for execution stability, falls back to Context ID.
 Private Function BuildContextTarget(ByVal contextId As String, _
                                    Optional ByVal realmId As String = "") As Dictionary
     Dim target As New Dictionary
     
     If realmId <> "" Then
-        ' Execution in a specific realm is more stable for persistent probes
         target.Add "realm", realmId
     Else
-        ' Fallback to context-level targeting
         target.Add "context", contextId
     End If
     
     Set BuildContextTarget = target
 End Function
 
-' Configuration: Public properties to manage noise filtering from Standard Modules.
 Public Property Let IgnoreSelectors(ByVal cssSelectors As String)
     If m_userIgnoreSelectors Is Nothing Then Set m_userIgnoreSelectors = New Collection
     m_userIgnoreSelectors.Add cssSelectors
@@ -4237,8 +3242,6 @@ Public Property Let IgnoreNetworkPatterns(ByVal urlPattern As String)
     m_userIgnoreNetworkPatterns.Add urlPattern
 End Property
 
-' Internal Helper: Ensures a Dictionary object is initialized.
-' Returns a new Dictionary if the input is Nothing, otherwise returns the input.
 Private Function EnsureDictionary(ByVal dic As Dictionary) As Dictionary
     If dic Is Nothing Then
         Set EnsureDictionary = New Dictionary
@@ -4247,14 +3250,9 @@ Private Function EnsureDictionary(ByVal dic As Dictionary) As Dictionary
     End If
 End Function
 
-' [INTERNAL] MasterWaitEngine (Refined Anti-Freeze & Stack-Safe Version)
-'  High-precision polling engine for all wait operations.
-' UPGRADED:
-'   - Telemetry Gating: Uses instance-level 'm_lastTelemetryTick' to ensure consistent
-'     100ms HUD updates, decoupled from Windows message pump frequency.
-'   - Stack Safety: Timer is reset only at root entry (depth=1) to allow nested calls
-'     to share a continuous timing context without flickering.
-'   - CleanExit Fix: Restored correct logic (errNum = 0) to ensure HUD removal on success.
+
+' MasterWaitEngine owns URL-contains and SPA-idle polling. m_waitStackDepth owns the
+' nested Office UI lock, and every exit converges on cleanup.
 Private Function MasterWaitEngine(ByVal mode As waitMode, _
                                   ByVal timeoutMs As Long, _
                                   ByVal intervalMs As Long, _
@@ -4269,36 +3267,25 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
     m_waitStackDepth = m_waitStackDepth + 1
     
     If m_waitStackDepth = 1 Then
-        ' --- ROOT ENTRY: Lock UI and Initialize Timer ---
-        ' PHYSICAL LOCK: Prevent user intervention during critical sync operations.
         Application.Interactive = False
         Application.Cursor = xlWait
         
-        ' Initialize the instance-level timer for HUD updates.
-        ' Resetting to 0 ensures the first update fires immediately.
         m_lastTelemetryTick = 0
         
-        ' JIT HUD: Inject the UI container into the browser.
         On Error Resume Next
         Call Me.CallScript(GetHudJs("init"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), False, False, 2000, True)
         On Error GoTo 0
     End If
     On Error GoTo ErrorHandler
     Do
-        ' [CRITICAL] Processes WebSocket queue and pumps Windows messages.
-        ' Maintains Excel UI responsiveness during the wait.
+        ' Queue processing and Office pumping occur only at this safe wrapper wait boundary.
         WaitHeartbeat vInterval
         
-        ' --- REFINED TELEMETRY GATING ---
-        ' Uses dedicated instance-level timer to poll UpdateWaitTelemetry every 100ms.
-        ' This is independent of DoEvents frequency to ensure a stable HUD refresh rate.
-        If socket_.ElapsedMs(m_lastTelemetryTick) > 100 Then
+        If socket_.elapsedMs(m_lastTelemetryTick) > 100 Then
             Call UpdateWaitTelemetry(mode, ctx)
             m_lastTelemetryTick = socket_.NowTicks()
         End If
         
-        ' --- LAYER 2: LOGICAL EVALUATION & CONSENSUS CHECK ---
-        ' Check if the target condition (URL match or SPA stability) is met.
         On Error Resume Next
         success = EvaluateWaitCondition(mode, ctx)
         If Err.Number <> 0 Then
@@ -4307,10 +3294,8 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
         End If
         On Error GoTo ErrorHandler
         
-        ' --- LAYER 3: EXIT & TIMEOUT LOGIC ---
         If success Then Exit Do
         
-        ' Standard Logical Timeout check (Error 504).
         If IsTimeout(startTick, CDbl(vTimeout)) Then
             errNum = 504
             errDesc = "Wait condition timed out (" & vTimeout & "ms)."
@@ -4319,9 +3304,7 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
         End If
     Loop
 
-' CLEANUP & RESTORATION
 CleanExit:
-    ' STEP 1: UI RESTORATION
     If errNum <> 0 Then
         m_waitStackDepth = 0
     Else
@@ -4335,23 +3318,16 @@ CleanExit:
         Application.StatusBar = False
     End If
     
-    ' STEP 2: BROWSER SIDE CLEANUP
-    ' [FIXED] Restored correct removal condition:
-    ' Remove HUD if operation succeeded (errNum = 0) OR if we are at the outermost call.
     On Error Resume Next
     If errNum = 0 Or m_waitStackDepth = 0 Then
         Call Me.CallScript(GetHudJs("remove"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), False, False, 1000, True)
     End If
     
-    ' STEP 3: RESOURCE RELEASE
     On Error GoTo 0
     
-    ' STEP 4: ERROR PROPAGATION (504, 505, or 517 from JS)
     If errNum <> 0 Then
-        ' --- Consensus Failure Analysis ---
-        ' HALT escalation applies ONLY to the logical timeout (504) with pending
-        ' requests. Other errors (505 probe panic, socket 6xx) must keep their
-        ' original code so the socket-recovery / best-effort paths stay reachable.
+        ' HALT escalation applies only to logical timeout 504 with pending requests; other errors
+        ' retain their original codes for recovery or best-effort handling.
         On Error Resume Next
         Application.Interactive = True
         
@@ -4373,10 +3349,8 @@ CleanExit:
         End If
         On Error GoTo 0
         
-        ' [Tier1 Diagnostics] Record the give-up outcome BEFORE raising, so the
-        ' saved discovery log distinguishes a real consensus from a timeout,
-        ' halt, or error (outcome key: see WriteSpaWaitEnd). Previously these
-        ' only went to the Immediate Window and left no trace in the log.
+        ' Record failure outcome before raising so saved logs distinguish timeout, halt, and
+        ' non-504 error.
         Dim endStatus As String
         If errNum = 504 And Len(inflightDetail) > 0 Then
             endStatus = "HALT"
@@ -4387,17 +3361,13 @@ CleanExit:
         End If
         On Error Resume Next
         Call WriteSpaWaitEnd(endStatus, mode, ctx, startTick)
-        ' [Signal Gate] One-shot consumption: the arm's lifetime is exactly one
-        ' SPA-idle wait, whatever the outcome. Consuming on TIMEOUT/ERROR too
-        ' prevents a stale arm from permanently gating an unrelated later wait.
-        ' Must run AFTER WriteSpaWaitEnd (which reads the flags for signal=).
+        ' Consume one-shot arms on success and failure, after END logging, to prevent stale gates.
         If mode = WaitMode_SpaIdle Then ConsumeSignalArms CStr(ctx("contextId"))
         Err.Clear
         On Error GoTo 0
 
         If errNum = 504 And Len(inflightDetail) > 0 Then
-            ' --- HALT: 504 timeout with pending fetch/XHR activity blocking consensus ---
-            ' Output to Immediate Window and raise non-absorbable error.
+            ' A 504 with pending requests becomes non-absorbable ERR_CONSENSUS_HALT.
             Debug.Print String(60, "=")
             Debug.Print "[" & Format(Now, "hh:mm:ss") & "] CONSENSUS HALT"
             Debug.Print "  Pending Fetch/XHR:" & inflightDetail
@@ -4409,17 +3379,14 @@ CleanExit:
             
             Err.Raise ERR_CONSENSUS_HALT, "BiDi:MasterWaitEngine:" & errSrc, haltMsg
         Else
-            ' --- NON-HALT: DOM-only 504, or a non-504 error (505 / socket 6xx) ---
-            ' Propagate with the original code; TrySyncPhase absorbs non-HALT errors.
+            ' DOM-only 504 and non-504 errors retain their codes; TrySyncPhase may absorb them.
             Err.Raise errNum, "BiDi:MasterWaitEngine:" & errSrc, errDesc
         End If
     End If
     
-    ' [Tier1 Diagnostics] Record a successful consensus (with achieved slack).
     If success Then
         On Error Resume Next
         Call WriteSpaWaitEnd("STABLE", mode, ctx, startTick)
-        ' [Signal Gate] One-shot consumption (see the error-path twin above).
         If mode = WaitMode_SpaIdle Then ConsumeSignalArms CStr(ctx("contextId"))
         On Error GoTo 0
     End If
@@ -4432,17 +3399,8 @@ ErrorHandler:
     Resume CleanExit
 End Function
 
-' [Tier1 Diagnostics] WriteSpaWaitEnd
-'   Emits a single [SPA-WAIT-END] line summarising the outcome of one SPA-idle
-'   wait: STABLE (consensus reached), TIMEOUT (504, no pending network),
-'   HALT (504 with requests still pending), or ERROR (non-504 failure:
-'   505 probe panic, socket 6xx, JS error). Reports wall-clock elapsedMs, the
-'   DOM-quiet duration actually achieved (domQuietMs), the slack over the
-'   configured threshold (slackMs = domQuietMs - minStableMs), and the network
-'   counters at exit. Paired with [SPA-WAIT-BEGIN] this lets an analyzer tell a
-'   comfortable setting from a lucky near-miss, and makes give-ups visible in the
-'   saved log instead of only the Immediate Window. No-op unless recording and
-'   the wait is SPA-idle.
+' SPA-WAIT-END records outcome, elapsed time, achieved DOM quiet/slack, and network
+' counters. It is the diagnostic pair of SPA-WAIT-BEGIN and runs only while recording.
 Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
                             ByVal mode As waitMode, _
                             ByRef ctx As Dictionary, _
@@ -4462,27 +3420,18 @@ Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
     If ctx.Exists("lastInflFetch") Then inflFetch = CLng(ctx("lastInflFetch"))
     If ctx.Exists("lastInflXhr") Then inflXhr = CLng(ctx("lastInflXhr"))
 
-    Dim ElapsedMs As Double: ElapsedMs = socket_.ElapsedMs(startTick)
+    Dim elapsedMs As Double: elapsedMs = socket_.elapsedMs(startTick)
     Dim slackMs As Double: slackMs = domQuietMs - CDbl(minStableMs)
 
     Dim relTime As String
-    relTime = Format((socket_.NowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+    relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
 
-    ' [Signal Gate] Per-armed-type outcome (e.g. "net:hit,dom:miss"). Uniform
-    ' type-prefixed notation even for a single armed type, so one parser shape
-    ' covers solo and combined arms. Omitted entirely on ungated waits (line
-    ' stays byte-identical to the pre-gate format). Read at TIMEOUT:
-    '   miss -> the signal never arrived (selector/pattern error, action never
-    '           fired, or the site genuinely produced no change) -- NOT a
-    '           minStableMs problem; raising the threshold cannot fix it.
-    '   hit  -> signal arrived but post-signal quiet never settled (continuous
-    '           site mutation) -- a threshold/site problem, not a signal problem.
-    ' NOTE: must be built BEFORE ConsumeSignalArms clears the flags (call order
-    ' in MasterWaitEngine guarantees this).
+    ' Signal END status distinguishes miss (evidence never arrived) from hit-but-unsettled.
+    ' Build it before arms are consumed.
     Dim sigEndDesc As String: sigEndDesc = BuildSignalEndDesc()
 
     m_recorderLogs.Add "[" & relTime & "] [SPA-WAIT-END] " & outcome & _
-                       " | elapsedMs=" & Format(ElapsedMs, "0") & _
+                       " | elapsedMs=" & Format(elapsedMs, "0") & _
                        " | domQuietMs=" & Format(domQuietMs, "0") & _
                        " | slackMs=" & Format(slackMs, "0") & _
                        " | minStableMs=" & minStableMs & _
@@ -4490,33 +3439,23 @@ Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
                        " | xhr=" & inflXhr & _
                        IIf(Len(sigEndDesc) > 0, " | signal=" & sigEndDesc, "")
 
-    ' [Carryover notice] Wait end: retire this wait's one-shot note arm. (The next
-    ' BEGIN re-establishes armed/emitted from the reservation, so this is defensive
-    ' -- it guarantees the arm never outlives its single wait even on odd paths.)
     m_carryoverNoteArmedThisWait = False
     m_carryoverNoteEmittedThisWait = False
 End Sub
 
 
-' FUNCTION    : EvaluateWaitCondition
-'  Centralized condition checker for the wait engine.
-'               Handles logical state evaluation and detects "Consensus Panic" (505).
 Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dictionary) As Boolean
-    ' Maximum allowed re-injections of the monitoring script before raising a panic error.
     Const MAX_RECOVERY_ATTEMPTS As Long = 8
 
-    ' Safety Guard: Ensure context has not been prematurely destroyed.
     If ctx Is Nothing Then Exit Function
 
     Dim targetCtx As String: targetCtx = ResolveTargetContext(CStr(ctx("contextId")))
 
     Select Case mode
         Case WaitMode_UrlContains
-            ' Simple logical check: URL pattern matching.
             EvaluateWaitCondition = (InStr(GetCurrentUrl(targetCtx, True), CStr(ctx("partialUrl"))) > 0)
 
         Case WaitMode_SpaIdle
-            ' Query the SPA Probe injected in the browser's JavaScript execution context.
             Dim probe As Dictionary: Set probe = QuerySpaProbe(targetCtx)
             Dim isProbeActive As Boolean: isProbeActive = False
             If Not probe Is Nothing Then
@@ -4524,43 +3463,29 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
             End If
 
             If isProbeActive Then
-                ' --- Path A: Probe is alive and reporting ---
                 ctx("missingProbeCount") = 0
 
-                ' --- CORE CONSENSUS ENGINE ---
-                ' Evaluates Network Idle + DOM Stability.
-                ' If internal panic occurs (e.g., infinite mutations), this may raise 505.
-                EvaluateWaitCondition = EvaluateSpaIdleCondition(probe, ctx, socket_.NowMs())
+                EvaluateWaitCondition = EvaluateSpaIdleCondition(probe, ctx, socket_.nowMs())
 
-                ' Explicitly release the local probe reference.
                 Set probe = Nothing
             Else
-                ' --- Path B: Probe is missing (Navigation, Crash, or Context Swap) ---
-                ' Probe gone => ctx("lastInflightUrls") (JS-probe sourced) is
-                ' stale. Drop it so a later timeout isn't misread as a network stall
-                ' and escalated from an absorbable 504/505 to a hard HALT. Path A
-                ' repopulates it on the next live poll.
+                ' When the probe disappears, clear cached inflight URLs so stale data cannot misclassify
+                ' a later timeout as a network HALT.
                 If ctx.Exists("lastInflightUrls") Then ctx.Remove "lastInflightUrls"
 
-                ' --- [OPTIMIZATION] Predictive Recovery via navigationStarted ---
-                ' If we already know a navigation occurred in THIS context,
-                ' skip the expensive QuerySpaProbe round-trip on the next iteration.
-                ' Instead, go directly to probe re-injection with a clean state.
+                ' navigationStarted permits predictive probe reinjection without an extra failed query;
+                ' the flag is one-shot.
                 If m_navigationDetected And m_navigationContextId = targetCtx Then
-                    ' Consume the flag (one-shot) to prevent infinite re-injection loops.
                     m_navigationDetected = False
                     m_navigationContextId = ""
 
-                    ' Force context refresh since the document has changed.
                     On Error Resume Next
                     Call UpdateMainContextId(True, True)
                     On Error GoTo 0
 
-                    ' Reset stability window: new document = unknown state.
-                    ctx("stableStart") = socket_.NowMs()
+                    ctx("stableStart") = socket_.nowMs()
                     ctx("missingProbeCount") = 0
 
-                    ' Immediate re-injection without querying first.
                     If m_debugMode Then
                         Debug.Print "BiDi: Predictive probe injection (navigationStarted shortcut)"
                     End If
@@ -4573,19 +3498,15 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
                 Dim bCount As Long: bCount = CLng(ctx("missingProbeCount")) + 1
                 ctx("missingProbeCount") = bCount
 
-                ' Reset stability window during recovery as the logical state is unknown.
-                ctx("stableStart") = socket_.NowMs()
+                ctx("stableStart") = socket_.nowMs()
 
-                ' ERROR 505: Logical Panic (Consensus Failure)
-                ' If the probe cannot be established after multiple attempts, the page is
-                ' considered too unstable to reach a consensus.
+                ' Repeated inability to establish the probe raises logical panic 505.
                 If bCount > MAX_RECOVERY_ATTEMPTS Then
                     Err.Raise 505, "BiDi:ConsensusError", _
                         "SPA Consensus Panic: Stability probe failed to initialize after " & _
                         MAX_RECOVERY_ATTEMPTS & " attempts. The page state is too volatile."
                 End If
 
-                ' JIT Re-injection: Attempt to heal the logical monitoring layer.
                 If m_debugMode Then Debug.Print "BiDi: SPA Probe inactive. Attempting re-injection (#" & bCount & ")..."
                 Call StartSpaIdleProbe(targetCtx)
 
@@ -4594,11 +3515,8 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
     End Select
 End Function
 
-' [INTERNAL] ExecuteBaseAction
-'  The core execution engine for browser interactions (Click, Input, etc.).
-' UPGRADED:
-'   - Optimized memory management by explicitly clearing object references.
-'   - Refined retry logic to distinguish between transient protocol desync and fatal errors.
+' ExecuteBaseAction is the three-stage interaction funnel; retry classification, not
+' procedure success alone, decides whether another attempt is safe.
 Private Function ExecuteBaseAction(ByVal contextId As String, _
                                     ByVal jsKey As String, _
                                     ByVal args As Collection, _
@@ -4616,73 +3534,51 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
     Dim callResult As String:   callResult = ""
     Dim status As Long:         status = 0
     
-    ' Resolve the target context and sanitize timing parameters.
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim vStable As Long:     vStable = SanitizeMs(minStable, "minStableMs", DEFAULT_IDLE_STABLE_MS)
     Dim vTimeout As Long:    vTimeout = SanitizeMs(maxTimeout, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
 
     Do While retryCount <= maxRetries
-        ' --- PHASE 1: PREPARE (Probe injection & Context Refresh) ---
-        ' Ensures the SPA monitoring probe is active before interaction.
-        ' If this is a retry (retryCount > 0), it forces a context tree refresh.
         status = TryPreparePhase(targetCtx, waitNetwork, (retryCount > 0), _
                                  localErrNum, localErrDesc, localErrSrc)
         
-        ' --- PHASE 2: EXECUTE (JS Action) ---
-        ' Proceed to execution only if the preparation phase succeeded.
         If status = 0 Then
             status = TryExecutePhase(targetCtx, jsKey, args, awaitPromise, vTimeout, _
                                      callResult, localErrNum, localErrDesc, localErrSrc)
         End If
         
-        ' --- PHASE 3: SUCCESS & SYNC ---
-        ' If interaction succeeded, perform post-action synchronization.
         If status = 0 Then
-            ' Post-action sync is best-effort (non-fatal if it times out).
             Call TrySyncPhase(targetCtx, waitNetwork, vStable, vTimeout, checkUrl)
             ExecuteBaseAction = callResult
             
-            ' SUCCESS EXIT: Proceed to memory cleanup.
             GoTo Finalize
         End If
 
-        ' --- RETRY DECISION LOGIC ---
-        ' If status indicates a fatal failure (e.g., Element Not Found), abort retries.
         If status = ERR_ACTION_FAILED Then Exit Do
 
-        ' Ambiguous-timeout guard (mirrors ExecuteBiDiCommand's layer-1 guard): for a
-        ' non-idempotent action, a soft timeout (604) / connection loss (600) after
-        ' dispatch may mean the browser already performed it. Do NOT re-run -- propagate
-        ' instead of risking a double click / keystroke. Read-only keys are excluded.
-        If IsStateChangingActionKey(jsKey) And IsAmbiguousOutcome(status) Then Exit Do
+        ' Non-idempotent ambiguous outcomes propagate rather than replaying the action.
+        If IsStateChangingActionKey(jsKey) And _
+           IsAmbiguousDispatchFailure(status, localErrSrc, localErrDesc) Then Exit Do
         
-        ' For transient protocol errors (Context Lost, Socket issues), wait and retry.
         retryCount = retryCount + 1
         If retryCount <= maxRetries Then
             If m_debugMode Then
                 Debug.Print "BiDi: Action '" & jsKey & "' failed (Status:" & status & "). " & _
                             "Attempting retry " & retryCount & "/" & maxRetries & "..."
             End If
-            ' Yield control to process background messages before retrying.
             WaitHeartbeat 500
         End If
     Loop
 
-    ' --- ERROR PROPAGATION ---
-    ' If the loop completes without success, raise the captured exception.
     If localErrNum = 0 Then localErrNum = ERR_ACTION_FAILED
     If localErrDesc = "" Then localErrDesc = "Unexpected execution state in ExecuteBaseAction."
     
     Err.Raise localErrNum, localErrSrc, localErrDesc
 
 Finalize:
-    ' Intentional no-op join point. Both the success path (GoTo Finalize) and the
-    ' Err.Raise path converge here so the function has a single exit. VBA releases
-    ' local object references (args, etc.) automatically on End Function, so no
-    ' explicit teardown is required -- this label is NOT missing cleanup code.
+    ' Finalize is an intentional single-exit join point; VBA releases local references.
 End Function
 
-' [INTERNAL] SyncAfterAction (Updated with URL Stability)
 Private Sub SyncAfterAction(ByVal contextId As String, _
                             ByVal minStableMs As Long, _
                             ByVal maxTimeoutMs As Long, _
@@ -4690,33 +3586,23 @@ Private Sub SyncAfterAction(ByVal contextId As String, _
     
     WaitHeartbeat 50
     
-    '    Only executed when the developer explicitly expects a page transition.
     If checkUrl Then
         If m_debugMode Then Debug.Print ">>> [Sync] Page navigation mode active."
         On Error Resume Next
-        ' Wait for the physical address and document state to settle
         WaitForUrlStability contextId, 200, 3000
-        ' Refresh the context map for the new document
         UpdateMainContextId True
         On Error GoTo 0
     End If
     ProcessRecorderQueue
     
-    '    Wait for Network requests and DOM Mutations to cease.
     WaitForNetworkIdleSpa minStableMs, maxTimeoutMs, contextId
 End Sub
 
-' [PRIVATE] ValidateProtocolResponse
-'  Parses and validates BiDi protocol responses. Detects malformed JSON,
-'          top-level BiDi protocol errors, and JavaScript runtime exceptions,
-'          raising errors accordingly.
-' RETURNS: ParseJson-produced Dictionary on success.
 Private Function ValidateProtocolResponse(ByVal jsonRaw As String, ByVal methodName As String) As Object
     Dim json As Object
 
-    ' --- Step 1: JSON Parsing Validation ---
-    ' OERN scope: ParseJson only. If it throws, json remains Nothing (VBA default),
-    ' which is caught by the Nothing check below. This is intentional.
+    ' Limit OERN to ParseJson; malformed JSON becomes Nothing, while later structural errors
+    ' must remain visible.
     On Error Resume Next
     Set json = WebJsonConverter.ParseJson(jsonRaw)
     On Error GoTo 0
@@ -4725,18 +3611,12 @@ Private Function ValidateProtocolResponse(ByVal jsonRaw As String, ByVal methodN
         Err.Raise vbObjectError + 512, "BiDi:" & methodName, "Response is not valid JSON."
     End If
 
-    ' --- Step 2: Layer 1 - Protocol Level Errors ---
-    ' Abort if the browser returns a top-level BiDi protocol error
     If json.Exists("error") Then
         Dim errType As String: errType = json("error")
         Dim errMsg As String: errMsg = json("message")
-        If Not IsIgnorableError(errType, errMsg) Then
-            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:" & methodName, "[" & errType & "] " & errMsg
-        End If
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:" & methodName, "[" & errType & "] " & errMsg
     End If
 
-    ' --- Step 3: Layer 2 - JavaScript Runtime Exceptions ---
-    ' Use Layer 3 Exit Accessors for consistent object/string extraction
     Dim excDetails As Object
     Set excDetails = GetPathObject(json, "result.exceptionDetails")
 
@@ -4755,22 +3635,14 @@ Private Function ValidateProtocolResponse(ByVal jsonRaw As String, ByVal methodN
     Set ValidateProtocolResponse = json
 End Function
 
-' [PRIVATE] UnwrapSafetyShell
-'  Unwraps the Safety Shell envelope from a validated BiDi response.
-'          Falls back to the raw BiDi value when the response is not wrapped,
-'          and enforces the script-result integrity contract.
-' RETURNS: Dictionary in normalized {"status":"ok","value":...} form.
 Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As String) As Object
     Dim resultObj As New Dictionary ' Container for normalized output
 
-    ' --- Step 4: Layer 3 - Safety Shell Unwrapping ---
-    ' [CORE UPDATE]: Routing extraction through the Gatekeeper (GetPathValue)
     Dim rawVal As Variant
     Assign rawVal, GetPathValue(json, "result.result.value")
 
     Dim isWrapped As Boolean: isWrapped = False
 
-    ' Check for the Safety Shell envelope (JSON string starting with '{')
     If VarType(rawVal) = vbString Then
         Dim sVal As String: sVal = Trim(CStr(rawVal))
         If Left(sVal, 1) = "{" And Right(sVal, 1) = "}" Then
@@ -4782,11 +3654,10 @@ Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As Str
             If Not innerJson Is Nothing Then
                 If innerJson.Exists("status") Then
                     isWrapped = True
-                    ' Handle browser-side watchdog/script errors reported via the shell
                     If innerJson("status") = "error" Then
                         Dim shellMsg As String: shellMsg = CStr(innerJson("message"))
 
-                        ' Map the specific VBA_TIMEOUT token to a dedicated Error 517
+                        ' Map the Safety Shell VBA_TIMEOUT token to error 517.
                         If shellMsg = "VBA_TIMEOUT" Then
                             Err.Raise 517, "BiDi:SafetyTimeout:" & methodName, _
                                 "Safety Shell timeout: the wrapper stopped waiting, but the browser-side task may still be running."
@@ -4795,17 +3666,13 @@ Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As Str
                         End If
                     End If
 
-                    ' Success: Assign the unwrapped payload
                     Call AssignValue(resultObj, "value", innerJson("value"))
                 End If
             End If
         End If
     End If
 
-    ' --- Step 5: Final Integrity Check (BiDi Protocol Compliance) ---
-    ' Fallback to raw BiDi value if the response was not wrapped
     If Not isWrapped Then
-        ' Perform success pattern matching for methods with no return value (e.g., script actions)
         If VarType(rawVal) = vbEmpty Then
             If InStr(1, methodName, "script.", vbTextCompare) > 0 Then
                 Dim resultType As String
@@ -4813,9 +3680,7 @@ Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As Str
 
                 Select Case resultType
                     Case "undefined", "null"
-                        ' Valid script termination with no return
                     Case ""
-                        ' Check for structural success indicators (scriptId or realm presence)
                         Dim hasScriptId As String: hasScriptId = GetPathString(json, "result.script")
                         Dim hasRealms As String:   hasRealms = GetPathString(json, "result.realms.0.realm")
 
@@ -4824,14 +3689,12 @@ Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As Str
                                 "Structural failure: No recognizable result or metadata in script response."
                         End If
                     Case Else
-                        ' Protocol violation: a type was reported, but the value is missing
                         Err.Raise ERR_BIDI_PROTOCOL, "BiDi:UnwrapSafetyShell:" & methodName, _
                             "Protocol violation: Result type '" & resultType & "' reported without value."
                 End Select
             End If
         End If
 
-        ' Final normalized assignment
         Call AssignValue(resultObj, "value", rawVal)
     End If
 
@@ -4839,8 +3702,6 @@ Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As Str
     Set UnwrapSafetyShell = resultObj
 End Function
 
-' [INTERNAL] AssignValue
-'  Safely assigns a value to a Dictionary key using Let or Set as appropriate.
 Private Sub AssignValue(ByRef dic As Dictionary, ByVal key As String, ByRef val As Variant)
     If IsObject(val) Then
         Set dic(key) = val
@@ -4849,12 +3710,6 @@ Private Sub AssignValue(ByRef dic As Dictionary, ByVal key As String, ByRef val 
     End If
 End Sub
 
-' [INTERNAL] ResolveXPathOrThrow
-'  A bottleneck function to resolve an XPath to a sharedId.
-'          Features:
-'          - Integrated validation for 'searchTimeoutMs' to prevent loop logic errors.
-'          - Centralized error raising if the element is not found within the timeout.
-'          - Ensures that the target context is fresh before the search.
 Private Function ResolveXPathOrThrow(ByVal xpath As String, _
                                      ByVal contextId As String, _
                                      ByVal timeoutMs As Long, _
@@ -4862,12 +3717,10 @@ Private Function ResolveXPathOrThrow(ByVal xpath As String, _
     Dim sid As String
     Dim targetCtx As String
     
-    ' 0. Null Byte Sanitization: reject strings containing Chr$(0).
     If InStr(xpath, Chr$(0)) > 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
                   "XPath contains null byte (Chr$(0)) which would corrupt the WebSocket message. Sanitize input before calling."
     End If
-    ' Consolidated Validation: Prevent logic errors from 'True' or negative inputs.
     Dim vTimeout As Long
     If timeoutMs = 0 Then
         vTimeout = 0
@@ -4879,7 +3732,6 @@ Private Function ResolveXPathOrThrow(ByVal xpath As String, _
     Else
         targetCtx = UpdateMainContextId()
     End If
-    ' This calls the internal private locator which handles the polling loop.
     sid = GetFindElementSharedIdByXPath(xpath, vTimeout, targetCtx)
     
     If sid = "" Then
@@ -4890,14 +3742,10 @@ Private Function ResolveXPathOrThrow(ByVal xpath As String, _
     ResolveXPathOrThrow = sid
 End Function
 
-' [HELPER] PrepareProbeForAction
-' Summary: Ensures the SPA monitoring probe is installed and active.
-'          Called JIT (Just-In-Time) before any interaction to prevent count leaks.
 Private Sub PrepareProbeForAction(ByVal contextId As String)
     Dim probe As Dictionary
     Dim isReady As Boolean: isReady = False
     
-    ' Internal probe status check is Silent
     Set probe = QuerySpaProbe(contextId)
     
     If Not probe Is Nothing Then
@@ -4905,85 +3753,62 @@ Private Sub PrepareProbeForAction(ByVal contextId As String)
     End If
 
     If Not isReady Then
-        ' Probe injection is an internal management task, so it should be Silent
         StartSpaIdleProbe contextId
         WaitHeartbeat 150
     End If
 End Sub
 
-' [INTERNAL] SanitizeMs
-'  Central gatekeeper to validate millisecond arguments.
-'          Normalizes zero and negative values to the supplied default
-'          and caps large values to reduce prolonged Excel hangs.
+' SanitizeMs substitutes defaults for non-positive values, applies the minimum polling
+' floor, and caps prolonged waits. Exact-zero APIs branch before calling it.
 Private Function SanitizeMs(ByVal ms As Long, ByVal argName As String, _
                              ByVal defaultMs As Long, _
                              Optional ByVal minMs As Long = 50) As Long
     Dim vMs As Long: vMs = ms
     
-    ' 1. Logic Guard: substitutes the default for zero/negative values (does not raise).
     If vMs <= 0 Then
         If m_debugMode Then
             Debug.Print "BiDi Warning: Invalid value (" & ms & ") for '" & argName & "'. Using default: " & defaultMs
         End If
         vMs = defaultMs
     End If
-    ' 2. Minimum Floor Guard:
-    ' Ensure the interval is not too short for Windows message pumping.
-    ' Values under 50ms can cause "Not Responding" states in heavy SPAs.
     If vMs < minMs Then vMs = minMs
 
-    ' 3. Range Guard: Circuit breaker for UI responsiveness (10 min cap)
     If vMs > 600000 Then vMs = 600000
 
     SanitizeMs = vMs
 End Function
 
-' [PUBLIC] WaitForUrlStability
-'  Polls the current URL and Document.readyState until they remain constant
-'              for a specified 'stableDurationMs'.
-' STRATEGY   : Uses a "Fail-Fast" approach. If the environment fails to stabilize
-'              within the timeout, the loop exits.
 Public Sub WaitForUrlStability(Optional ByVal contextId As String = "", _
                                Optional ByVal stableDurationMs As Long = 500, _
                                Optional ByVal timeoutMs As Long = 10000)
 
-    ' --- [ENTRY GUARD] Guard against 0ms inputs ---
     If stableDurationMs <= 0 Then stableDurationMs = 500
     If timeoutMs <= 0 Then timeoutMs = 10000
 
     Dim vStableMs As Long: vStableMs = SanitizeMs(stableDurationMs, "stableDurationMs", 500)
     Dim vTimeoutMs As Long: vTimeoutMs = SanitizeMs(timeoutMs, "timeoutMs", 10000)
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    Dim startMs As Double: startMs = socket_.NowMs()
-    Dim stableStartMs As Double: stableStartMs = socket_.NowMs()
+    Dim startMs As Double: startMs = socket_.nowMs()
+    Dim stableStartMs As Double: stableStartMs = socket_.nowMs()
     Dim lastStateKey As String: lastStateKey = ""
     Dim checkJs As String: checkJs = "return window.location.href + '|' + document.readyState;"
     
     Do
-        ' FORCE Silent:=True to prevent technically repetitive REQ/RES logs during polling
         Dim currentResult As String
         currentResult = CStr(GetCleanResult(CallScript(checkJs, Nothing, targetCtx, False, False, vTimeoutMs, True)))
         
-        ' Determine if the page state is still in flux
         Dim isMoving As Boolean
-        ' State is "moving" if the URL/ReadyState changed, or if not yet "complete"
         isMoving = (currentResult <> lastStateKey) Or (Right$(currentResult, 8) <> "complete")
         
         If isMoving Then
-            ' Reset the stability timer
             lastStateKey = currentResult
-            stableStartMs = socket_.NowMs()
+            stableStartMs = socket_.nowMs()
         Else
-            ' Check if the state has been stable for the required duration
-            If (socket_.NowMs() - stableStartMs) >= CDbl(vStableMs) Then Exit Do
+            If (socket_.nowMs() - stableStartMs) >= CDbl(vStableMs) Then Exit Do
         End If
         
-        ' Global timeout check to prevent infinite loops
-        If (socket_.NowMs() - startMs) > CDbl(vTimeoutMs) Then Exit Do
+        If (socket_.nowMs() - startMs) > CDbl(vTimeoutMs) Then Exit Do
         
-        ' Adaptive yielding:
-        ' If recording is active, maintain queue sync.
-        ' Otherwise, yield via Communicator for high-speed URL change detection.
         If m_isRecording Then
             WaitHeartbeat 50
         Else
@@ -4992,75 +3817,45 @@ Public Sub WaitForUrlStability(Optional ByVal contextId As String = "", _
     Loop
 End Sub
 
-' [PRIVATE] WrapInSafetyShell (REFACTORED)
-'  Wraps JS code in a Promise.race watchdog to bound the WAIT (not the task).
-'              Stops waiting after the watchdog fires; the losing browser-side task is
-'              not cancelled and may keep running. This is the primary Safety-Shell
-'              envelope stringification point (the idle probe in GetProbeJs also
-'              stringifies),
-'              producing a clean, single-layer response for VBA.
+' The Safety Shell bounds how long VBA waits, not how long the browser task runs.
+' Promise.race does not cancel the losing task.
 Private Function WrapInSafetyShell(ByVal jsBody As String, ByVal timeoutMs As Long) As String
     Dim js As String
     
     js = "async function(){ "
     js = js & "const _t=" & timeoutMs & "; let _la=Date.now(); const hb=()=>{_la=Date.now()}; "
     
-    ' --- _tk: The actual task execution ---
-    ' Preservation of 'arguments' and lexical closure 'hb' is key here.
-    ' [CRITICAL CONTRACT] _tk MUST remain an arrow function (=>).
-    ' Arrow functions do NOT create their own 'arguments' binding, so
-    ' arguments[0], arguments[1] etc. inside jsBody correctly resolve to
-    ' the outer async function's parameters (the BiDi-serialized args).
-    ' Changing _tk to a regular "async function()" will SILENTLY BREAK
-    ' every action method (click, input, select, shadow_click) because
-    ' arguments would become an empty Arguments object.
+    ' _tk must remain an arrow function so jsBody arguments resolve to the outer BiDi
+    ' function parameters; a regular function silently breaks all action arguments.
     js = js & "const _tk = async () => { " & jsBody & " }; "
     
-    ' --- _wd: The Autonomous Watchdog ---
-    ' Heartbeat check: If silence > timeout, reject with the specific "VBA_TIMEOUT" token.
+    ' The watchdog rejects with VBA_TIMEOUT when hb() silence exceeds its limit.
     js = js & "let _wdTimer; const _wd = new Promise((_,r)=>{ _wdTimer=setInterval(()=>{if(Date.now()-_la>_t){clearInterval(_wdTimer);r(new Error('VBA_TIMEOUT'))}},100);}); "
     
-    ' Race between the task and the internal watchdog.
     js = js & "try{ const res = await Promise.race([_tk(), _wd]); clearInterval(_wdTimer); return JSON.stringify({status:'ok', value:(typeof res === 'undefined' ? null : res)}); "
     js = js & "}catch(e){ clearInterval(_wdTimer); return JSON.stringify({status:'error', message:e.message}); } }"
     
     WrapInSafetyShell = js
 End Function
 
-' [PRIVATE] HandleConsoleLog
-'  Formats and prints browser console logs to the VBA Immediate Window.
 Private Sub HandleConsoleLog(ByVal json As Object)
-    ' WHY: no blanket OERN here. GetPathString already returns "" for missing paths
-    ' without raising errors, so the OERN wrapper was unnecessary and could mask
-    ' unrelated bugs (e.g., a corrupted json object reference).
+    ' Do not add blanket OERN here; missing paths are already handled and other errors matter.
     Dim text As String: text = GetPathString(json, "params.text")
     
-    ' Only output logs from our specific AutoClicker to keep the window clean.
     If InStr(text, "BiDi-AutoClicker") > 0 Then
         Debug.Print ">>> [BROWSER] " & text
     End If
 End Sub
 
-' METHOD: Shutdown
-'  Explicitly releases all BiDi/CDP resources.
-'          This should be called before setting the object to Nothing.
 Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     If socket_ Is Nothing Then Exit Sub
-    ' OERN SCOPE = REST OF PROCEDURE. No matching "On Error GoTo 0" follows by design:
-    ' resource release is best-effort. If detach/forceClose fails (connection already
-    ' dropped), we still want to fall through and null out socket_ rather than raise.
+    ' Shutdown is best-effort from this point; cleanup must continue even after detach or
+    ' close failure.
     On Error Resume Next
     
-    ' --- 1. CDP Session Detachment ---
-    ' ForceClose is the emergency/teardown path: skip the synchronous detach entirely.
-    ' goog:cdp.detachSession runs through SendAndReceive, whose synchronous
-    ' WinHttpWebSocketReceive can block against a TCP-alive but frame-silent peer
-    ' (suspended/hung browser) -- freezing Excel during Class_Terminate for the full
-    ' timeout window (and its retries). The reconnect-only guard could not prevent this:
-    ' the detach SEND succeeds, only the response wait hangs. The CDP session is bound
-    ' to the BiDi session and dies with the socket that socket_.ForceClose tears down
-    ' below, so an explicit detach here is unnecessary; just drop the local id. A caller
-    ' that wants a graceful, acknowledged detach uses Shutdown ForceClose:=False.
+    ' ForceClose skips acknowledged CDP detach because teardown should not spend a receive
+    ' timeout on a suspended browser. The tunnel dies with the BiDi socket. Graceful callers
+    ' may use Shutdown ForceClose:=False.
     If ForceClose Then
         m_cdpSessionId = ""
     ElseIf m_cdpSessionId <> "" Then
@@ -5070,13 +3865,10 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
         m_cdpSessionId = ""
     End If
     
-    ' --- 2. Recorder Memory Cleanup ---
     Set m_recorderLogs = Nothing
     
-    ' --- 3. Internal State Reset ---
     ClearState
     
-    ' --- 4. Communication Socket Release ---
     If ForceClose Then
         socket_.ForceClose
     End If
@@ -5085,90 +3877,63 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     If m_debugMode Then Debug.Print "BiDi: Explicit Shutdown sequence completed."
 End Sub
 
-' [PRIVATE] UpdateWaitTelemetry (Atomic HUD Upsert - State Only)
-'  Updates the browser-side HUD with real-time sync telemetry.
-' REFINED:
-'   - Efficiency: Removed dynamic idle counter to allow lastHudKey to block redundant traffic.
-'   - ID Integrity: Remains within the CallScript framework to ensure no ID collisions.
-'   - Stability: Dramatically reduces WebSocket traffic by only updating on state changes.
 Private Sub UpdateWaitTelemetry(ByVal mode As waitMode, ByRef ctx As Dictionary)
     On Error Resume Next
     
-    Dim Msg As String, colorCode As String
+    Dim msg As String, colorCode As String
     Dim targetCtx As String: targetCtx = ResolveTargetContext(CStr(ctx("contextId")))
     
-    ' --- 1. Construct Message & Color ---
     Select Case mode
         Case WaitMode_UrlContains
-            Msg = "BiDi: Waiting for URL..." & vbLf & "Pattern: " & ctx("partialUrl")
+            msg = "BiDi: Waiting for URL..." & vbLf & "Pattern: " & ctx("partialUrl")
             colorCode = "#00FF00" ' Green
             
         Case WaitMode_SpaIdle
-            Dim idleTime As Double: idleTime = (socket_.NowMs() - CDbl(ctx("stableStart"))) / 1000
+            Dim idleTime As Double: idleTime = (socket_.nowMs() - CDbl(ctx("stableStart"))) / 1000
             Dim targetIdle As Double: targetIdle = CLng(ctx("minStableMs")) / 1000
 
-            ' [Signal Gate] Types armed but not yet latched. Empty when the gate
-            ' is fully open OR nothing is armed (ungated waits behave as before).
-            ' NOTE: dom/vis seen-flags are set by EvaluateSpaIdleCondition, which
-            ' runs AFTER this telemetry in the poll loop, so a dom/vis hit clears
-            ' here one poll (~interval) late. The net flag is set during the event
-            ' drain earlier in the same poll, so net is reported without lag.
+            ' HUD pending types may lag DOM/visibility by one poll because telemetry precedes probe
+            ' evaluation; network latches during the preceding event drain.
             Dim sigPending As String: sigPending = BuildSignalPendingDesc()
 
-            ' A net hit sets m_sigNetSeen during the event drain, but the window
-            ' reset (stableStart) is applied one poll later in EvaluateSpaIdleCondition
-            ' (guarded by ctx("sigNetAcked")). In that gap idleTime still reflects the
-            ' PRE-hit quiet -> a spurious green "Stable" would flash between the amber
-            ' wait and the post-hit render window. Treat "net seen, reset not yet
-            ' acked" as still-synchronizing to suppress it (dom/vis latch and reset in
-            ' the same function, so they need no equivalent guard).
+            ' A network hit is latched before its stableStart reset is acknowledged on the next poll.
+            ' Treat that gap as synchronizing to prevent a false green Stable flash.
             Dim netResetPending As Boolean
             netResetPending = m_sigNetArmed And m_sigNetSeen
             If netResetPending And ctx.Exists("sigNetAcked") Then netResetPending = Not CBool(ctx("sigNetAcked"))
 
-            ' Determine HUD color and text based on STATE, not COUNTER.
             If idleTime < targetIdle Then
                 colorCode = "#FF4444" ' Red (Busy: DOM/network still churning)
-                Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Synchronizing..."
+                msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Synchronizing..."
             ElseIf Len(sigPending) > 0 Then
-                ' DOM window satisfied (would be green) but a completion signal has
-                ' NOT arrived: consensus is BLOCKED, not stable. Amber makes this
-                ' state -- previously indistinguishable from Stable -- visible, so a
-                ' frozen HUD pins the blocking phase by colour.
+                ' DOM quiet with a closed signal gate is amber Awaiting signal, not Stable.
                 colorCode = "#FFAA00" ' Amber (Gated: awaiting signal)
-                Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Awaiting signal (" & sigPending & ")"
+                msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Awaiting signal (" & sigPending & ")"
             ElseIf netResetPending Then
-                ' Net hit latched but its window reset lands next poll: not stable yet.
                 colorCode = "#FF4444" ' Red (post-hit reset imminent)
-                Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Synchronizing..."
+                msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Synchronizing..."
             Else
                 colorCode = "#00FF00" ' Green (Stable: gate open or ungated)
-                Msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Stable"
+                msg = "BiDi: [SPA SYNC]" & vbLf & "Status: Stable"
             End If
     End Select
     
-    ' Create a fingerprint to avoid redundant WebSocket calls
-    ' Now that the idle counter is gone, this key will remain identical
-    ' throughout the entire "Busy" phase, effectively blocking all repetitive calls.
-    Dim currentHudKey As String: currentHudKey = Msg & "|" & colorCode
+    ' Fingerprint unchanged HUD state to suppress redundant socket traffic.
+    Dim currentHudKey As String: currentHudKey = msg & "|" & colorCode
     
-    ' --- 2. Context Change Detection ---
     If targetCtx <> m_lastHudCtx Then
         m_lastHudKey = ""
         m_lastHudCtx = targetCtx
         m_lastHudRetryTick = 0
     End If
     
-    ' --- 3. Optimization: Skip if state is identical ---
     If currentHudKey = m_lastHudKey Then Exit Sub
     
-    ' --- 4. ERROR THROTTLING ---
     If m_lastHudRetryTick > 0 Then
-        If socket_.ElapsedMs(m_lastHudRetryTick) < 500 Then Exit Sub
+        If socket_.elapsedMs(m_lastHudRetryTick) < 500 Then Exit Sub
     End If
     
-    ' --- 5. JavaScript Construction ---
-    Dim safeMsg As String: safeMsg = Replace(Replace(Msg, "\", "\\"), "'", "\'")
+    Dim safeMsg As String: safeMsg = Replace(Replace(msg, "\", "\\"), "'", "\'")
     safeMsg = Replace(Replace(safeMsg, vbCr, ""), vbLf, "\n")
     Dim safeColor As String: safeColor = Replace(colorCode, "'", "\'")
     Dim js As String: js = ""
@@ -5177,10 +3942,8 @@ Private Sub UpdateWaitTelemetry(ByVal mode As waitMode, ByRef ctx As Dictionary)
     js = js & " h.style.cssText='position:fixed;top:15px;right:15px;z-index:2147483647;padding:10px;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.85);color:#00FF00;border:1px solid #00FF00;border-radius:6px;pointer-events:none;box-shadow:0 4px 15px rgba(0,0,0,0.5);min-width:180px;white-space:pre-wrap;'; b.appendChild(h);}"
     js = js & " h.innerText=MSG; h.style.borderColor=CLR; h.style.color=CLR; return true;})()"
     
-    ' --- 6. Execution via CallScript ---
     Call Me.CallScript(js, Nothing, targetCtx, False, False, 1000, True)
     
-    ' --- 7. Final State Update ---
     If Err.Number = 0 Then
         m_lastHudKey = currentHudKey
         m_lastHudRetryTick = 0
@@ -5191,13 +3954,10 @@ Private Sub UpdateWaitTelemetry(ByVal mode As waitMode, ByRef ctx As Dictionary)
     On Error GoTo 0
 End Sub
 
-' [PRIVATE] GetHudJs
-'  Returns JavaScript snippets for the Browser-side HUD (Head-Up Display).
 Private Function GetHudJs(ByVal snippetType As String) As String
     Dim js As String: js = ""
     Select Case LCase(snippetType)
         Case "init"
-            ' Injects a floating HUD. 'pointer-events:none' ensures it won't block clicks.
             js = js & "(function(){if(document.getElementById('vba-bidi-hud')) return;"
             js = js & "const h=document.createElement('div'); h.id='vba-bidi-hud';"
             js = js & "h.style.cssText='position:fixed;top:15px;right:15px;z-index:2147483647;padding:10px;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.85);color:#00FF00;border:1px solid #00FF00;border-radius:6px;pointer-events:none;box-shadow:0 4px 15px rgba(0,0,0,0.5);min-width:180px;white-space:pre-wrap;';"
@@ -5205,21 +3965,15 @@ Private Function GetHudJs(ByVal snippetType As String) As String
             GetHudJs = js
                        
         Case "remove"
-            ' Cleanly removes the HUD from the webpage DOM
             GetHudJs = "(function(){const h=document.getElementById('vba-bidi-hud'); if(h)h.remove();})();"
     End Select
 End Function
 
-' [PUBLIC] ExecuteEnableGlobalShadowUnlocker
-'  Uses WebDriver BiDi's preloadScript to globally force Shadow DOM (closed)
-'              to 'open' mode across all domains and iframes.
-' RETURNS    : The registered script ID (script.PreloadScriptId)
 Public Function ExecuteEnableGlobalShadowUnlocker() As String
     Dim params As New Dictionary, js As String
     
-    ' Hook attachShadow to force mode:'open' while PRESERVING all other options
-    ' (delegatesFocus, slotAssignment, serializable). Dropping slotAssignment:
-    ' 'manual' would break rendering of manually slotted components.
+    ' The attachShadow hook forces mode:'open' while preserving other options; dropping
+    ' slotAssignment or delegatesFocus can break components.
     js = "function() { "
     js = js & "if (Element.prototype._attachShadow) return; "
     js = js & "Element.prototype._attachShadow = Element.prototype.attachShadow; "
@@ -5229,7 +3983,6 @@ Public Function ExecuteEnableGlobalShadowUnlocker() As String
     
     params.Add "functionDeclaration", js
 
-    ' Execute command silently. GetPathString handles empty/error results gracefully.
     Dim strRes As String: strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True, allowAmbiguousRetry:=False)
     ExecuteEnableGlobalShadowUnlocker = GetPathString(WebJsonConverter.ParseJson(strRes), "result.script")
     
@@ -5238,9 +3991,6 @@ Public Function ExecuteEnableGlobalShadowUnlocker() As String
     End If
 End Function
 
-' [PHASE] TryPreparePhase
-'  Prepares the environment before an interaction.
-'              Ensures the SPA probe is active and refreshes the context tree if needed.
 Private Function TryPreparePhase(ByVal ctx As String, _
                                   ByVal waitNet As Boolean, _
                                   ByVal isRetry As Boolean, _
@@ -5249,8 +3999,6 @@ Private Function TryPreparePhase(ByVal ctx As String, _
                                   ByRef outErrSrc As String) As Long
     Dim capturedErr As Long
     
-    ' Step 1: Ensure SPA monitoring probe is installed if synchronization is required.
-    ' JIT injection prevents state loss between page transitions.
     If waitNet Then
         On Error Resume Next
         Call PrepareProbeForAction(ctx)
@@ -5263,8 +4011,6 @@ Private Function TryPreparePhase(ByVal ctx As String, _
         On Error GoTo 0
     End If
     
-    ' Step 2: Refresh main browsing context mapping on retry attempts.
-    ' This handles cases where the context was destroyed or navigated during a race condition.
     If isRetry Then
         On Error Resume Next
         Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
@@ -5277,17 +4023,11 @@ Private Function TryPreparePhase(ByVal ctx As String, _
         On Error GoTo 0
     End If
     
-    ' Return 0 indicating a successful preparation phase.
     TryPreparePhase = 0
 End Function
 
-' [PHASE] TryExecutePhase
-'  Dispatches the actual JavaScript command to the browser.
-'              The JS is automatically wrapped in a Safety Shell (Watchdog).
-' [Opt-in] When True, state-changing clicks use trusted pointer input (input.performActions,
-' isTrusted:true) instead of synthetic element.click(). Default False (synthetic) is the
-' proven path for Wiz/Lit SPAs like Google Flights; enable only for sites that ignore
-' synthetic clicks. See TryExecutePhase.
+' Trusted pointer clicks are opt-in. Synthetic element.click() remains the default proven
+' path for Wiz/Lit SPAs.
 Public Property Get UseTrustedClick() As Boolean
     UseTrustedClick = m_useTrustedClick
 End Property
@@ -5295,11 +4035,8 @@ Public Property Let UseTrustedClick(ByVal value As Boolean)
     m_useTrustedClick = value
 End Property
 
-' [Opt-out] Toggles this class's high-level developer trace (Debug.Print to the
-' Immediate window): navigation/action/recovery/SPA-probe diagnostics, JS error
-' reports, etc. Default True. Set False to silence routine trace while keeping the
-' unconditional critical-error prints. Does NOT affect the Discovery Log recorder
-' (StartDiscoveryLog) nor the low-level wire log in BiDiSocketCommunicator.
+' DebugMode controls wrapper trace only; it does not affect Discovery Log or communicator
+' wire tracing.
 Public Property Get DebugMode() As Boolean
     DebugMode = m_debugMode
 End Property
@@ -5311,26 +4048,21 @@ Private Function TryExecutePhase(ByVal ctx As String, _
                                   ByVal key As String, _
                                   ByVal args As Collection, _
                                   ByVal await As Boolean, _
-                                  ByVal timeout As Long, _
+                                  ByVal TIMEOUT As Long, _
                                   ByRef outResult As String, _
                                   ByRef outErrNum As Long, _
                                   ByRef outErrDesc As String, _
                                   ByRef outErrSrc As String) As Long
     On Error Resume Next
     
-    ' Execute the action. Clicks default to the JS pipeline (element.click()) -- the
-    ' proven path for Wiz/Lit SPAs (Google Flights). A trusted pointer click on an
-    ' autocomplete option leaves real focus state that blocks the next field's input
-    ' (the "Where to" field never activates -> ow20 never created -> value not typed).
-    ' Trusted pointer input (input.performActions, isTrusted:true) is opt-in via
-    ' UseTrustedClick=True, for the rare SPA that ignores synthetic element.click().
+    ' Trusted clicks can leave focus state that breaks some autocomplete flows, so use them
+    ' only for sites that reject synthetic clicks.
     If key = "click" And m_useTrustedClick Then
-        outResult = PerformTrustedClick(ctx, args, timeout)
+        outResult = PerformTrustedClick(ctx, args, TIMEOUT)
     Else
-        outResult = CallScript(GetActionJs(key), args, ctx, await, , timeout, allowAmbiguousRetry:=Not IsStateChangingActionKey(key))
+        outResult = CallScript(GetActionJs(key), args, ctx, await, , TIMEOUT, allowAmbiguousRetry:=Not IsStateChangingActionKey(key))
     End If
     
-    ' Capture any error occurred during transmission or script execution.
     TryExecutePhase = Err.Number
     If Err.Number <> 0 Then
         outErrNum = Err.Number
@@ -5340,47 +4072,36 @@ Private Function TryExecutePhase(ByVal ctx As String, _
     On Error GoTo 0
 End Function
 
-' [PHASE] TrySyncPhase
-'  Performs post-action synchronization (Network Idle / DOM stability).
-'              Transient failures (normal timeouts) are logged as warnings but do not
-'              invalidate the action. However, ERR_CONSENSUS_HALT is a deliberate stop
-'              signal that MUST propagate to halt the entire process for review.
+' Post-action synchronization is best-effort after action success, except
+' ERR_CONSENSUS_HALT which must stop the caller.
 Private Sub TrySyncPhase(ByVal ctx As String, _
                          ByVal waitNet As Boolean, _
                          ByVal stable As Long, _
-                         ByVal timeout As Long, _
+                         ByVal TIMEOUT As Long, _
                          ByVal chkUrl As Boolean)
     On Error Resume Next
     
-    ' Perform SPA-aware synchronization if requested.
     If waitNet Then
-        Call SyncAfterAction(ctx, stable, timeout, chkUrl)
+        Call SyncAfterAction(ctx, stable, TIMEOUT, chkUrl)
     End If
     
-    ' Capture error state before clearing
     Dim syncErrNum As Long:    syncErrNum = Err.Number
     Dim syncErrDesc As String: syncErrDesc = Err.description
     Dim syncErrSrc As String:  syncErrSrc = Err.source
     On Error GoTo 0
     
-    ' --- CRITICAL: Do NOT absorb CONSENSUS_HALT ---
-    ' ERR_CONSENSUS_HALT means the failure was logged and the operator needs to
-    ' review the log before continuing. Re-raise to stop the entire process.
+    ' Never absorb ERR_CONSENSUS_HALT.
     If syncErrNum = ERR_CONSENSUS_HALT Then
         Err.Raise syncErrNum, syncErrSrc, syncErrDesc
     End If
     
-    ' Diagnostic Logging: Transient sync failures (504 timeout etc.) are non-fatal.
-    ' The primary interaction (Click/Input) has already succeeded.
+    ' Ordinary synchronization failure does not undo the completed interaction.
     If syncErrNum <> 0 And m_debugMode Then
         Debug.Print "[" & Format(Now, "hh:mm:ss") & "] BiDi Warning: Post-action Sync failed (Status: " & syncErrNum & "). DOM mutations only (no pending requests). Consider extending idle timeout."
     End If
 End Sub
 
-' [PUBLIC] PostScript (Fire & Forget Mode)
-'  Executes JavaScript without waiting for a response from the browser.
-'              Primarily used for HUD updates to prevent UI freezing (whiteout)
-'              caused by synchronous socket congestion during heavy event traffic.
+' PostScript is disposable send-only infrastructure; completion must not be inferred.
 Public Sub PostScript(ByVal js As String, _
                       Optional ByVal args As Collection = Nothing, _
                       Optional ByVal contextId As String = "")
@@ -5390,15 +4111,11 @@ Public Sub PostScript(ByVal js As String, _
     
     If resolvedCtx = "" Then Exit Sub
 
-    ' Wrap the script in the Safety Shell for browser-side protection.
-    '    Timeout is set to a short duration (1000ms) as this is non-critical.
     Dim finalJs As String: finalJs = WrapInSafetyShell(js, 1000)
 
     targetDic.Add "context", resolvedCtx
     params.Add "functionDeclaration", finalJs
 
-    ' Explicit branch: IIf would evaluate both arms and build a throwaway Collection
-    ' on every call; it is also fragile with object references.
     Dim safeArgs As Collection
     If args Is Nothing Then
         Set safeArgs = New Collection
@@ -5410,38 +4127,25 @@ Public Sub PostScript(ByVal js As String, _
     params.Add "target", targetDic
     params.Add "awaitPromise", True
 
-    '    Fixed reserved ID (POST_SCRIPT_ID = 2, reserved band 1..99). The Communicator's
-    '    GetNextRequestId (socket_) issues only command-band IDs (>= 100), so id 2 cannot
-    '    collide with a normal request. The browser's reply to this id is swallowed on the
-    '    Communicator side (SendAndReceive / GetMessage), so it never reaches the
-    '    recorder/event stream.
+    ' PostScript id 2 belongs to the communicator's reserved band; normal IDs cannot collide
+    ' and its response is consumed internally.
     Dim requestDic As New Dictionary
     requestDic.Add "id", POST_SCRIPT_ID
     requestDic.Add "method", "script.callFunction"
     requestDic.Add "params", params
     
-    ' 4. [CRITICAL] Direct Send without Receive via Communicator's PostScript.
-    '    By calling socket_.PostScript instead of ExecuteBiDiCommand,
-    '    we bypass the synchronous SendAndReceive loop, ensuring the VBA
-    '    main thread remains responsive to Windows messages.
+    ' This path bypasses response correlation but does not pump Office messages.
     socket_.PostScript WebJsonConverter.ConvertToJson(requestDic)
 End Sub
 
-' LAYER 0: XPath String Escaper
-' Summary  : Produces a safe XPath string literal from arbitrary VBA text.
-'            If the text contains no single quotes, wraps in 'text'.
-'            If it contains no double quotes, wraps in "text".
-'            Otherwise, splits at single-quote boundaries and uses concat().
-' Example  : "O'Brien"  -> concat('O',&quot;'&quot;,'Brien')
+' Escape XPath literals with single quotes, double quotes, or concat() when both quote
+' types occur.
 Private Function EscapeXPathString(ByVal text As String) As String
     If InStr(text, "'") = 0 Then
-        ' Simple case: no single quotes, wrap in single quotes
         EscapeXPathString = "'" & text & "'"
     ElseIf InStr(text, """") = 0 Then
-        ' No double quotes, wrap in double quotes
         EscapeXPathString = """" & text & """"
     Else
-        ' Contains both: split on single quotes and reassemble with concat()
         Dim parts() As String: parts = Split(text, "'")
         Dim result As String: result = "concat("
         Dim i As Long
@@ -5454,22 +4158,16 @@ Private Function EscapeXPathString(ByVal text As String) As String
     End If
 End Function
 
-' LAYER 0: Safe Assignment Helper (The "Shield")
-' Summary  : Handles the Set/Let logic internally to prevent assignment errors.
-' Warning  : Unsafe for function return variables inside deep On Error scopes.
 Private Sub Assign(ByRef dest As Variant, ByRef src As Variant)
     If IsObject(src) Then Set dest = src Else dest = src
 End Sub
 
-' LAYER 1: Core Navigation Engine (Physical Search)
-' Traverses a nested Dictionary/Collection tree using dot-separated path notation.
-' Supports Dictionary key lookup and Collection index access (0-based in path, 1-based in VBA).
-' Example: "result.contexts.0.url" navigates result -> contexts -> first item -> url.
-' Returns Empty (default Variant) if any segment is missing or invalid.
-Private Function InternalTraverseFromObject(ByVal root As Object, ByVal Path As String) As Variant
-    If root Is Nothing Or Path = "" Then Exit Function
+' GetPathValue traverses dot paths through Dictionaries and Collections; path indexes are
+' zero-based while VBA Collection indexes are one-based.
+Private Function InternalTraverseFromObject(ByVal root As Object, ByVal path As String) As Variant
+    If root Is Nothing Or path = "" Then Exit Function
     
-    Dim keys() As String: keys = Split(Path, ".")
+    Dim keys() As String: keys = Split(path, ".")
     Dim current As Object: Set current = root
     Dim i As Long, idx As Long
     
@@ -5489,7 +4187,6 @@ Private Function InternalTraverseFromObject(ByVal root As Object, ByVal Path As 
     Dim lastKey As String: lastKey = keys(UBound(keys))
     If TypeName(current) = "Dictionary" Then
         If current.Exists(lastKey) Then
-            ' CRITICAL: Use explicit Set/Let here to guarantee return value stability
             If IsObject(current(lastKey)) Then Set InternalTraverseFromObject = current(lastKey) _
             Else InternalTraverseFromObject = current(lastKey)
         End If
@@ -5502,29 +4199,24 @@ Private Function InternalTraverseFromObject(ByVal root As Object, ByVal Path As 
     End If
 End Function
 
-' LAYER 2: Gatekeeper (Type Arbitration)
-Private Function GetPathValue(ByVal root As Object, ByVal Path As String) As Variant
-    Assign GetPathValue, InternalTraverseFromObject(root, Path)
+Private Function GetPathValue(ByVal root As Object, ByVal path As String) As Variant
+    Assign GetPathValue, InternalTraverseFromObject(root, path)
 End Function
 
-' LAYER 3: Specialized Exit Accessors
-Private Function GetPathString(ByVal root As Object, ByVal Path As String) As String
-    Dim v As Variant: Assign v, GetPathValue(root, Path)
+Private Function GetPathString(ByVal root As Object, ByVal path As String) As String
+    Dim v As Variant: Assign v, GetPathValue(root, path)
     If Not IsObject(v) Then GetPathString = CStr(v & "")
 End Function
 
-Private Function GetPathObject(ByVal root As Object, ByVal Path As String) As Object
-    ' WHY: explicit type check instead of blanket OERN.
-    ' GetPathValue returns Variant; we must verify it's an Object before Set.
-    Dim v As Variant: Assign v, GetPathValue(root, Path)
+Private Function GetPathObject(ByVal root As Object, ByVal path As String) As Object
+    ' Verify Object type explicitly before Set; do not hide type errors with OERN.
+    Dim v As Variant: Assign v, GetPathValue(root, path)
     If IsObject(v) Then Set GetPathObject = v
-    ' Returns Nothing implicitly if v is not an Object
 End Function
 
 Private Function GetCleanResult(ByVal jsonRaw As String) As Variant
-    ' WHY: OERN scope is narrowed to ParseJson only. ParseJson can legitimately fail
-    ' on malformed/empty input, but errors in GetPathValue or Assign should propagate
-    ' since they indicate structural bugs in the response pipeline.
+    ' Only ParseJson is tolerant of malformed input; path traversal and assignment errors
+    ' indicate structural bugs and must propagate.
     If Len(jsonRaw) = 0 Then GetCleanResult = Empty: Exit Function
     
     Dim parsed As Object
@@ -5542,9 +4234,6 @@ Private Function GetCleanResult(ByVal jsonRaw As String) As Variant
     End If
 End Function
 
-' [PUBLIC] ExecuteWizSelectDropdown
-'  Controls semantic pseudo dropdowns (combobox/option UI architecture)
-'              by leveraging the multi-phase SPA consensus click engine.
 Public Sub ExecuteWizSelectDropdown(ByVal triggerXPath As String, _
                                     ByVal optionText As String, _
                                     Optional ByVal searchTimeoutMs As Long = 10000, _
@@ -5552,15 +4241,10 @@ Public Sub ExecuteWizSelectDropdown(ByVal triggerXPath As String, _
                                     Optional ByVal contextId As String = "")
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
-    ' Phase 1: Click the combo box trigger to dynamic spawn the option list window.
-    ' SyncAfterAction will automatically lock until the pop-up mutations completely settle.
     Call Me.ExecuteClickByXPath(triggerXPath, searchTimeoutMs, True, , maxTimeoutMs, targetCtx)
     
-    ' Construct W3C ARIA-compliant semantic XPath to isolate the designated list option.
     Dim optionXPath As String
     optionXPath = "//*[@role='option'][contains(., " & EscapeXPathString(optionText) & ")]"
     
-    ' Phase 2: Click the resolved option inside the dynamically populated layer.
-    ' SyncAfterAction will automatically trap the frame re-render and wait until the SPA returns to stable state.
     Call Me.ExecuteClickByXPath(optionXPath, searchTimeoutMs, True, , maxTimeoutMs, targetCtx)
 End Sub

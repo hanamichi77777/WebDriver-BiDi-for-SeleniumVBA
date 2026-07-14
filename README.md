@@ -93,7 +93,7 @@ Official references:
 
 ## 📂 Procedure Overview (Sample Module: `BiDi_Sample`)
 
-These procedures are learning and diagnostic examples rather than permanent integration tests for the referenced public websites. Third-party URLs, XPath expressions, ARIA labels, extension folders, and observed network endpoints can change without notice. When adapting a sample, first identify the application's real completion condition, then update selectors, signal patterns, noise rules, and business-level verification accordingly.
+These descriptions are aligned with the `BiDi_Sample` module included in WebDriver BiDi for SeleniumVBA v2.7. The procedures are learning and diagnostic examples rather than permanent integration tests for the referenced public websites. Third-party URLs, XPath expressions, ARIA labels, extension folders, and observed network endpoints can change without notice. When adapting a sample, first identify the application's real completion condition, then update selectors, signal patterns, noise rules, and business-level verification accordingly.
 
 ### 1. Main01: Google Translate Extension Installation through WebDriver BiDi
 This procedure is intentionally limited to one task: installing the unpacked Google Translate extension into the current Chrome automation session.
@@ -115,14 +115,14 @@ This procedure demonstrates controlled scrolling on a page that appends content 
 * **Business-level verification:** After the wait, SeleniumVBA takes a DOM snapshot and counts article links. The count is useful as a manual verification result, not as a fixed expected value for the live site.
 * **What to customize:** Replace the URL and final article XPath. If the site uses a dedicated “load more” response or a stable result container, consider arming an explicit network or content signal instead of relying on quietness alone.
 
-### 3. Main03: Resource Blocking, Idle-Noise Filtering, and Discovery Log
-This procedure automates a live route-search form while recording evidence that can be used to tune SPA synchronization.
+### 3. Main03: Two-Stage Route Search, Resource Filtering, and Discovery Log
+This procedure automates a live route-search workflow that requires two sequential button clicks across a page transition, while recording evidence that can be used to tune SPA synchronization.
 
 * **Two different traffic controls:** `ExecuteEnableResourceBlocking` prevents matching requests from being sent, while `AddIdleIgnoreNetworkPattern` allows requests to continue but excludes matching background traffic from idle judgment. Blocking is stronger and can change page behavior; ignoring is appropriate for required but continuously noisy telemetry.
-* **Focused diagnostic recording:** `StartDiscoveryLog` begins after initial navigation so the saved log concentrates on field input, suggestion activity, submission, responses, DOM mutations, and the final stability decision.
-* **Action waits remain enabled:** The input and click operations keep their normal post-action waits because route fields and search submission may trigger asynchronous work.
-* **Selector adaptation:** The sample shows both prefix and exact-ID selector forms for the search button. If they resolve to the same live element, keep only one when adapting the code to avoid duplicate submission.
-* **How to diagnose failure:** Inspect the Discovery Log before adding fixed delays. Determine whether the problem is an incorrect selector, relevant traffic excluded as noise, an untracked completion response, or a render that occurs after apparent network quiet.
+* **Focused diagnostic recording:** `StartDiscoveryLog` begins after the initial navigation and covers field input, the first search-button action, the resulting page transition, the second search-button action, responses, DOM mutations, and the final stability decision.
+* **Action waits remain enabled:** The input and click operations keep their normal post-action waits because route fields, the intermediate transition, and final submission may trigger asynchronous work.
+* **Intentional two-stage button sequence:** The prefix selector clicks the first button. That action changes the page, after which another button with the exact ID appears and is clicked by the second call. These calls are not duplicate submissions against one unchanged element. When adapting the sample, verify that each selector belongs to the intended page state before removing either action.
+* **How to diagnose failure:** Inspect the Discovery Log before adding fixed delays. Determine whether the problem is an incorrect selector, a transition that did not complete, relevant traffic excluded as noise, an untracked completion response, or a render that occurs after apparent network quiet.
 
 ### 4. Main04: Manual Login Wait Using URL and Post-Navigation Activity
 This procedure opens a login page, lets the user authenticate manually, and waits for the browser to reach the expected authenticated URL.
@@ -163,7 +163,8 @@ This procedure demonstrates how multiple synchronization techniques can be combi
 * **Selector resilience:** The sample favors ARIA roles and accessible labels over obfuscated CSS classes, sets `--lang=en`, and uses `[last()]` where Google may create or replace duplicate combobox inputs.
 * **Trusted input path:** `ExecuteInputValueByXPath` uses the wrapper's active-element-aware input flow to clear, type, and validate values while the framework may replace controls.
 * **Traffic classification:** Non-essential resources are blocked, while required background requests are merely ignored for idle judgment. The Discovery Log remains the evidence source for revising both lists.
-* **Explicit render boundaries:** The calendar step arms both a network signal (`GetCalendarPicker`) and a visibility signal for fare cells. The search step arms `GetShoppingResults`. These are one-shot, observed implementation details rather than stable public APIs.
+* **Suggestion-selection gates:** Immediately before clicking the Sapporo suggestion, the sample arms `rpcids=tDoGIe`; immediately before clicking the Paris suggestion, it arms `rpcids=BVAT3`. Each click also requests a 1000 ms stable window. These signals were discovered from the current live workflow and may change independently.
+* **Calendar and result gates:** Before opening the departure calendar, the sample arms the `GetCalendarPicker` network signal and the visibility signal `//div[@data-gs]`. Before pressing Search, it arms `GetShoppingResults`. All `Arm*` signals are one-shot observations rather than stable public APIs.
 * **Live-site limitations:** City suggestions, date-cell positions, button labels, endpoint names, consent state, locale, and account state may change. Update selectors and signals from a fresh log instead of adding arbitrary delays.
 * **Expected outcome:** The example demonstrates a robust diagnostic strategy, but it cannot guarantee immunity from future Google UI or backend changes.
 
@@ -179,13 +180,12 @@ This procedure records a narrow observation window while the user performs one m
 ### 10. Main10: Content-Signal Gate for the Settle-to-Render Gap
 This procedure demonstrates `ArmContentSignal` for cases where a response settles before an existing results container is rewritten.
 
-* **Arm-then-act pattern:** The sample arms `#table-body` immediately before each year click. The next relevant SPA wait is gated on observing that existing subtree change in addition to the normal idle conditions.
+* **Arm-then-act pattern:** The sample arms the existing target `//*[@id='table-body']` immediately before each year click. The next relevant SPA wait is gated on observing that subtree change in addition to the normal idle conditions.
 * **Existing-target requirement:** The target XPath must already exist when armed. This signal is not appropriate for an element that is created only after the action; choose an existing parent container or another completion signal instead.
 * **One-shot consumption:** Each armed signal is consumed by the next relevant wait, so the sample must re-arm before the second year click.
 * **Fail-fast configuration:** A missing target at arm time raises immediately, exposing a mistyped or obsolete XPath instead of silently creating a meaningless wait.
 * **Noise filtering:** Known background telemetry is ignored for idle judgment so unrelated traffic does not prevent the content-gated wait from settling.
 * **What to customize:** Choose a stable existing subtree whose rewrite genuinely marks business completion. Avoid broad ancestors that also mutate for animations, clocks, advertisements, or unrelated telemetry.
-
 ---
 ### 🔗 External Links
 * [Medium - Article by hanamichi77777](https://medium.com/@hanamichi77777/webdriver-bidi-for-seleniumvba-ee4687887d03)
