@@ -45,49 +45,12 @@ The validation code is contained in the `Main07` procedure.
 
 Setup and import instructions are available in the **[Wiki](https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA/wiki)**.
 
-## Installing Chrome Extensions through WebDriver BiDi
-
-`Main01` is a minimal demonstration that installs the Google Translate extension into the automation browser after Chrome has started. It does not navigate to a page or demonstrate SPA waiting, so extension-installation problems can be diagnosed independently from page synchronization.
-
-### Why the sample does not use classic startup capabilities
-
-Older Selenium examples often load an unpacked extension at browser startup through ChromeOptions / capabilities, such as `AddExtensions` or the `--load-extension` command-line switch.
-
-For branded Chrome, that startup route is no longer a practical solution for this sample. Chrome removed the `--load-extension` flag in Chrome 137 because it had been abused to load malicious or unwanted software. As a result, a classic SeleniumVBA capability that ultimately depends on that startup mechanism cannot be relied on to install an unpacked extension in current normal Chrome builds.
-
-Instead, this project:
-
-1. starts Chrome with WebDriver BiDi enabled;
-2. connects `BiDiCommandWrapper` to the BiDi WebSocket endpoint; and
-3. sends the standard `webExtension.install` command after the browser session has been created.
-
-The W3C WebDriver BiDi command accepts a local extension directory through `extensionData.type = "path"` and returns the installed extension ID. Browsers may install the extension temporarily so that it is removed when the automation browser shuts down.
-
-### Requirements used by `Main01`
-
-* Google Translate must already be installed in the user's normal Chrome profile so that its unpacked local files are available.
-* `extensionPath` must point to the version directory that directly contains `manifest.json`, not only to the extension-ID directory.
-* The Google Translate extension ID used by the sample is `aapbdbdomjkkjkaonfhkkikfgjllcleb`.
-* Chrome may update the version-number directory. If the sample path no longer exists, replace the version segment with the directory currently present under the Chrome profile.
-* The sample launches Chrome with `--remote-debugging-pipe` and `--enable-unsafe-extension-debugging`, and calls `caps.EnableBiDiMode` before `OpenBrowser`.
-* Enterprise browser policy may prohibit extension installation or the required debugging configuration. Such restrictions cannot be solved by changing SPA wait settings.
-
-`webExtension.install` changes browser state. The wrapper therefore does not blindly retry the command after an ambiguous transport failure, because the first installation may already have succeeded even if its response was not received.
-
-Official references:
-
-* [Chrome Extensions update: removal of `--load-extension` in Chrome 137](https://developer.chrome.com/blog/extension-news-june-2025)
-* [W3C WebDriver BiDi: `webExtension.install`](https://www.w3.org/TR/webdriver-bidi/#command-webExtension-install)
-
 ## Scope and Limitations
 
 * **SPA completion is inferred, not guaranteed.** The default idle consensus is based on observed network activity, Fetch/XHR counters, DOM mutations, and a quiet window. It cannot prove the target application's internal logical completion or rule out future delayed work.
 * **Use explicit completion signals for important actions.** When a specific DOM rewrite or network response marks completion, arm `ArmContentSignal` and/or `ArmNetworkSignal` immediately before the action. A targeted signal is safer than relying on quietness alone.
-* **The WebSocket transport is synchronous.** In the rare case that the TCP connection remains open while the peer returns no frames, the underlying WinHTTP receive call may not return control to VBA, so VBA-side timeout logic cannot intervene.
 * **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
-* **Resource blocking changes page behavior.** `ExecuteEnableResourceBlocking` should be limited to resources known to be unnecessary. Blocking application code, authentication endpoints, or content APIs can break the target page.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
-* **Extension installation depends on browser and policy support.** `Main01` installs an unpacked extension through WebDriver BiDi after startup; the local extension path, Chrome version, ChromeDriver support, and enterprise policy can all affect the result.
 
 ---
 

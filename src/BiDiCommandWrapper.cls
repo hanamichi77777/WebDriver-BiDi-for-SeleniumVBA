@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 2.7 / MIT License / Copyright (c) hanamichi77777
+' Version 2.8 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -611,6 +611,54 @@ NextNavAttempt:
     ExecuteNavigateAndGetStatus = "500"
 End Function
 
+
+' browsingContext.traverseHistory returns before the specification guarantees that
+' traversal has completed. The command result is therefore followed by the wrapper's
+' bounded URL/SPA synchronization, and callers should still verify a destination-specific
+' element when the restored page has a known completion condition.
+Public Function ExecuteTraverseHistory(ByVal delta As Long, _
+                                       Optional ByVal waitNetworkIdle As Boolean = True, _
+                                       Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                       Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                       Optional ByVal contextId As String = "") As String
+
+    If delta = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteTraverseHistory", _
+                  "delta must not be zero. Use -1 for Back or 1 for Forward."
+    End If
+
+    Dim vMinStable As Long
+    Dim vMaxTimeout As Long
+    Dim targetCtx As String
+    Dim params As New Dictionary
+    Dim strRes As String
+
+    vMinStable = SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS)
+    vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
+    targetCtx = ResolveTargetContext(contextId)
+
+    params.Add "context", targetCtx
+    params.Add "delta", delta
+
+    ' History traversal is state-changing. A transport timeout, disconnect, or context-loss
+    ' response can mean that the browser already accepted the traversal, so never resend it,
+    ' recover it against another context, or retarget it to the current main context.
+    strRes = ExecuteBiDiCommand( _
+                "browsingContext.traverseHistory", _
+                params, _
+                allowAmbiguousRetry:=False, _
+                allowRecoveryRetry:=False, _
+                allowContextRetarget:=False)
+
+    ValidateProtocolResponse strRes, "browsingContext.traverseHistory"
+
+    ' Ordinary settle failure does not undo an accepted history traversal.
+    ' TrySyncPhase propagates only ERR_CONSENSUS_HALT.
+    Call TrySyncPhase(targetCtx, waitNetworkIdle, vMinStable, vMaxTimeout, True)
+
+    ExecuteTraverseHistory = strRes
+End Function
+
 ' Resource blocking deliberately uses CDP Network.setBlockedURLs.
 ' Fetch/BiDi interception would require per-request replies on the shared synchronous
 ' correlation path, starving SPA-probe polls and risking re-entry. Failing parser-blocking
@@ -712,6 +760,163 @@ Public Function ExecuteIsElementVisible(ByVal xpath As String, _
         ExecuteIsElementVisible = CBool(resultVal)
     End If
     On Error GoTo 0
+End Function
+
+' Returns normalized textContent for the first element matching XPath. An absent
+' element is an action error; an existing element with no text returns an empty string.
+Public Function ExecuteGetTextByXPath(ByVal xpath As String, _
+                                      Optional ByVal searchTimeoutMs As Long = 10000, _
+                                      Optional ByVal contextId As String = "") As String
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+
+    Dim sharedId As String
+    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteGetTextByXPath")
+
+    Dim args As New Collection
+    Dim arg1 As New Dictionary: arg1.Add "sharedId", sharedId: args.Add arg1
+
+    Dim strRes As String
+    strRes = ExecuteBaseAction(targetCtx, _
+                               "get_text", _
+                               args, _
+                               False, _
+                               DEFAULT_IDLE_STABLE_MS, _
+                               True, _
+                               DEFAULT_STALE_RETRIES, _
+                               DEFAULT_IDLE_TIMEOUT_MS)
+
+    Dim resultVal As Variant
+    resultVal = GetCleanResult(strRes)
+
+    If IsEmpty(resultVal) Or IsNull(resultVal) Or IsObject(resultVal) Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetTextByXPath", _
+                  "The text result was not a string value."
+    End If
+
+    ExecuteGetTextByXPath = CStr(resultVal)
+End Function
+
+' Returns getAttribute(name) for the first element matching XPath. A missing
+' attribute returns Null; an existing empty attribute returns an empty string.
+Public Function ExecuteGetAttributeByXPath(ByVal xpath As String, _
+                                           ByVal attributeName As String, _
+                                           Optional ByVal searchTimeoutMs As Long = 10000, _
+                                           Optional ByVal contextId As String = "") As Variant
+    If Len(attributeName) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetAttributeByXPath", _
+                  "attributeName must not be empty."
+    End If
+    If InStr(attributeName, Chr$(0)) > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetAttributeByXPath", _
+                  "attributeName contains a null byte (Chr$(0))."
+    End If
+
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+
+    Dim sharedId As String
+    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteGetAttributeByXPath")
+
+    Dim args As New Collection
+    Dim arg1 As New Dictionary: arg1.Add "sharedId", sharedId: args.Add arg1
+    Dim arg2 As New Dictionary: arg2.Add "type", "string": arg2.Add "value", attributeName: args.Add arg2
+
+    Dim strRes As String
+    strRes = ExecuteBaseAction(targetCtx, _
+                               "get_attribute", _
+                               args, _
+                               False, _
+                               DEFAULT_IDLE_STABLE_MS, _
+                               True, _
+                               DEFAULT_STALE_RETRIES, _
+                               DEFAULT_IDLE_TIMEOUT_MS)
+
+    Dim resultVal As Variant
+    resultVal = GetCleanResult(strRes)
+
+    If IsEmpty(resultVal) Or IsObject(resultVal) Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetAttributeByXPath", _
+                  "The attribute result was not a scalar value or Null."
+    End If
+
+    ExecuteGetAttributeByXPath = resultVal
+End Function
+
+' Returns a scalar DOM property for the first element matching XPath. Supported
+' result types are String, Boolean, numeric values, and Null.
+Public Function ExecuteGetPropertyByXPath(ByVal xpath As String, _
+                                          ByVal propertyName As String, _
+                                          Optional ByVal searchTimeoutMs As Long = 10000, _
+                                          Optional ByVal contextId As String = "") As Variant
+    If Len(propertyName) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetPropertyByXPath", _
+                  "propertyName must not be empty."
+    End If
+    If InStr(propertyName, Chr$(0)) > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetPropertyByXPath", _
+                  "propertyName contains a null byte (Chr$(0))."
+    End If
+
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+
+    Dim sharedId As String
+    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteGetPropertyByXPath")
+
+    Dim args As New Collection
+    Dim arg1 As New Dictionary: arg1.Add "sharedId", sharedId: args.Add arg1
+    Dim arg2 As New Dictionary: arg2.Add "type", "string": arg2.Add "value", propertyName: args.Add arg2
+
+    Dim strRes As String
+    strRes = ExecuteBaseAction(targetCtx, _
+                               "get_property", _
+                               args, _
+                               False, _
+                               DEFAULT_IDLE_STABLE_MS, _
+                               True, _
+                               DEFAULT_STALE_RETRIES, _
+                               DEFAULT_IDLE_TIMEOUT_MS)
+
+    Dim resultVal As Variant
+    resultVal = GetCleanResult(strRes)
+
+    If IsEmpty(resultVal) Or IsObject(resultVal) Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetPropertyByXPath", _
+                  "The property result was not a supported scalar value or Null."
+    End If
+
+    ExecuteGetPropertyByXPath = resultVal
+End Function
+
+' Returns outerHTML for the first element matching XPath.
+Public Function ExecuteGetOuterHtmlByXPath(ByVal xpath As String, _
+                                           Optional ByVal searchTimeoutMs As Long = 10000, _
+                                           Optional ByVal contextId As String = "") As String
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+
+    Dim sharedId As String
+    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteGetOuterHtmlByXPath")
+
+    Dim args As New Collection
+    Dim arg1 As New Dictionary: arg1.Add "sharedId", sharedId: args.Add arg1
+
+    Dim strRes As String
+    strRes = ExecuteBaseAction(targetCtx, _
+                               "get_outer_html", _
+                               args, _
+                               False, _
+                               DEFAULT_IDLE_STABLE_MS, _
+                               True, _
+                               DEFAULT_STALE_RETRIES, _
+                               DEFAULT_IDLE_TIMEOUT_MS)
+
+    Dim resultVal As Variant
+    resultVal = GetCleanResult(strRes)
+
+    If IsEmpty(resultVal) Or IsNull(resultVal) Or IsObject(resultVal) Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteGetOuterHtmlByXPath", _
+                  "The outerHTML result was not a string value."
+    End If
+
+    ExecuteGetOuterHtmlByXPath = CStr(resultVal)
 End Function
 
 Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
@@ -1267,7 +1472,12 @@ Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
     ' would be converted to the minimum polling interval.
     Dim isImmediate As Boolean: isImmediate = (searchTimeoutMs <= 0)
     
-    Dim vTimeoutMs As Long: vTimeoutMs = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
+    Dim vTimeoutMs As Long
+    If isImmediate Then
+        vTimeoutMs = 0
+    Else
+        vTimeoutMs = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
+    End If
     Dim startTick As Currency: startTick = socket_.NowTicks()
     Dim strRes As String, json As Object, nodes As Collection
     Dim sid As String
@@ -3060,6 +3270,24 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "if(!f)throw new Error('Option text not found: '+t); s.scrollIntoView({block:'center'}); s.focus(); " & rp
             js = js & "s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); s.blur(); return true;} catch(err){throw err;}"
 
+        Case "get_text"
+            js = js & "const e=arguments[0]; if(!e||!e.isConnected)throw new Error('Element is no longer connected.'); "
+            js = js & "return(e.textContent||'').replace(/[\s\u00A0]+/g,' ').trim();"
+
+        Case "get_attribute"
+            js = js & "const e=arguments[0],n=arguments[1]; if(!e||!e.isConnected)throw new Error('Element is no longer connected.'); "
+            js = js & "return e.getAttribute(n);"
+
+        Case "get_property"
+            js = js & "const e=arguments[0],n=arguments[1]; if(!e||!e.isConnected)throw new Error('Element is no longer connected.'); "
+            js = js & "const v=e[n]; if(v===undefined)throw new Error('Property is undefined: '+n); "
+            js = js & "if(v===null||typeof v==='string'||typeof v==='boolean'||typeof v==='number')return v; "
+            js = js & "throw new Error('Property is not a supported scalar value: '+n);"
+
+        Case "get_outer_html"
+            js = js & "const e=arguments[0]; if(!e||!e.isConnected)throw new Error('Element is no longer connected.'); "
+            js = js & "return e.outerHTML;"
+
         Case "visibility_check"
             js = js & "const e=arguments[0]; if(!e||!e.isConnected)return false; const s=window.getComputedStyle(e),r=e.getBoundingClientRect(); "
             js = js & "return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0));"
@@ -4137,6 +4365,13 @@ Public Sub PostScript(ByVal js As String, _
     ' This path bypasses response correlation but does not pump Office messages.
     socket_.PostScript WebJsonConverter.ConvertToJson(requestDic)
 End Sub
+
+
+' Converts arbitrary text to an XPath 1.0 string literal. The returned value is an XPath
+' expression such as 'text', "text", or concat(...), not the original unescaped text.
+Public Function XPathLiteral(ByVal text As String) As String
+    XPathLiteral = EscapeXPathString(text)
+End Function
 
 ' Escape XPath literals with single quotes, double quotes, or concat() when both quote
 ' types occur.
