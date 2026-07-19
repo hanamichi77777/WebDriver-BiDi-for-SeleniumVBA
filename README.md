@@ -15,6 +15,8 @@ Since this project assumes concurrent use of classic SeleniumVBA methods and BiD
 
 ## Discovery Log
 
+![What You Do with BiDi](image/pr_image_workflow.png)
+
 The Discovery Log is designed for third-party SPA sites where the automation code cannot access an internal “ready” or “completed” flag.
 
 It records network responses, DOM mutation bursts, suppressed background noise, and stability margins such as slackMs.
