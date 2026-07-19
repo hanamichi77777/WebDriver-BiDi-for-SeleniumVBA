@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 2.8 / MIT License / Copyright (c) hanamichi77777
+' Version 2.9 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -65,7 +65,10 @@ Private Const DEFAULT_IDLE_STABLE_MS As Long = 500
 Private Const DEFAULT_IDLE_TIMEOUT_MS As Long = 10000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
 Private Const SHORT_WAIT_MS As Long = 500
-Private Const MAX_LOG_SIZE As Long = 500
+' Maximum number of diagnostic timeline events retained by the Discovery Log.
+' A generous limit is used because the recorder is enabled only during diagnosis
+' and preserving the beginning of the timeline is important for root-cause analysis.
+Private Const MAX_LOG_SIZE As Long = 5000
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging
 Private Const MIN_MSG_SIZE As Long = 10     ' Ignore extremely short messages
 ' PostScript uses reserved id 2. Normal command IDs start at 100 and replies to
