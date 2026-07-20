@@ -36,6 +36,12 @@ ServiceNow is frequently regarded as one of the more difficult Single Page Appli
 
 The validation code is contained in the `Main07` procedure.
 
+
+## VirusTotal Scan Results
+
+WebDriver BiDi for SeleniumVBA v2.9 was scanned by VirusTotal on July 20, 2026, and received 0 detections from 64 security vendors at the time of testing.
+
+
 ---
 ## [Supported OS]
 * **Windows11**
