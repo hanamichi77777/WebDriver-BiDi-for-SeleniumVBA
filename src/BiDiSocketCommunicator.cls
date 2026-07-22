@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 2.9 / MIT License / Copyright (c) hanamichi77777
+' Version 3.0 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
@@ -1377,9 +1377,7 @@ Public Sub Trace(ByVal msg As String, Optional ByVal isCritical As Boolean = Fal
     End If
 
     If shouldLogToFile Then
-        Dim localDir As String: localDir = WebShared.getFullLocalPath(ThisWorkbook.path)
-        If localDir = "" Then localDir = Environ("USERPROFILE") & "\Desktop"
-        If Right$(localDir, 1) <> "\" Then localDir = localDir & "\"
+        Dim localDir As String: localDir = ResolveLogDirectory()
         
         Dim logPath As String: logPath = localDir & "bidi_socket_trace.log"
         Dim fNum As Integer: fNum = FreeFile
@@ -1431,12 +1429,32 @@ Public Sub LogEvent(ByVal Header As String, ByVal Body As String, _
     End If
 End Sub
 
+Private Function ResolveLogDirectory() As String
+    Dim localDir As String
+
+    ' WebShared.thisLibFolderPath is host-neutral:
+    ' Excel -> host workbook folder, Access -> CodeProject.Path.
+    On Error Resume Next
+    localDir = WebShared.thisLibFolderPath
+    If Len(localDir) > 0 Then
+        localDir = WebShared.getFullLocalPath(localDir)
+    End If
+    On Error GoTo 0
+
+    ' An unsaved host document or an unavailable project path must not prevent logging.
+    If Len(localDir) = 0 Then localDir = Environ$("TEMP")
+    If Len(localDir) = 0 Then localDir = CurDir$
+    If Len(localDir) = 0 Then localDir = Environ$("USERPROFILE")
+    If Len(localDir) = 0 Then localDir = "."
+    If Right$(localDir, 1) <> "\" Then localDir = localDir & "\"
+
+    ResolveLogDirectory = localDir
+End Function
+
 Private Sub WriteLogToFile(ByVal msg As String)
     Dim localDir As String
     On Error Resume Next
-    localDir = WebShared.getFullLocalPath(ThisWorkbook.path)
-    If localDir = "" Then localDir = Environ("USERPROFILE") & "\Desktop"
-    If Right$(localDir, 1) <> "\" Then localDir = localDir & "\"
+    localDir = ResolveLogDirectory()
     
     Dim logPath As String: logPath = localDir & "bidi_socket_trace.log"
     Dim fNum As Integer: fNum = FreeFile

@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 2.9 / MIT License / Copyright (c) hanamichi77777
+' Version 3.0 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -21,7 +21,7 @@ Option Explicit
 '   SPA wait: MasterWaitEngine -> EvaluateWaitCondition -> EvaluateSpaIdleCondition.
 '
 ' Preserve these invariants:
-'   - m_waitStackDepth alone owns Application.Interactive.
+'   - m_waitStackDepth tracks nested active wait loops.
 '   - Do not pump Office messages during SendAndReceive correlation.
 '   - State-changing ambiguous outcomes are never replayed.
 '   - ERR_CONSENSUS_HALT propagates; ordinary post-action sync failure is best-effort.
@@ -203,10 +203,6 @@ Private Sub Class_Terminate()
     ' procedure because teardown must continue after any individual failure.
     On Error Resume Next
     
-    Application.Interactive = True
-    Application.Cursor = xlDefault
-    Application.StatusBar = False
-    
     If m_mainContextId <> "" Then
         Call Me.PostScript(GetHudJs("remove"), Nothing, m_mainContextId)
     End If
@@ -216,7 +212,7 @@ Private Sub Class_Terminate()
     Call Shutdown
     
     If m_debugMode Then
-        Debug.Print "BiDiCommandWrapper: Terminated and UI protection released."
+        Debug.Print "BiDiCommandWrapper: Terminated."
     End If
 End Sub
 Public Property Get GetSocket() As BiDiSocketCommunicator
@@ -2164,8 +2160,7 @@ End Sub
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
     If seconds <= 0 Then Exit Sub
 
-    ' Arm the handler and validate socket_ before locking Application.Interactive; otherwise
-    ' an early error could leave Excel locked.
+    ' Arm the handler and validate socket_ before starting the timed recorder loop.
     On Error GoTo ErrorHandler
 
     If socket_ Is Nothing Then
@@ -2174,9 +2169,6 @@ Public Sub RecordEventsForSeconds(ByVal seconds As Long)
 
     Dim startMs As Double: startMs = socket_.nowMs()
     Dim durationMs As Double: durationMs = CDbl(seconds) * 1000#
-
-    Application.Interactive = False
-    Application.Cursor = xlWait
 
     Do While (socket_.nowMs() - startMs) < durationMs
         ProcessRecorderQueue
@@ -2193,8 +2185,6 @@ Cleanup:
     ' Always release the recorder processing lock after an error.
     m_isProcessingQueue = False
     
-    Application.Interactive = True
-    Application.Cursor = xlDefault
     Exit Sub
 
 ErrorHandler:
@@ -3482,8 +3472,8 @@ Private Function EnsureDictionary(ByVal dic As Dictionary) As Dictionary
 End Function
 
 
-' MasterWaitEngine owns URL-contains and SPA-idle polling. m_waitStackDepth owns the
-' nested Office UI lock, and every exit converges on cleanup.
+' MasterWaitEngine owns URL-contains and SPA-idle polling. m_waitStackDepth tracks
+' nested waits, and every exit converges on cleanup.
 Private Function MasterWaitEngine(ByVal mode As waitMode, _
                                   ByVal timeoutMs As Long, _
                                   ByVal intervalMs As Long, _
@@ -3498,9 +3488,6 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
     m_waitStackDepth = m_waitStackDepth + 1
     
     If m_waitStackDepth = 1 Then
-        Application.Interactive = False
-        Application.Cursor = xlWait
-        
         m_lastTelemetryTick = 0
         
         On Error Resume Next
@@ -3543,12 +3530,6 @@ CleanExit:
         If m_waitStackDepth < 0 Then m_waitStackDepth = 0
     End If
 
-    If m_waitStackDepth = 0 Then
-        Application.Interactive = True
-        Application.Cursor = xlDefault
-        Application.StatusBar = False
-    End If
-    
     On Error Resume Next
     If errNum = 0 Or m_waitStackDepth = 0 Then
         Call Me.CallScript(GetHudJs("remove"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), False, False, 1000, True)
@@ -3560,8 +3541,6 @@ CleanExit:
         ' HALT escalation applies only to logical timeout 504 with pending requests; other errors
         ' retain their original codes for recovery or best-effort handling.
         On Error Resume Next
-        Application.Interactive = True
-        
         Dim inflightDetail As String: inflightDetail = ""
         If ctx.Exists("lastInflightUrls") Then
             Dim urls As Collection: Set urls = ctx("lastInflightUrls")

@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v2.9
+# WebDriver BiDi for SeleniumVBA v3.0
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.png)
 
@@ -45,6 +45,8 @@ WebDriver BiDi for SeleniumVBA v2.9 was scanned by VirusTotal on July 20, 2026, 
 ---
 ## [Supported OS]
 * **Windows11**
+## [Supported Application]
+* **Excel / Access**
 ## [Supported Browsers]
 * **Edge / Chrome**
 * *Firefox is not supported due to functional limitations.*
