@@ -39,7 +39,7 @@ The validation code is contained in the `Main07` procedure.
 
 ## VirusTotal Scan Results
 
-WebDriver BiDi for SeleniumVBA v3.0 was scanned by VirusTotal on July 22, 2026, and received 0 detections from 64 security vendors at the time of testing.
+WebDriver BiDi for SeleniumVBA v3.1 was scanned by VirusTotal on July 25, 2026, and received 0 detections from 64 security vendors at the time of testing.
 
 
 ---
