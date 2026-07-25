@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v3.0
+# WebDriver BiDi for SeleniumVBA v3.1
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.png)
 
@@ -160,5 +160,3 @@ This procedure demonstrates `ArmContentSignal` for cases where a response settle
 * **Noise filtering:** Known background telemetry is ignored for idle judgment so unrelated traffic does not prevent the content-gated wait from settling.
 * **What to customize:** Choose a stable existing subtree whose rewrite genuinely marks business completion. Avoid broad ancestors that also mutate for animations, clocks, advertisements, or unrelated telemetry.
 ---
-### 🔗 External Links
-* [Medium - Article by hanamichi77777](https://medium.com/@hanamichi77777/webdriver-bidi-for-seleniumvba-ee4687887d03)

@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.0 / MIT License / Copyright (c) hanamichi77777
+' Version 3.1 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
@@ -23,6 +23,7 @@ Option Explicit
 '   - IDs [1..99] are system traffic; normal commands use [100..ID_MAX].
 '   - Recovery may heal the socket but never replay the same payload/request ID.
 '   - Every native Pump is non-blocking and bounded by time and work.
+'   - Strict UTF-8 validation belongs here; invalid peer text closes with status 1007.
 '   - Do not call Trace from a cleanup-critical error handler.
 Private Const DEBUG_MODE As Boolean = False
 Private Declare PtrSafe Sub SleepWinAPI Lib "kernel32" Alias "Sleep" (ByVal milliseconds As Long)
@@ -104,28 +105,41 @@ Private Declare PtrSafe Function WsApi_WSAStartup Lib "ws2_32.dll" Alias "WSASta
 Private Declare PtrSafe Function WsApi_WSACleanup Lib "ws2_32.dll" Alias "WSACleanup" () As Long
 Private Declare PtrSafe Function WsApi_socket Lib "ws2_32.dll" Alias "socket" (ByVal af As Long, ByVal socketType As Long, ByVal protocol As Long) As LongPtr
 Private Declare PtrSafe Function WsApi_closesocket Lib "ws2_32.dll" Alias "closesocket" (ByVal s As LongPtr) As Long
-Private Declare PtrSafe Function WsApi_connectSocket Lib "ws2_32.dll" Alias "connect" (ByVal s As LongPtr, ByRef socketAddress As Any, ByVal nameLength As Long) As Long
-Private Declare PtrSafe Function WsApi_sendSocket Lib "ws2_32.dll" Alias "send" (ByVal s As LongPtr, ByRef Buffer As Any, ByVal bufferLength As Long, ByVal flags As Long) As Long
-Private Declare PtrSafe Function WsApi_recvSocket Lib "ws2_32.dll" Alias "recv" (ByVal s As LongPtr, ByRef Buffer As Any, ByVal bufferLength As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_connectSocketIPv4 Lib "ws2_32.dll" Alias "connect" (ByVal s As LongPtr, ByRef socketAddress As WsSOCKADDR_IN, ByVal nameLength As Long) As Long
+Private Declare PtrSafe Function WsApi_connectSocketIPv6 Lib "ws2_32.dll" Alias "connect" (ByVal s As LongPtr, ByRef socketAddress As WsSOCKADDR_IN6, ByVal nameLength As Long) As Long
+Private Declare PtrSafe Function WsApi_sendSocket Lib "ws2_32.dll" Alias "send" (ByVal s As LongPtr, ByRef Buffer As Byte, ByVal bufferLength As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_recvSocket Lib "ws2_32.dll" Alias "recv" (ByVal s As LongPtr, ByRef Buffer As Byte, ByVal bufferLength As Long, ByVal flags As Long) As Long
 Private Declare PtrSafe Function WsApi_ioctlsocket Lib "ws2_32.dll" Alias "ioctlsocket" (ByVal s As LongPtr, ByVal command As Long, ByRef argument As Long) As Long
 Private Declare PtrSafe Function WsApi_selectSocket Lib "ws2_32.dll" Alias "select" (ByVal ignored As Long, ByRef readSet As WsFD_SET, ByRef writeSet As WsFD_SET, ByRef exceptSet As WsFD_SET, ByRef TIMEOUT As WsTIMEVAL) As Long
 Private Declare PtrSafe Function WsApi_getsockopt Lib "ws2_32.dll" Alias "getsockopt" (ByVal s As LongPtr, ByVal level As Long, ByVal optionName As Long, ByRef optionValue As Long, ByRef optionLength As Long) As Long
-Private Declare PtrSafe Function WsApi_setsockopt Lib "ws2_32.dll" Alias "setsockopt" (ByVal s As LongPtr, ByVal level As Long, ByVal optionName As Long, ByRef optionValue As Any, ByVal optionLength As Long) As Long
+Private Declare PtrSafe Function WsApi_setsockopt Lib "ws2_32.dll" Alias "setsockopt" (ByVal s As LongPtr, ByVal level As Long, ByVal optionName As Long, ByRef optionValue As Long, ByVal optionLength As Long) As Long
 Private Declare PtrSafe Function WsApi_shutdownSocket Lib "ws2_32.dll" Alias "shutdown" (ByVal s As LongPtr, ByVal how As Long) As Long
 Private Declare PtrSafe Function WsApi_WSAGetLastError Lib "ws2_32.dll" Alias "WSAGetLastError" () As Long
-Private Declare PtrSafe Function WsApi_InetPtonW Lib "ws2_32.dll" Alias "InetPtonW" (ByVal addressFamily As Long, ByVal addressText As LongPtr, ByRef addressBuffer As Any) As Long
+Private Declare PtrSafe Function WsApi_InetPtonW_IPv4 Lib "ws2_32.dll" Alias "InetPtonW" (ByVal addressFamily As Long, ByVal addressText As LongPtr, ByRef addressBuffer As Long) As Long
+Private Declare PtrSafe Function WsApi_InetPtonW_IPv6 Lib "ws2_32.dll" Alias "InetPtonW" (ByVal addressFamily As Long, ByVal addressText As LongPtr, ByRef addressBuffer As Byte) As Long
 
 Private Declare PtrSafe Sub WsApi_SleepWinAPI Lib "kernel32" Alias "Sleep" (ByVal milliseconds As Long)
 Private Declare PtrSafe Function WsApi_QueryPerformanceCounter Lib "kernel32" Alias "QueryPerformanceCounter" (ByRef performanceCount As Currency) As Long
 Private Declare PtrSafe Function WsApi_QueryPerformanceFrequency Lib "kernel32" Alias "QueryPerformanceFrequency" (ByRef frequency As Currency) As Long
+Private Declare PtrSafe Function WsApi_WideCharToMultiByteSize Lib "kernel32" Alias "WideCharToMultiByte" ( _
+    ByVal codePage As Long, ByVal flags As Long, ByVal wideText As LongPtr, _
+    ByVal wideCharCount As Long, ByVal utf8Buffer As LongPtr, ByVal utf8BufferSize As Long, _
+    ByVal defaultChar As LongPtr, ByVal usedDefaultChar As LongPtr) As Long
+Private Declare PtrSafe Function WsApi_WideCharToMultiByteBytes Lib "kernel32" Alias "WideCharToMultiByte" ( _
+    ByVal codePage As Long, ByVal flags As Long, ByVal wideText As LongPtr, _
+    ByVal wideCharCount As Long, ByRef utf8Buffer As Byte, ByVal utf8BufferSize As Long, _
+    ByVal defaultChar As LongPtr, ByVal usedDefaultChar As LongPtr) As Long
+Private Declare PtrSafe Function WsApi_MultiByteToWideChar Lib "kernel32" Alias "MultiByteToWideChar" ( _
+    ByVal codePage As Long, ByVal flags As Long, ByRef utf8Text As Byte, _
+    ByVal utf8ByteCount As Long, ByVal wideBuffer As LongPtr, ByVal wideBufferSize As Long) As Long
 
-Private Declare PtrSafe Function WsApi_BCryptGenRandom Lib "bcrypt.dll" Alias "BCryptGenRandom" (ByVal hAlgorithm As LongPtr, ByRef randomBuffer As Any, ByVal bufferSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptGenRandom Lib "bcrypt.dll" Alias "BCryptGenRandom" (ByVal hAlgorithm As LongPtr, ByRef randomBuffer As Byte, ByVal bufferSize As Long, ByVal flags As Long) As Long
 Private Declare PtrSafe Function WsApi_BCryptOpenAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptOpenAlgorithmProvider" (ByRef algorithmHandle As LongPtr, ByVal algorithmId As LongPtr, ByVal implementation As LongPtr, ByVal flags As Long) As Long
 Private Declare PtrSafe Function WsApi_BCryptCloseAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptCloseAlgorithmProvider" (ByVal algorithmHandle As LongPtr, ByVal flags As Long) As Long
-Private Declare PtrSafe Function WsApi_BCryptGetProperty Lib "bcrypt.dll" Alias "BCryptGetProperty" (ByVal objectHandle As LongPtr, ByVal propertyName As LongPtr, ByRef outputBuffer As Any, ByVal outputSize As Long, ByRef resultSize As Long, ByVal flags As Long) As Long
-Private Declare PtrSafe Function WsApi_BCryptCreateHash Lib "bcrypt.dll" Alias "BCryptCreateHash" (ByVal algorithmHandle As LongPtr, ByRef hashHandle As LongPtr, ByRef hashObject As Any, ByVal hashObjectSize As Long, ByVal secret As LongPtr, ByVal secretSize As Long, ByVal flags As Long) As Long
-Private Declare PtrSafe Function WsApi_BCryptHashData Lib "bcrypt.dll" Alias "BCryptHashData" (ByVal hashHandle As LongPtr, ByRef inputBuffer As Any, ByVal inputSize As Long, ByVal flags As Long) As Long
-Private Declare PtrSafe Function WsApi_BCryptFinishHash Lib "bcrypt.dll" Alias "BCryptFinishHash" (ByVal hashHandle As LongPtr, ByRef outputBuffer As Any, ByVal outputSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptGetPropertyLong Lib "bcrypt.dll" Alias "BCryptGetProperty" (ByVal objectHandle As LongPtr, ByVal propertyName As LongPtr, ByRef outputBuffer As Long, ByVal outputSize As Long, ByRef resultSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptCreateHash Lib "bcrypt.dll" Alias "BCryptCreateHash" (ByVal algorithmHandle As LongPtr, ByRef hashHandle As LongPtr, ByRef hashObject As Byte, ByVal hashObjectSize As Long, ByVal secret As LongPtr, ByVal secretSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptHashData Lib "bcrypt.dll" Alias "BCryptHashData" (ByVal hashHandle As LongPtr, ByRef inputBuffer As Byte, ByVal inputSize As Long, ByVal flags As Long) As Long
+Private Declare PtrSafe Function WsApi_BCryptFinishHash Lib "bcrypt.dll" Alias "BCryptFinishHash" (ByVal hashHandle As LongPtr, ByRef outputBuffer As Byte, ByVal outputSize As Long, ByVal flags As Long) As Long
 Private Declare PtrSafe Function WsApi_BCryptDestroyHash Lib "bcrypt.dll" Alias "BCryptDestroyHash" (ByVal hashHandle As LongPtr) As Long
 
 
@@ -212,6 +226,18 @@ Private Const WS_CLIENT_PING_BUSY_RETRY_MS As Long = 1000
 
 Private Const WS_HANDSHAKE_NONCE_SIZE As Long = 16
 Private Const WS_WEBSOCKET_GUID As String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+' WebSocket text is UTF-8 without a BOM. Strict flags prevent malformed peer data
+' or isolated UTF-16 surrogates from being silently replaced.
+Private Const WS_CP_UTF8 As Long = 65001
+Private Const WS_MB_ERR_INVALID_CHARS As Long = &H8
+Private Const WS_WC_ERR_INVALID_CHARS As Long = &H80
+Private Const WS_ERROR_NO_UNICODE_TRANSLATION As Long = 1113
+Private Const WS_CLOSE_INVALID_PAYLOAD_DATA As Long = 1007
+Private Const WS_PROTOCOL_CLOSE_FLUSH_MS As Long = 50
+Private Const WS_ERR_INVALID_UTF8 As Long = 9250
+Private Const WS_ERR_INVALID_UTF16 As Long = 9251
+Private Const WS_ERR_UTF8_CODEC As Long = 9252
 Private Const WS_BCRYPT_SHA1_ALGORITHM As String = "SHA1"
 Private Const WS_BCRYPT_OBJECT_LENGTH As String = "ObjectLength"
 Private Const WS_BCRYPT_HASH_LENGTH As String = "HashDigestLength"
@@ -257,6 +283,7 @@ Private m_ws_handshakeOrigin As String
 Private m_ws_handshakeUserAgent As String
 Private m_ws_handshakeValidationError As String
 Private m_ws_LastErrorCode As Long
+Private m_ws_lastProtocolCloseStatus As Long ' RFC 6455 close status; separate from VBA/WSA/internal error codes
 Private m_ws_lastErrorText As String
 
 Private m_ws_sendQueue As Collection
@@ -615,14 +642,21 @@ Private Sub FinalizeConnectedState()
 End Sub
 
 Private Function GetWinsockFailureText() As String
+    Dim details As String
+
     If m_ws_LastErrorCode <> 0 Or Len(m_ws_lastErrorText) > 0 Then
-        GetWinsockFailureText = CStr(m_ws_LastErrorCode) & " / " & m_ws_lastErrorText
+        details = CStr(m_ws_LastErrorCode) & " / " & m_ws_lastErrorText
     ElseIf Not m_wsTransportInitialized Then
-        GetWinsockFailureText = "integrated transport was not initialized"
+        details = "integrated transport was not initialized"
     Else
-        GetWinsockFailureText = CStr(WsLastErrorCode) & _
-                                " / " & WsLastErrorText
+        details = CStr(WsLastErrorCode) & " / " & WsLastErrorText
     End If
+
+    If m_ws_lastProtocolCloseStatus <> 0 Then
+        details = details & " / WebSocket close=" & CStr(m_ws_lastProtocolCloseStatus)
+    End If
+
+    GetWinsockFailureText = details
 End Function
 
 Private Function SendMessageWinsock(ByVal msg As String) As Boolean
@@ -680,8 +714,12 @@ Public Function SendMessage(ByVal msg As String, Optional ByVal allowRecovery As
     SendMessage = False
 End Function
 
+' Fire-and-forget contract: any send failure is dropped, including the deterministic
+' invalid-UTF-16 rejection now raised by WsQueueText. This path must never raise.
 Public Sub PostScript(ByVal msg As String)
+    On Error Resume Next
     SendMessage msg, False
+    On Error GoTo 0
 End Sub
 
 Public Function GetNextRequestId() As Long
@@ -1743,23 +1781,23 @@ Private Function WsBeginConnect(ByVal wsUrl As String, _
         address6.family = WS_AF_INET6
         address6.port = WsHostToNetworkShort(m_ws_port)
 
-        If WsApi_InetPtonW(WS_AF_INET6, StrPtr("::1"), address6.address(0)) <> 1 Then
+        If WsApi_InetPtonW_IPv6(WS_AF_INET6, StrPtr("::1"), address6.address(0)) <> 1 Then
             WsSetFailure WsApi_WSAGetLastError(), "IPv6 loopback conversion failed."
             Exit Function
         End If
 
-        connectResult = WsApi_connectSocket(m_ws_socket, address6, LenB(address6))
+        connectResult = WsApi_connectSocketIPv6(m_ws_socket, address6, LenB(address6))
     Else
         Dim address4 As WsSOCKADDR_IN
         address4.family = WS_AF_INET
         address4.port = WsHostToNetworkShort(m_ws_port)
 
-        If WsApi_InetPtonW(WS_AF_INET, StrPtr("127.0.0.1"), address4.address) <> 1 Then
+        If WsApi_InetPtonW_IPv4(WS_AF_INET, StrPtr("127.0.0.1"), address4.address) <> 1 Then
             WsSetFailure WsApi_WSAGetLastError(), "IPv4 loopback conversion failed."
             Exit Function
         End If
 
-        connectResult = WsApi_connectSocket(m_ws_socket, address4, LenB(address4))
+        connectResult = WsApi_connectSocketIPv4(m_ws_socket, address4, LenB(address4))
     End If
 
     If connectResult = 0 Then
@@ -1838,6 +1876,7 @@ End Function
 
 Private Function WsQueueText(ByVal message As String) As Boolean
     If m_ws_state <> WsTransportOpen Then Exit Function
+    On Error GoTo ErrorHandler
 
     Dim payload() As Byte
     payload = WsEncodeUtf8(message)
@@ -1850,6 +1889,27 @@ Private Function WsQueueText(ByVal message As String) As Boolean
 
     WsEnqueueSendBytes frame
     WsQueueText = True
+    Exit Function
+
+ErrorHandler:
+    Dim savedNumber As Long
+    Dim savedDescription As String
+    savedNumber = Err.Number
+    savedDescription = Err.description
+
+    If savedNumber = WS_ERR_INVALID_UTF16 Then Resume RejectCallerText
+    Resume FailTransport
+
+RejectCallerText:
+    ' Encoding failed before a frame was built or queued. The peer saw nothing, so the
+    ' socket remains healthy and the deterministic caller-input error is propagated.
+    On Error GoTo 0
+    Err.Raise savedNumber, "BiDiSocketCommunicator.WsQueueText", savedDescription
+
+FailTransport:
+    On Error GoTo 0
+    WsSetFailure savedNumber, _
+                 "Outgoing WebSocket frame construction failed: " & savedDescription
 End Function
 
 Private Function WsTryDequeueText(ByRef message As String) As Boolean
@@ -1876,8 +1936,71 @@ Private Function WsTryDequeueText(ByRef message As String) As Boolean
     Exit Function
 
 ErrorHandler:
-    WsSetFailure Err.Number, "Deferred UTF-8 decode failed: " & Err.description
+    Dim savedNumber As Long
+    Dim savedDescription As String
+    savedNumber = Err.Number
+    savedDescription = Err.description
+
+    If savedNumber = WS_ERR_INVALID_UTF8 Then Resume RejectInvalidUtf8
+    Resume FailDecode
+
+RejectInvalidUtf8:
+    On Error GoTo 0
+    WsRejectInvalidPeerUtf8 savedDescription
+    Exit Function
+
+FailDecode:
+    On Error GoTo 0
+    WsSetFailure savedNumber, "Deferred UTF-8 decode failed: " & savedDescription
 End Function
+
+Private Sub WsRejectInvalidPeerUtf8(ByVal description As String)
+    On Error GoTo RejectFailure
+
+    m_ws_LastErrorCode = WS_ERR_INVALID_UTF8
+    m_ws_lastErrorText = description
+
+    If Not WsIsOpen Then
+        WsSetFailure WS_ERR_INVALID_UTF8, description
+        Exit Sub
+    End If
+
+    If Not WsBeginClose(WS_CLOSE_INVALID_PAYLOAD_DATA) Then
+        WsSetFailure WS_ERR_INVALID_UTF8, _
+            "Invalid UTF-8 was detected, but close status 1007 could not be queued: " & _
+            description
+        Exit Sub
+    End If
+
+    m_ws_lastProtocolCloseStatus = WS_CLOSE_INVALID_PAYLOAD_DATA
+
+    ' The dequeue caller may stop pumping as soon as state changes from OPEN. Give the
+    ' tiny close frame one bounded local flush opportunity before forcing teardown.
+    Dim closeDeadline As Double
+    closeDeadline = WsMonotonicMs() + WS_PROTOCOL_CLOSE_FLUSH_MS
+
+    Do While m_ws_state = WsTransportClosing And _
+             WsHasPendingSend And _
+             WsMonotonicMs() < closeDeadline
+        WsPump WINSOCK_PUMP_MAX_MS, _
+               WINSOCK_PUMP_MAX_BYTES, _
+               WINSOCK_PUMP_MAX_CALLS
+        WsApi_SleepWinAPI 0
+    Loop
+
+    If m_ws_state = WsTransportClosing Then WsForceClose
+    Exit Sub
+
+RejectFailure:
+    Dim rejectFailureText As String
+    rejectFailureText = Err.description
+    Resume RejectFailureOutsideHandler
+
+RejectFailureOutsideHandler:
+    On Error GoTo 0
+    WsSetFailure WS_ERR_INVALID_UTF8, _
+                 "Invalid UTF-8 close handling failed: " & rejectFailureText
+End Sub
 
 Private Function WsBeginClose(Optional ByVal statusCode As Long = 1000) As Boolean
     If m_ws_state <> WsTransportOpen Then Exit Function
@@ -2212,7 +2335,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     Dim objectLength As Long
     Dim resultSize As Long
 
-    status = WsApi_BCryptGetProperty( _
+    status = WsApi_BCryptGetPropertyLong( _
         algorithmHandle, StrPtr(objectProperty), _
         objectLength, 4, resultSize, 0)
 
@@ -2229,7 +2352,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     Dim hashLength As Long
     resultSize = 0
 
-    status = WsApi_BCryptGetProperty( _
+    status = WsApi_BCryptGetPropertyLong( _
         algorithmHandle, StrPtr(hashProperty), _
         hashLength, 4, resultSize, 0)
 
@@ -3091,6 +3214,7 @@ End Sub
 
 Private Sub WsResetRuntimeState()
     m_ws_LastErrorCode = 0
+    m_ws_lastProtocolCloseStatus = 0
     m_ws_lastErrorText = vbNullString
 
     Set m_ws_sendQueue = New Collection
@@ -3238,26 +3362,41 @@ Private Function WsEncodeAscii(ByVal text As String) As Byte()
 End Function
 
 Private Function WsEncodeUtf8(ByVal text As String) As Byte()
-    Dim stream As ADODB.stream
-    Set stream = New ADODB.stream
+    Dim result() As Byte
+    Dim wideCharCount As Long
+    wideCharCount = Len(text)
 
-    stream.Type = adTypeText
-    stream.Charset = "utf-8"
-    stream.Open
-    stream.WriteText text
-    stream.position = 0
-    stream.Type = adTypeBinary
-
-    If stream.size <= 3 Then
-        Dim emptyResult() As Byte
-        stream.Close
-        WsEncodeUtf8 = emptyResult
+    If wideCharCount = 0 Then
+        WsEncodeUtf8 = result
         Exit Function
     End If
 
-    stream.position = 3
-    WsEncodeUtf8 = stream.Read
-    stream.Close
+    Dim requiredBytes As Long
+    Dim lastError As Long
+
+    requiredBytes = WsApi_WideCharToMultiByteSize( _
+        WS_CP_UTF8, WS_WC_ERR_INVALID_CHARS, StrPtr(text), wideCharCount, _
+        0, 0, 0, 0)
+    lastError = Err.LastDllError
+
+    If requiredBytes = 0 Then WsRaiseEncodeError lastError
+
+    ReDim result(0 To requiredBytes - 1)
+
+    Dim convertedBytes As Long
+    convertedBytes = WsApi_WideCharToMultiByteBytes( _
+        WS_CP_UTF8, WS_WC_ERR_INVALID_CHARS, StrPtr(text), wideCharCount, _
+        result(0), requiredBytes, 0, 0)
+    lastError = Err.LastDllError
+
+    If convertedBytes = 0 Then
+        WsRaiseEncodeError lastError
+    ElseIf convertedBytes <> requiredBytes Then
+        Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                  "WideCharToMultiByte returned an unexpected byte count."
+    End If
+
+    WsEncodeUtf8 = result
 End Function
 
 Private Function WsDecodeUtf8Chunks(ByVal chunks As Collection, _
@@ -3267,28 +3406,157 @@ Private Function WsDecodeUtf8Chunks(ByVal chunks As Collection, _
         Exit Function
     End If
 
-    Dim stream As ADODB.stream
-    Set stream = New ADODB.stream
+    Dim utf8Bytes() As Byte
+    utf8Bytes = WsFlattenByteChunks(chunks, totalBytes)
+    WsDecodeUtf8Chunks = WsDecodeUtf8Bytes(utf8Bytes, totalBytes)
+End Function
 
-    stream.Type = adTypeBinary
-    stream.Open
+Private Function WsDecodeUtf8Bytes(ByRef utf8Bytes() As Byte, _
+                                  ByVal byteCount As Long) As String
+    If byteCount <= 0 Then
+        WsDecodeUtf8Bytes = vbNullString
+        Exit Function
+    End If
 
-    Dim i As Long
+    If WsByteArrayLength(utf8Bytes) <> byteCount Then
+        Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                  "UTF-8 byte count does not match the supplied buffer length."
+    End If
+
+    Dim requiredWideChars As Long
+    Dim lastError As Long
+
+    requiredWideChars = WsApi_MultiByteToWideChar( _
+        WS_CP_UTF8, WS_MB_ERR_INVALID_CHARS, _
+        utf8Bytes(LBound(utf8Bytes)), byteCount, 0, 0)
+    lastError = Err.LastDllError
+
+    If requiredWideChars = 0 Then WsRaiseDecodeError lastError
+
+    Dim result As String
+    result = String$(requiredWideChars, vbNullChar)
+
+    Dim convertedWideChars As Long
+    convertedWideChars = WsApi_MultiByteToWideChar( _
+        WS_CP_UTF8, WS_MB_ERR_INVALID_CHARS, _
+        utf8Bytes(LBound(utf8Bytes)), byteCount, _
+        StrPtr(result), requiredWideChars)
+    lastError = Err.LastDllError
+
+    If convertedWideChars = 0 Then
+        WsRaiseDecodeError lastError
+    ElseIf convertedWideChars <> requiredWideChars Then
+        Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                  "MultiByteToWideChar returned an unexpected character count."
+    End If
+
+    WsDecodeUtf8Bytes = result
+End Function
+
+Private Function WsFlattenByteChunks(ByVal chunks As Collection, _
+                                    ByVal totalBytes As Long) As Byte()
+    Dim result() As Byte
+
+    If totalBytes <= 0 Then
+        WsFlattenByteChunks = result
+        Exit Function
+    End If
+
+    If chunks Is Nothing Then
+        Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                  "UTF-8 chunk collection is unavailable."
+    End If
+
+    ' Most completed WebSocket messages arrive as one chunk. Avoid a second byte-wise
+    ' copy in that dominant case while preserving lower bounds and strict length checks.
+    If chunks.count = 1 Then
+        Dim onlyChunk As Variant
+        Dim onlyBytes() As Byte
+        onlyChunk = chunks(1)
+
+        If VarType(onlyChunk) <> (vbArray Or vbByte) Then
+            Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                      "UTF-8 chunk 1 is not a Byte array."
+        End If
+
+        If WsVariantByteArrayLength(onlyChunk) <> totalBytes Then
+            Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                      "Single UTF-8 chunk length does not match the declared message length."
+        End If
+
+        onlyBytes = onlyChunk
+        WsFlattenByteChunks = onlyBytes
+        Exit Function
+    End If
+
+    ReDim result(0 To totalBytes - 1)
+
+    Dim destinationIndex As Long
+    Dim chunkIndex As Long
+    Dim sourceIndex As Long
     Dim chunkValue As Variant
+    Dim chunkLength As Long
 
-    For i = 1 To chunks.count
-        chunkValue = chunks(i)
-        stream.Write chunkValue
+    For chunkIndex = 1 To chunks.count
+        chunkValue = chunks(chunkIndex)
+
+        If VarType(chunkValue) <> (vbArray Or vbByte) Then
+            Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                      "UTF-8 chunk " & chunkIndex & " is not a Byte array."
+        End If
+
+        chunkLength = WsVariantByteArrayLength(chunkValue)
+
+        If destinationIndex + chunkLength > totalBytes Then
+            Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                      "UTF-8 chunks exceed the declared message length."
+        End If
+
+        If chunkLength > 0 Then
+            For sourceIndex = LBound(chunkValue) To UBound(chunkValue)
+                result(destinationIndex) = CByte(chunkValue(sourceIndex))
+                destinationIndex = destinationIndex + 1
+            Next
+        End If
     Next
 
-    stream.position = 0
-    stream.Type = adTypeText
-    stream.Charset = "utf-8"
-    WsDecodeUtf8Chunks = stream.ReadText
+    If destinationIndex <> totalBytes Then
+        Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+                  "UTF-8 chunk length mismatch. Expected " & totalBytes & _
+                  " bytes but copied " & destinationIndex & "."
+    End If
 
-    stream.Close
-    Set stream = Nothing
+    WsFlattenByteChunks = result
 End Function
+
+Private Function WsVariantByteArrayLength(ByRef value As Variant) As Long
+    On Error GoTo EmptyArray
+    WsVariantByteArrayLength = UBound(value) - LBound(value) + 1
+    Exit Function
+
+EmptyArray:
+    WsVariantByteArrayLength = 0
+End Function
+
+Private Sub WsRaiseEncodeError(ByVal windowsError As Long)
+    If windowsError = WS_ERROR_NO_UNICODE_TRANSLATION Then
+        Err.Raise WS_ERR_INVALID_UTF16, "BiDiSocketCommunicator.UTF8", _
+                  "Outgoing text contains an invalid UTF-16 surrogate sequence."
+    End If
+
+    Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+              "WideCharToMultiByte failed. Windows error: " & windowsError
+End Sub
+
+Private Sub WsRaiseDecodeError(ByVal windowsError As Long)
+    If windowsError = WS_ERROR_NO_UNICODE_TRANSLATION Then
+        Err.Raise WS_ERR_INVALID_UTF8, "BiDiSocketCommunicator.UTF8", _
+                  "Peer text message contains malformed UTF-8."
+    End If
+
+    Err.Raise WS_ERR_UTF8_CODEC, "BiDiSocketCommunicator.UTF8", _
+              "MultiByteToWideChar failed. Windows error: " & windowsError
+End Sub
 
 Private Function WsByteArrayLength(ByRef Bytes() As Byte) As Long
     On Error GoTo EmptyArray
