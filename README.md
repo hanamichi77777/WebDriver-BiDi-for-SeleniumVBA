@@ -41,7 +41,6 @@ The validation code is contained in the `Main07` procedure.
 
 WebDriver BiDi for SeleniumVBA v3.2 was scanned by VirusTotal on July 26, 2026, and received 0 detections from 64 security vendors at the time of testing.
 
-
 ---
 ## [Supported OS]
 * **Windows11**
