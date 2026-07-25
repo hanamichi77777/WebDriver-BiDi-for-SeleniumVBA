@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.1 / MIT License / Copyright (c) hanamichi77777
+' Version 3.2 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.

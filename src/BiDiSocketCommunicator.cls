@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.1 / MIT License / Copyright (c) hanamichi77777
+' Version 3.2 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
@@ -21,11 +21,14 @@ Option Explicit
 '   - One SendAndReceive call owns response correlation; do not pump Office messages.
 '   - m_isReading and m_isRecovering are released only by structured cleanup.
 '   - IDs [1..99] are system traffic; normal commands use [100..ID_MAX].
+'   - Event FIFO retention is bounded by both count and VBA string bytes.
+'   - At most one application-level session.status heartbeat is outstanding.
 '   - Recovery may heal the socket but never replay the same payload/request ID.
 '   - Every native Pump is non-blocking and bounded by time and work.
 '   - Strict UTF-8 validation belongs here; invalid peer text closes with status 1007.
 '   - Do not call Trace from a cleanup-critical error handler.
-Private Const DEBUG_MODE As Boolean = False
+' Outer communicator diagnostics: request/response summaries, state changes and Trace output.
+Private Const COMMUNICATOR_DEBUG_ENABLED As Boolean = False
 Private Declare PtrSafe Sub SleepWinAPI Lib "kernel32" Alias "Sleep" (ByVal milliseconds As Long)
 Private Declare PtrSafe Function QueryPerformanceCounter Lib "kernel32" (lpPerformanceCount As Currency) As Long
 Private Declare PtrSafe Function QueryPerformanceFrequency Lib "kernel32" (lpFrequency As Currency) As Long
@@ -41,6 +44,10 @@ Private Const SYSTEM_PING_ID_MAX As Long = 99    ' heartbeat rotating id band ce
 Private Const MAX_CONSECUTIVE_SOFT_TIMEOUTS As Long = 2 ' soft timeouts on one connection before StateError
 Private Const DEFAULT_TIMEOUT_MS As Long = 30000
 Private Const DEFAULT_POLLING_INTERVAL_MS As Long = 100
+Private Const EVENT_BUFFER_MAX_COUNT As Long = 2000
+Private Const EVENT_BUFFER_MAX_BYTES As Long = 33554432 ' 32 MiB of VBA string storage measured by LenB
+Private Const APPLICATION_HEARTBEAT_INTERVAL_MS As Long = 1000
+Private Const APPLICATION_HEARTBEAT_TIMEOUT_MS As Long = 5000
 
 Private m_wsTransportInitialized As Boolean
 ' Only symbolic localhost may fall back from [::1] to 127.0.0.1.
@@ -77,11 +84,13 @@ Private m_state As BiDiSocketState
 Public Event StateChanged(ByVal NewState As BiDiSocketState, ByVal StateName As String)
 
 Private m_EventBuffer As Collection
+Private m_EventBufferBytes As Long
 
 Private m_DefaultTimeout As Long
 Private m_PollingInterval As Long
 Private m_DroppedEventsCount As Long
 Private m_lastPollTime As Double
+Private m_lastApplicationHeartbeatAt As Double
 Private m_RegExp As RegExp
 Private m_AllowUiPump As Boolean
 Private m_qpcFreq As Currency ' QueryPerformanceFrequency cache (set in Class_Initialize)
@@ -89,6 +98,8 @@ Private m_lastPumpTicks As Currency ' Throttle state for PumpMessages
 
 Private m_nextRequestId As Long
 Private m_nextSystemPingId As Long ' heartbeat id rotation cursor [3..99]
+Private m_applicationHeartbeatOutstanding As Boolean
+Private m_applicationHeartbeatId As Long
 Private m_consecutiveSoftTimeouts As Long ' consecutive soft timeouts on the current connection
 
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging (mirrors Wrapper constant)
@@ -99,7 +110,8 @@ Private m_maxIncomingSize As Long ' Receive-side cap; oversized messages are dis
 ' framing, masking and WebSocket ping/pong. Each Pump is work-bounded; BiDi IDs,
 ' heartbeats, recovery and the event FIFO remain in the outer communicator layer.
 
-Private Const WS_DEBUG_MODE As Boolean = True
+' Lowest-level integrated WinSock transport diagnostics only (OPEN/FAILED).
+Private Const WINSOCK_TRANSPORT_DEBUG_ENABLED As Boolean = False
 
 Private Declare PtrSafe Function WsApi_WSAStartup Lib "ws2_32.dll" Alias "WSAStartup" (ByVal wVersionRequired As Integer, ByRef lpWSAData As WsWSADATA) As Long
 Private Declare PtrSafe Function WsApi_WSACleanup Lib "ws2_32.dll" Alias "WSACleanup" () As Long
@@ -336,7 +348,7 @@ Private Sub Class_Initialize()
     m_AllowUiPump = True
     m_maxIncomingSize = DEFAULT_MAX_INCOMING_SIZE
 
-    Set m_EventBuffer = New Collection
+    ResetEventBuffer
 
     Set m_RegExp = New RegExp
     m_RegExp.Global = False
@@ -347,6 +359,7 @@ Private Sub Class_Initialize()
 
     m_nextRequestId = CMD_ID_FLOOR - 1
     m_nextSystemPingId = SYSTEM_PING_ID_MIN - 1
+    ResetApplicationHeartbeatState
 
     SetState StateDisconnected
 End Sub
@@ -365,6 +378,8 @@ Private Sub Class_Terminate()
     End If
     Set m_RegExp = Nothing
     Set m_EventBuffer = Nothing
+    m_EventBufferBytes = 0
+    ResetApplicationHeartbeatState
     On Error GoTo 0
 End Sub
 
@@ -438,15 +453,19 @@ Private Sub SetState(ByVal NewState As BiDiSocketState)
         Case StateError:         StateName = "ERROR"
     End Select
     
-    If DEBUG_MODE Then Debug.Print "BiDi State Changed: " & StateName
+    If COMMUNICATOR_DEBUG_ENABLED Then Debug.Print "BiDi State Changed: " & StateName
     RaiseEvent StateChanged(m_state, StateName)
 End Sub
 
 Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boolean
     If m_state = StateConnecting Or m_state = StateConnected Then
-        If DEBUG_MODE Then Debug.Print "BiDi: Connect aborted. Current state is " & m_state
+        If COMMUNICATOR_DEBUG_ENABLED Then Debug.Print "BiDi: Connect aborted. Current state is " & m_state
         Exit Function
     End If
+
+    ' A direct Connect starts a fresh diagnostic session. Recovery reconnects keep
+    ' the original transport failure and retry history in the same trace file.
+    If Not m_isRecovering Then ResetSocketTraceLog
 
     ' Reject anything except loopback ws:// before entering the RFC 6455 parser.
     m_RegExp.pattern = "^ws://(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:/|$)"
@@ -636,6 +655,8 @@ End Function
 Private Sub FinalizeConnectedState()
     m_DroppedEventsCount = 0
     m_lastPollTime = 0
+    m_nextSystemPingId = SYSTEM_PING_ID_MIN - 1
+    ResetApplicationHeartbeatState
     m_RetryCount = 0
     m_consecutiveSoftTimeouts = 0
     SetState StateConnected
@@ -728,8 +749,8 @@ Public Function GetNextRequestId() As Long
     GetNextRequestId = m_nextRequestId
 End Function
 
-' Heartbeat IDs rotate inside [3..99], separate from normal command IDs; replies
-' must return before a complete band rotation to keep outstanding IDs unique.
+' Heartbeat IDs rotate inside [3..99], separate from normal command IDs. Only one
+' application heartbeat is tracked; a timed-out ID is retired before allocating the next.
 Private Function GetNextSystemPingId() As Long
     m_nextSystemPingId = m_nextSystemPingId + 1
     If m_nextSystemPingId > SYSTEM_PING_ID_MAX Then m_nextSystemPingId = SYSTEM_PING_ID_MIN
@@ -744,6 +765,73 @@ Private Function IsReservedSystemId(ByVal idStr As String) As Boolean
     Dim v As Double: v = val(idStr)
     IsReservedSystemId = (v >= 1 And v < CMD_ID_FLOOR)
 End Function
+
+Private Sub ResetEventBuffer()
+    Set m_EventBuffer = New Collection
+    m_EventBufferBytes = 0
+End Sub
+
+Private Sub DropOldestBufferedEvent()
+    If m_EventBuffer Is Nothing Then Exit Sub
+    If m_EventBuffer.count = 0 Then Exit Sub
+
+    Dim dropped As String
+    dropped = CStr(m_EventBuffer(1))
+    m_EventBuffer.Remove 1
+
+    m_EventBufferBytes = m_EventBufferBytes - LenB(dropped)
+    If m_EventBufferBytes < 0 Then m_EventBufferBytes = 0
+
+    m_DroppedEventsCount = m_DroppedEventsCount + 1
+End Sub
+
+' Preserve FIFO order while bounding both retained event count and VBA string bytes.
+' A single event larger than the entire byte budget is dropped without evicting the queue.
+Private Sub EnqueueEventBounded(ByVal msg As String)
+    Dim msgBytes As Long
+    msgBytes = LenB(msg)
+
+    If msgBytes > EVENT_BUFFER_MAX_BYTES Then
+        m_DroppedEventsCount = m_DroppedEventsCount + 1
+        Exit Sub
+    End If
+
+    If m_EventBuffer Is Nothing Then ResetEventBuffer
+
+    Do While m_EventBuffer.count >= EVENT_BUFFER_MAX_COUNT Or _
+             m_EventBufferBytes > (EVENT_BUFFER_MAX_BYTES - msgBytes)
+        If m_EventBuffer.count = 0 Then
+            m_EventBufferBytes = 0
+            Exit Do
+        End If
+        DropOldestBufferedEvent
+    Loop
+
+    m_EventBuffer.Add msg
+    m_EventBufferBytes = m_EventBufferBytes + msgBytes
+End Sub
+
+Private Function TryDequeueBufferedEvent(ByRef msg As String) As Boolean
+    If m_EventBuffer Is Nothing Then Exit Function
+    If m_EventBuffer.count = 0 Then
+        m_EventBufferBytes = 0
+        Exit Function
+    End If
+
+    msg = CStr(m_EventBuffer(1))
+    m_EventBuffer.Remove 1
+
+    m_EventBufferBytes = m_EventBufferBytes - LenB(msg)
+    If m_EventBufferBytes < 0 Then m_EventBufferBytes = 0
+
+    TryDequeueBufferedEvent = True
+End Function
+
+Private Sub ResetApplicationHeartbeatState()
+    m_applicationHeartbeatOutstanding = False
+    m_applicationHeartbeatId = 0
+    m_lastApplicationHeartbeatAt = 0
+End Sub
 
 Public Function SendCommand(ByVal method As String, _
                             ByRef params As Object, _
@@ -767,7 +855,7 @@ Public Function SendCommand(ByVal method As String, _
                   "Reduce the input data size or split the operation."
     End If
     
-    If DEBUG_MODE And Not Silent Then
+    If COMMUNICATOR_DEBUG_ENABLED And Not Silent Then
         Dim displayMsg As String: displayMsg = sendMsg
         If Len(displayMsg) > 500 Then displayMsg = Left$(displayMsg, 497) & "..."
         LogEvent method & " (ID: " & requestId & ")", displayMsg, "[REQ]"
@@ -776,7 +864,7 @@ Public Function SendCommand(ByVal method As String, _
     Dim strRes As String
     strRes = SendAndReceive(sendMsg)
     
-    If DEBUG_MODE And Not Silent Then
+    If COMMUNICATOR_DEBUG_ENABLED And Not Silent Then
         Dim displayRes As String: displayRes = strRes
         If Len(displayRes) > 500 Then displayRes = Left$(displayRes, 497) & "..."
         LogEvent method & " (ID: " & requestId & ")", displayRes, "[RES]"
@@ -796,7 +884,7 @@ Public Sub Disconnect(Optional ByVal keepErrorState As Boolean = False)
     
     Call InternalCleanup
     
-    Set m_EventBuffer = New Collection
+    ResetEventBuffer
     
     If Not keepErrorState Then
         SetState StateDisconnected
@@ -826,6 +914,7 @@ Private Sub InternalCleanup()
         WsForceClose
     End If
 
+    ResetApplicationHeartbeatState
     m_isRecovering = False
 
     On Error GoTo 0
@@ -874,9 +963,8 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     Dim softDeadline As Double: softDeadline = nowMs() + TIMEOUT
     Dim hardDeadline As Double: hardDeadline = nowMs() + (TIMEOUT * 2)
     
-    ' The command-time event FIFO is count-bounded; individual messages remain bounded
-    ' by MaxIncomingSize. Oldest asynchronous events are dropped first.
-    Const MAX_EVENT_BUFFER_SIZE As Long = 20000
+    ' The command-time event FIFO is bounded by both count and retained VBA string bytes.
+    ' Oldest asynchronous events are dropped first while preserving response correlation.
     
     Do
         If m_state <> StateConnected Then
@@ -895,12 +983,9 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
                 ' Queue id-less/asynchronous events, but consume reserved PostScript/heartbeat
                 ' replies internally rather than exposing them through GetMessage.
                 If Not IsReservedSystemId(inId) Then
-                    m_EventBuffer.Add msg
-                    
-                    If m_EventBuffer.count > MAX_EVENT_BUFFER_SIZE Then
-                        m_EventBuffer.Remove 1
-                        m_DroppedEventsCount = m_DroppedEventsCount + 1
-                    End If
+                    EnqueueEventBounded msg
+                Else
+                    ProcessReservedSystemResponse inId, msg, False
                 End If
             End If
         End If
@@ -1018,6 +1103,13 @@ End Sub
 Private Sub ProcessReservedSystemResponse(ByVal inId As String, _
                                           ByVal rawMsg As String, _
                                           ByVal isPostHeartbeat As Boolean)
+    If m_applicationHeartbeatOutstanding Then
+        If inId = CStr(m_applicationHeartbeatId) Then
+            m_applicationHeartbeatOutstanding = False
+            m_applicationHeartbeatId = 0
+        End If
+    End If
+
     If inId <> CStr(POST_SCRIPT_REPLY_ID) Then
         If m_RetryCount > 0 Then m_RetryCount = 0
     End If
@@ -1064,11 +1156,15 @@ DrainCompleted:
            WINSOCK_PUMP_MAX_CALLS
 
     If Wsstate = WsTransportFailed Then
+        Trace ">>> [Socket] Winsock transport failed during event polling. " & _
+              GetWinsockFailureText(), True
         SetState StateError
         GoTo FinalCleanup
     End If
 
     If Not WsIsOpen Then
+        Trace ">>> [Socket] Winsock transport is no longer open during event polling. " & _
+              GetWinsockFailureText(), True
         SetState StateError
         GoTo FinalCleanup
     End If
@@ -1091,9 +1187,9 @@ End Function
 Public Function GetMessage() As String
     If m_isSendReceiving Then Exit Function
 
-    If m_EventBuffer.count > 0 Then
-        GetMessage = m_EventBuffer(1)
-        m_EventBuffer.Remove 1
+    Dim bufferedEvent As String
+    If TryDequeueBufferedEvent(bufferedEvent) Then
+        GetMessage = bufferedEvent
         Exit Function
     End If
 
@@ -1125,12 +1221,30 @@ Public Function GetMessage() As String
 
     If m_state <> StateConnected Then Exit Function
 
+    ' Poll incoming traffic at PollingInterval, but pace the application heartbeat
+    ' independently so receive latency is not coupled to session.status frequency.
+    nowT = nowMs()
+    If m_applicationHeartbeatOutstanding Then
+        If (nowT - m_lastApplicationHeartbeatAt) < APPLICATION_HEARTBEAT_TIMEOUT_MS Then Exit Function
+
+        Trace ">>> [Heartbeat] session.status reply timeout. Retiring ID=" & _
+              m_applicationHeartbeatId & " without changing socket state.", True
+        m_applicationHeartbeatOutstanding = False
+        m_applicationHeartbeatId = 0
+    End If
+
+    If (nowT - m_lastApplicationHeartbeatAt) < APPLICATION_HEARTBEAT_INTERVAL_MS Then Exit Function
+
     Dim pingId As Long
     pingId = GetNextSystemPingId()
 
     Dim pingCmd As String
     pingCmd = "{""id"":" & pingId & ", ""method"":""session.status"", ""params"":{}}"
     If Not SendMessage(pingCmd) Then Exit Function
+
+    m_applicationHeartbeatOutstanding = True
+    m_applicationHeartbeatId = pingId
+    m_lastApplicationHeartbeatAt = nowMs()
 
     Dim rawMsg As String
     rawMsg = ReadFromWire(nowMs() + 10)
@@ -1197,11 +1311,15 @@ Private Function ReadFromWinsock(Optional ByVal deadline As Double = 0) As Strin
         If WsTryDequeueText(rawMsg) Then Exit Do
 
         If Wsstate = WsTransportFailed Then
+            Trace ">>> [Socket] Winsock transport failed while awaiting a response. " & _
+                  GetWinsockFailureText(), True
             SetState StateError
             Exit Do
         End If
 
         If Not WsIsOpen Then
+            Trace ">>> [Socket] Winsock transport is no longer open while awaiting a response. " & _
+                  GetWinsockFailureText(), True
             SetState StateError
             Exit Do
         End If
@@ -1396,18 +1514,19 @@ Public Sub YieldExecution(Optional ByVal ms As Long = 1, Optional ByVal allowDoE
     End If
 End Sub
 
-' DEBUG_MODE controls Immediate output and keyword-based file detection. In production,
-' file logging is driven only by the caller's explicit isCritical classification.
+' COMMUNICATOR_DEBUG_ENABLED controls outer-communicator Immediate output and
+' keyword-based file detection. In production, file logging is driven only by
+' the caller's explicit isCritical classification.
 Public Sub Trace(ByVal msg As String, Optional ByVal isCritical As Boolean = False)
-    If Not DEBUG_MODE And Not isCritical Then Exit Sub
+    If Not COMMUNICATOR_DEBUG_ENABLED And Not isCritical Then Exit Sub
     
     Dim logMsg As String: logMsg = "[" & Format(Now, "hh:mm:ss") & "] " & msg
     
-    If DEBUG_MODE Then Debug.Print logMsg
+    If COMMUNICATOR_DEBUG_ENABLED Then Debug.Print logMsg
     
     Dim shouldLogToFile As Boolean
     shouldLogToFile = isCritical
-    If DEBUG_MODE Then
+    If COMMUNICATOR_DEBUG_ENABLED Then
         shouldLogToFile = shouldLogToFile Or _
                           (InStr(1, msg, "Return Code", vbTextCompare) > 0) Or _
                           (InStr(1, msg, "failed", vbTextCompare) > 0) Or _
@@ -1488,6 +1607,22 @@ Private Function ResolveLogDirectory() As String
 
     ResolveLogDirectory = localDir
 End Function
+
+Private Sub ResetSocketTraceLog()
+    Dim localDir As String
+    Dim logPath As String
+    Dim fNum As Integer
+
+    On Error Resume Next
+    localDir = ResolveLogDirectory()
+    logPath = localDir & "bidi_socket_trace.log"
+    fNum = FreeFile
+
+    Err.Clear
+    Open logPath For Output As #fNum
+    If Err.Number = 0 Then Close #fNum
+    On Error GoTo 0
+End Sub
 
 Private Sub WriteLogToFile(ByVal msg As String)
     Dim localDir As String
@@ -1610,7 +1745,8 @@ Public Sub ForceClose()
         WsForceClose
     End If
 
-    Set m_EventBuffer = New Collection
+    ResetEventBuffer
+    ResetApplicationHeartbeatState
     SetState StateDisconnected
     On Error GoTo 0
 End Sub
@@ -2175,7 +2311,7 @@ Private Sub WsTryCompleteHandshake(ByVal pumpDeadline As Double, _
     m_ws_frameState = WsFrameReadBaseHeader
     m_ws_nextClientPingAtMs = WsMonotonicMs() + WS_CLIENT_PING_INTERVAL_MS
 
-    If WS_DEBUG_MODE Then Debug.Print "BiDiSocketCommunicator[IntegratedWinsock]: OPEN"
+    If WINSOCK_TRANSPORT_DEBUG_ENABLED Then Debug.Print "BiDiSocketCommunicator[IntegratedWinsock]: OPEN"
 
     WsParseAvailableFrames pumpDeadline, copyGuardDeadline
 End Sub
@@ -3262,7 +3398,7 @@ Private Sub WsSetFailure(ByVal errorCode As Long, ByVal description As String)
 
     m_ws_state = WsTransportFailed
 
-    If WS_DEBUG_MODE Then
+    If WINSOCK_TRANSPORT_DEBUG_ENABLED Then
         Debug.Print "BiDiSocketCommunicator[IntegratedWinsock] FAILED " & errorCode & ": " & description
     End If
 End Sub
