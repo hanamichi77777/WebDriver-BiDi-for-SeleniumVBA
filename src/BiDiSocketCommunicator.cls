@@ -104,7 +104,7 @@ Private m_consecutiveSoftTimeouts As Long ' consecutive soft timeouts on the cur
 
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging (mirrors Wrapper constant)
 Private Const DEFAULT_MAX_INCOMING_SIZE As Long = 2097152 ' 2MB: receive-side assembly cap (runtime-tunable via MaxIncomingSize)
-Private m_maxIncomingSize As Long ' Receive-side cap; oversized messages are discarded with identity diagnostics
+Private m_maxIncomingSize As Long ' Receive-side cap; oversized messages are drained with bounded identity diagnostics
 
 ' Ws*/WS_*/m_ws_* members form the RFC 6455 engine: socket, handshake,
 ' framing, masking and WebSocket ping/pong. Each Pump is work-bounded; BiDi IDs,
@@ -219,6 +219,7 @@ Private Const WS_OPCODE_PONG As Long = 10
 Private Const WS_DEFAULT_CONNECT_TIMEOUT_MS As Long = 2000
 Private Const WS_DEFAULT_HANDSHAKE_TIMEOUT_MS As Long = 5000
 Private Const WS_DEFAULT_MAX_INCOMING_SIZE As Long = 2097152
+Private Const OVERSIZED_DIAGNOSTIC_PREFIX_BYTES As Long = 512
 Private Const WS_DEFAULT_MAX_PUMP_MS As Long = 10
 Private Const WS_DEFAULT_MAX_PUMP_BYTES As Long = 262144
 Private Const WS_DEFAULT_MAX_PUMP_CALLS As Long = 16
@@ -326,6 +327,10 @@ Private m_ws_messageOpcode As Long
 Private m_ws_messageChunks As Collection
 Private m_ws_messageCount As Long
 Private m_ws_discardMessage As Boolean
+Private m_ws_messageObservedBytes As Double
+Private m_ws_messageOversized As Boolean
+Private m_ws_messageDiagnosticPrefix() As Byte
+Private m_ws_messageDiagnosticPrefixCount As Long
 
 Private m_ws_closeSent As Boolean
 
@@ -347,6 +352,7 @@ Private Sub Class_Initialize()
     m_PollingInterval = DEFAULT_POLLING_INTERVAL_MS
     m_AllowUiPump = True
     m_maxIncomingSize = DEFAULT_MAX_INCOMING_SIZE
+    ReDim m_ws_messageDiagnosticPrefix(0 To OVERSIZED_DIAGNOSTIC_PREFIX_BYTES - 1)
 
     ResetEventBuffer
 
@@ -2887,6 +2893,7 @@ Private Sub WsPrepareFramePayload(ByVal payloadLength As Long)
         m_ws_messageOpcode = m_ws_frameOpcode
         m_ws_messageCount = 0
         m_ws_discardMessage = (m_ws_frameOpcode = WS_OPCODE_BINARY)
+        WsBeginMessageDiagnostics
 
         If m_ws_discardMessage Then
             Set m_ws_messageChunks = Nothing
@@ -2903,12 +2910,14 @@ Private Sub WsPrepareFramePayload(ByVal payloadLength As Long)
 
     If m_ws_frameOpcode <= WS_OPCODE_BINARY Then
         If payloadLength > m_ws_maxIncomingSize Then
+            m_ws_messageOversized = True
             m_ws_discardMessage = True
             m_ws_frameDiscardPayload = True
             Set m_ws_messageChunks = Nothing
 
         ElseIf Not m_ws_discardMessage Then
             If CDbl(m_ws_messageCount) + CDbl(payloadLength) > CDbl(m_ws_maxIncomingSize) Then
+                m_ws_messageOversized = True
                 m_ws_discardMessage = True
                 m_ws_frameDiscardPayload = True
                 Set m_ws_messageChunks = Nothing
@@ -2931,24 +2940,29 @@ Private Sub WsConsumeFramePayload(ByVal count As Long)
         Next
         m_ws_controlCount = m_ws_controlCount + count
 
-    ElseIf Not m_ws_discardMessage And Not m_ws_frameDiscardPayload Then
-        If m_ws_messageChunks Is Nothing Then
-            WsSetFailure 9219, "Text message chunk accumulator is unavailable."
-            Exit Sub
+    Else
+        m_ws_messageObservedBytes = m_ws_messageObservedBytes + CDbl(count)
+        WsCaptureMessageDiagnosticPrefix count
+
+        If Not m_ws_discardMessage And Not m_ws_frameDiscardPayload Then
+            If m_ws_messageChunks Is Nothing Then
+                WsSetFailure 9219, "Text message chunk accumulator is unavailable."
+                Exit Sub
+            End If
+
+            Dim dataChunk() As Byte
+            ReDim dataChunk(0 To count - 1)
+
+            Dim j As Long
+            For j = 0 To count - 1
+                dataChunk(j) = CByte(WsPeekRawByte(j))
+            Next
+
+            Dim chunkValue As Variant
+            chunkValue = dataChunk
+            m_ws_messageChunks.Add chunkValue
+            m_ws_messageCount = m_ws_messageCount + count
         End If
-
-        Dim dataChunk() As Byte
-        ReDim dataChunk(0 To count - 1)
-
-        Dim j As Long
-        For j = 0 To count - 1
-            dataChunk(j) = CByte(WsPeekRawByte(j))
-        Next
-
-        Dim chunkValue As Variant
-        chunkValue = dataChunk
-        m_ws_messageChunks.Add chunkValue
-        m_ws_messageCount = m_ws_messageCount + count
     End If
 
     WsConsumeRaw count
@@ -2994,6 +3008,8 @@ Private Sub WsCompleteCurrentFrame()
                 m_ws_rawTextQueue.Add Item:=m_ws_messageChunks
                 m_ws_rawTextLengthQueue.Add m_ws_messageCount
             End If
+
+            If m_ws_messageOversized Then WsTraceOversizedMessageDiagnostic
 
             m_ws_currentPumpCompletedMessages = m_ws_currentPumpCompletedMessages + 1
             WsResetMessageAccumulator
@@ -3340,11 +3356,83 @@ Private Sub WsEnsureControlCapacity(ByVal requiredCount As Long)
     End If
 End Sub
 
+Private Sub WsBeginMessageDiagnostics()
+    m_ws_messageObservedBytes = 0
+    m_ws_messageOversized = False
+    m_ws_messageDiagnosticPrefixCount = 0
+End Sub
+
+Private Sub WsCaptureMessageDiagnosticPrefix(ByVal count As Long)
+    If count <= 0 Then Exit Sub
+
+    Dim available As Long
+    available = OVERSIZED_DIAGNOSTIC_PREFIX_BYTES - m_ws_messageDiagnosticPrefixCount
+    If available <= 0 Then Exit Sub
+    If count < available Then available = count
+
+    Dim i As Long
+    For i = 0 To available - 1
+        m_ws_messageDiagnosticPrefix(m_ws_messageDiagnosticPrefixCount + i) = _
+            CByte(WsPeekRawByte(i))
+    Next
+
+    m_ws_messageDiagnosticPrefixCount = m_ws_messageDiagnosticPrefixCount + available
+End Sub
+
+Private Function WsDiagnosticPrefixText() As String
+    Dim result As String
+    Dim i As Long
+    Dim b As Long
+
+    For i = 0 To m_ws_messageDiagnosticPrefixCount - 1
+        b = CLng(m_ws_messageDiagnosticPrefix(i))
+
+        Select Case b
+            Case 9
+                result = result & "\t"
+            Case 10
+                result = result & "\n"
+            Case 13
+                result = result & "\r"
+            Case 32 To 126
+                result = result & Chr$(b)
+            Case Else
+                result = result & "."
+        End Select
+    Next
+
+    WsDiagnosticPrefixText = result
+End Function
+
+Private Function WsDiagnosticFusionMarkerCount() As Long
+    Dim i As Long
+
+    For i = 0 To m_ws_messageDiagnosticPrefixCount - 2
+        If m_ws_messageDiagnosticPrefix(i) = 125 And _
+           m_ws_messageDiagnosticPrefix(i + 1) = 123 Then
+            WsDiagnosticFusionMarkerCount = WsDiagnosticFusionMarkerCount + 1
+        End If
+    Next
+End Function
+
+Private Sub WsTraceOversizedMessageDiagnostic()
+    Trace ">>> [Winsock] OVERSIZED MESSAGE DISCARDED. observedBytes=" & _
+          Format$(m_ws_messageObservedBytes, "0") & _
+          " limitBytes=" & CStr(m_ws_maxIncomingSize) & _
+          " retainedBytes=" & CStr(m_ws_messageDiagnosticPrefixCount) & _
+          " fusionMarkers(}{)=" & CStr(WsDiagnosticFusionMarkerCount()) & _
+          " HEAD" & CStr(m_ws_messageDiagnosticPrefixCount) & "=[" & _
+          WsDiagnosticPrefixText() & "]", True
+End Sub
+
 Private Sub WsResetMessageAccumulator()
     m_ws_messageActive = False
     m_ws_messageOpcode = 0
     m_ws_messageCount = 0
     m_ws_discardMessage = False
+    m_ws_messageObservedBytes = 0
+    m_ws_messageOversized = False
+    m_ws_messageDiagnosticPrefixCount = 0
     Set m_ws_messageChunks = Nothing
 End Sub
 
