@@ -921,8 +921,9 @@ Private Sub InternalCleanup()
     End If
 
     ResetApplicationHeartbeatState
-    m_isRecovering = False
 
+    ' Do not release m_isRecovering here. InternalCleanup is also called from Connect
+    ' inside AttemptRecovery; only AttemptRecovery.CleanExit owns that guard.
     On Error GoTo 0
 End Sub
 

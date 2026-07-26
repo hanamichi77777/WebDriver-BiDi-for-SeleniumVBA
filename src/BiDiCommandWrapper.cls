@@ -172,6 +172,10 @@ Public Sub ConnectTo(ByVal webSocketUrl As String)
             "The BiDi socket is already connected. Call Shutdown before reconnecting."
     End If
     
+    ' Connection plus mandatory session initialization is atomic. If subscribe or preload
+    ' setup fails, rollback leaves this wrapper reusable for a fresh ConnectTo call.
+    On Error GoTo InitializationFailed
+
     Me.ClearState
 
     ' AttemptAutoConnect returns False rather than raising. Check it here so connection
@@ -195,7 +199,22 @@ Public Sub ConnectTo(ByVal webSocketUrl As String)
     Me.ExecuteSessionSubscribe Array("log.entryAdded", "browsingContext.navigationStarted"), , True
     
     Me.ExecuteEnableGlobalShadowUnlocker
+    Exit Sub
 
+InitializationFailed:
+    Dim initErrNum As Long: initErrNum = Err.Number
+    Dim initErrDesc As String: initErrDesc = Err.description
+    Dim initErrSrc As String: initErrSrc = Err.source
+
+    ' Roll back both transport and wrapper caches. ForceClose is non-raising and keeps
+    ' the communicator object available so the caller may retry ConnectTo.
+    On Error Resume Next
+    socket_.ForceClose
+    Me.ClearState
+    On Error GoTo 0
+
+    If Len(initErrSrc) = 0 Then initErrSrc = "BiDiCommandWrapper:ConnectTo"
+    Err.Raise initErrNum, initErrSrc, initErrDesc
 End Sub
 
 Private Sub Class_Terminate()
@@ -1673,26 +1692,37 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
             End If
             
             m_isRecovering = True
-            
-            WaitHeartbeat 800 * (retryCount + 1)
-            
-            If m_debugMode Then
-                Debug.Print "BiDi [RECOVERY]: Attempting to refresh context (" & (retryCount + 1) & "/" & MAX_CONTEXT_RECOVERY_RETRIES & ")..."
-            End If
-            
+
+            ' Own the recovery guard across both the backoff wait and context refresh.
+            ' Any error is captured first; the guard is then released exactly once before
+            ' deciding whether the command loop may continue.
+            Dim recoveryErr As Long
+            Dim recoveryErrDesc As String
             On Error Resume Next
-            Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
-            Dim recoveryErr As Long: recoveryErr = Err.Number
+            WaitHeartbeat 800 * (retryCount + 1)
+            recoveryErr = Err.Number
+            recoveryErrDesc = Err.description
+            Err.Clear
+
+            If recoveryErr = 0 Then
+                If m_debugMode Then
+                    Debug.Print "BiDi [RECOVERY]: Attempting to refresh context (" & (retryCount + 1) & "/" & MAX_CONTEXT_RECOVERY_RETRIES & ")..."
+                End If
+
+                Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
+                recoveryErr = Err.Number
+                recoveryErrDesc = Err.description
+                Err.Clear
+            End If
             On Error GoTo 0
-            
+            m_isRecovering = False
+
             If recoveryErr = 0 Then
                 ' Retarget only when the caller explicitly permits main-context recovery.
                 If m_mainContextId <> "" And allowContextRetarget Then Call UpdateContextAndRealm(params, m_mainContextId)
-                m_isRecovering = False
                 retryCount = retryCount + 1
             Else
-                Debug.Print "BiDi [RECOVERY FAIL]: Failed to identify any valid browsing context."
-                m_isRecovering = False
+                Debug.Print "BiDi [RECOVERY FAIL]: " & recoveryErrDesc
                 Exit Do
             End If
         Else
@@ -3490,6 +3520,11 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
     If m_waitStackDepth = 1 Then
         m_lastTelemetryTick = 0
         
+        ' A new HUD instance invalidates the fingerprint and retry backoff from
+        ' the previous outer wait. The first telemetry update must reach the new DOM.
+        m_lastHudKey = ""
+        m_lastHudRetryTick = 0
+        
         On Error Resume Next
         Call Me.CallScript(GetHudJs("init"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), False, False, 2000, True)
         On Error GoTo 0
@@ -3531,7 +3566,9 @@ CleanExit:
     End If
 
     On Error Resume Next
-    If errNum = 0 Or m_waitStackDepth = 0 Then
+    ' Keep the HUD while an outer nested wait is still active. Errors already reset the
+    ' depth to zero above, so one condition covers both normal and exceptional exits.
+    If m_waitStackDepth = 0 Then
         Call Me.CallScript(GetHudJs("remove"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), False, False, 1000, True)
     End If
     
@@ -4081,6 +4118,10 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     
     If ForceClose Then
         socket_.ForceClose
+    Else
+        ' Graceful shutdown must explicitly end the transport even when another object
+        ' still holds a reference to the communicator.
+        socket_.Disconnect
     End If
     Set socket_ = Nothing
     
