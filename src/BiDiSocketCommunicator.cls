@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.2 / MIT License / Copyright (c) hanamichi77777
+' Version 3.3 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
@@ -18,9 +18,10 @@ Option Explicit
 '
 ' Preserve these invariants:
 '   - Accept only local unencrypted ws:// endpoints.
-'   - One SendAndReceive call owns response correlation; do not pump Office messages.
+'   - One SendAndReceive call owns response correlation; only guarded recovery backoff may pump Office messages.
 '   - m_isReading and m_isRecovering are released only by structured cleanup.
 '   - IDs [1..99] are system traffic; normal commands use [100..ID_MAX].
+'   - A nonmatching root response ID is dropped as a late/unknown reply, never queued as an event.
 '   - Event FIFO retention is bounded by both count and VBA string bytes.
 '   - At most one application-level session.status heartbeat is outstanding.
 '   - Recovery may heal the socket but never replay the same payload/request ID.
@@ -44,10 +45,13 @@ Private Const SYSTEM_PING_ID_MAX As Long = 99    ' heartbeat rotating id band ce
 Private Const MAX_CONSECUTIVE_SOFT_TIMEOUTS As Long = 2 ' soft timeouts on one connection before StateError
 Private Const DEFAULT_TIMEOUT_MS As Long = 30000
 Private Const DEFAULT_POLLING_INTERVAL_MS As Long = 100
+Private Const MIN_POLLING_INTERVAL_MS As Long = 10
+Private Const MAX_POLLING_INTERVAL_MS As Long = 5000 ' Must not exceed the application-heartbeat timeout
 Private Const EVENT_BUFFER_MAX_COUNT As Long = 2000
 Private Const EVENT_BUFFER_MAX_BYTES As Long = 33554432 ' 32 MiB of VBA string storage measured by LenB
 Private Const APPLICATION_HEARTBEAT_INTERVAL_MS As Long = 1000
 Private Const APPLICATION_HEARTBEAT_TIMEOUT_MS As Long = 5000
+Private Const MAX_PUBLIC_TIMEOUT_MS As Long = 600000
 
 Private m_wsTransportInitialized As Boolean
 ' Only symbolic localhost may fall back from [::1] to 127.0.0.1.
@@ -72,6 +76,9 @@ Private m_consecutiveInternalErrors As Long
 Private m_isReading As Boolean ' Non-yielding receive/Pump guard; structural release only
 Private m_isSendReceiving As Boolean ' True while one command owns response correlation
 Private m_isRecovering As Boolean ' Prevents nested connection recovery attempts
+Private m_recoveryConnectAuthorized As Boolean ' Allows only AttemptRecovery to enter public Connect
+Private m_recoveryCancelRequested As Boolean ' Lifecycle teardown cancels interactive recovery backoff
+Private m_isRaisingStateChanged As Boolean ' Suppresses lifecycle re-entry from event handlers
 
 Public Enum BiDiSocketState
     StateDisconnected = 0
@@ -80,6 +87,14 @@ Public Enum BiDiSocketState
     StateDisconnecting = 3
     StateError = 4
 End Enum
+
+Private Enum IncomingMessageClass
+    IncomingClass_Event = 0
+    IncomingClass_MatchingCommandResponse = 1
+    IncomingClass_ReservedSystemResponse = 2
+    IncomingClass_LateOrUnknownResponse = 3
+End Enum
+
 Private m_state As BiDiSocketState
 Public Event StateChanged(ByVal NewState As BiDiSocketState, ByVal StateName As String)
 
@@ -89,6 +104,7 @@ Private m_EventBufferBytes As Long
 Private m_DefaultTimeout As Long
 Private m_PollingInterval As Long
 Private m_DroppedEventsCount As Long
+Private m_DroppedLateResponsesCount As Long
 Private m_lastPollTime As Double
 Private m_lastApplicationHeartbeatAt As Double
 Private m_RegExp As RegExp
@@ -100,10 +116,12 @@ Private m_nextRequestId As Long
 Private m_nextSystemPingId As Long ' heartbeat id rotation cursor [3..99]
 Private m_applicationHeartbeatOutstanding As Boolean
 Private m_applicationHeartbeatId As Long
+Private m_consecutiveApplicationHeartbeatTimeouts As Long
 Private m_consecutiveSoftTimeouts As Long ' consecutive soft timeouts on the current connection
 
 Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging (mirrors Wrapper constant)
 Private Const DEFAULT_MAX_INCOMING_SIZE As Long = 2097152 ' 2MB: receive-side assembly cap (runtime-tunable via MaxIncomingSize)
+Private Const MAX_CONFIGURED_INCOMING_SIZE As Long = 33554432 ' 32 MiB hard ceiling for VBA memory safety
 Private m_maxIncomingSize As Long ' Receive-side cap; oversized messages are drained with bounded identity diagnostics
 
 ' Ws*/WS_*/m_ws_* members form the RFC 6455 engine: socket, handshake,
@@ -424,17 +442,25 @@ Public Property Get WinsockPrimaryFailureText() As String
     WinsockPrimaryFailureText = m_WinsockPrimaryFailureText
 End Property
 
-Public Property Let PollingInterval(ByVal v As Long): m_PollingInterval = v: End Property
+' Polling drives both event receive work and the application-heartbeat opportunity.
+' Clamp it away from a hot loop and below the heartbeat timeout.
+Public Property Let PollingInterval(ByVal v As Long)
+    If v < MIN_POLLING_INTERVAL_MS Then v = MIN_POLLING_INTERVAL_MS
+    If v > MAX_POLLING_INTERVAL_MS Then v = MAX_POLLING_INTERVAL_MS
+    m_PollingInterval = v
+End Property
+Public Property Get PollingInterval() As Long: PollingInterval = m_PollingInterval: End Property
 Public Property Let AllowUiPump(ByVal v As Boolean): m_AllowUiPump = v: End Property
 Public Property Get AllowUiPump() As Boolean: AllowUiPump = m_AllowUiPump: End Property
 Public Property Get state() As BiDiSocketState: state = m_state: End Property
 Public Property Let AutoReconnect(ByVal v As Boolean): m_AutoReconnect = v: End Property
 Public Property Get AutoReconnect() As Boolean: AutoReconnect = m_AutoReconnect: End Property
 Public Property Get ConsecutiveInternalErrors() As Long: ConsecutiveInternalErrors = m_consecutiveInternalErrors: End Property
-' MaxIncomingSize is a receive-assembly byte cap and is clamped to MAX_MSG_SIZE
-' so valid command responses are not rejected by configuration.
+' MaxIncomingSize is a receive-assembly byte cap. Keep the existing command-size floor,
+' and impose a hard upper ceiling so a public setting cannot disable memory protection.
 Public Property Let MaxIncomingSize(ByVal v As Long)
     If v < MAX_MSG_SIZE Then v = MAX_MSG_SIZE
+    If v > MAX_CONFIGURED_INCOMING_SIZE Then v = MAX_CONFIGURED_INCOMING_SIZE
     m_maxIncomingSize = v
 
     If m_wsTransportInitialized Then
@@ -444,12 +470,13 @@ Public Property Let MaxIncomingSize(ByVal v As Long)
 End Property
 Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_maxIncomingSize: End Property
 Public Property Get DroppedEventsCount() As Long: DroppedEventsCount = m_DroppedEventsCount: End Property
+Public Property Get DroppedLateResponsesCount() As Long: DroppedLateResponsesCount = m_DroppedLateResponsesCount: End Property
 
 Private Sub SetState(ByVal NewState As BiDiSocketState)
     If m_state = NewState Then Exit Sub
-    
+
     m_state = NewState
-    
+
     Dim StateName As String
     Select Case m_state
         Case StateDisconnected: StateName = "DISCONNECTED"
@@ -458,12 +485,37 @@ Private Sub SetState(ByVal NewState As BiDiSocketState)
         Case StateDisconnecting: StateName = "DISCONNECTING"
         Case StateError:         StateName = "ERROR"
     End Select
-    
+
     If COMMUNICATOR_DEBUG_ENABLED Then Debug.Print "BiDi State Changed: " & StateName
+
+    ' StateChanged is advisory. Subscriber errors must not interrupt cleanup, and transport
+    ' or command entry points are rejected until the synchronous notification returns.
+    If m_isRaisingStateChanged Then Exit Sub
+
+    m_isRaisingStateChanged = True
+    On Error Resume Next
+    Err.Clear
     RaiseEvent StateChanged(m_state, StateName)
+    If Err.Number <> 0 Then
+        Debug.Print "BiDi: StateChanged handler error ignored: " & Err.description
+        Err.Clear
+    End If
+    On Error GoTo 0
+    m_isRaisingStateChanged = False
 End Sub
 
 Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boolean
+    If m_isRaisingStateChanged Then
+        Trace ">>> [Lifecycle] Connect rejected during StateChanged notification. " & _
+              "Schedule the connection attempt after the event handler returns.", True
+        Exit Function
+    End If
+
+    If m_isRecovering And Not m_recoveryConnectAuthorized Then
+        Trace ">>> [Lifecycle] Connect rejected while recovery owns the connection lifecycle.", True
+        Exit Function
+    End If
+
     If m_state = StateConnecting Or m_state = StateConnected Then
         If COMMUNICATOR_DEBUG_ENABLED Then Debug.Print "BiDi: Connect aborted. Current state is " & m_state
         Exit Function
@@ -491,6 +543,14 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
 
     SetState StateConnecting
     InternalCleanup
+
+    ' An explicit new connection starts a new event/diagnostic session. Recovery reconnects
+    ' preserve both the FIFO and drop counters accumulated before the transport fault.
+    If Not m_isRecovering Then
+        ResetEventBuffer
+        m_DroppedEventsCount = 0
+        m_DroppedLateResponsesCount = 0
+    End If
 
     If LenB(wsUrl) = 0 Or localPort = 0 Then
         Err.Raise 512, "BiDiSocket", "Invalid WebSocket URL or port."
@@ -659,7 +719,6 @@ Private Function WinsockEndpointFamily(ByVal wsUrl As String) As String
 End Function
 
 Private Sub FinalizeConnectedState()
-    m_DroppedEventsCount = 0
     m_lastPollTime = 0
     m_nextSystemPingId = SYSTEM_PING_ID_MIN - 1
     ResetApplicationHeartbeatState
@@ -712,6 +771,7 @@ End Function
 ' allowRecovery=False is PostScript's best-effort send-only path. Recovery may
 ' repair a failed socket, but SendMessage returns False and never replays the payload.
 Public Function SendMessage(ByVal msg As String, Optional ByVal allowRecovery As Boolean = True) As Boolean
+    If m_isRaisingStateChanged Or m_isRecovering Then Exit Function
     If LenB(msg) = 0 Then Exit Function
 
     Trace ">>> [Socket] Attempting to send message..."
@@ -771,6 +831,63 @@ Private Function IsReservedSystemId(ByVal idStr As String) As Boolean
     Dim v As Double: v = val(idStr)
     IsReservedSystemId = (v >= 1 And v < CMD_ID_FLOOR)
 End Function
+
+
+' SendAndReceive is a normal-command API. Requiring its own root ID prevents an id-less
+' event from being mistaken for the response and keeps the reserved system band private.
+Private Function IsNormalCommandId(ByVal idStr As String) As Boolean
+    On Error GoTo InvalidId
+
+    If Len(idStr) = 0 Then Exit Function
+    If Not IsNumeric(idStr) Then Exit Function
+
+    Dim v As Double
+    v = CDbl(idStr)
+    IsNormalCommandId = (v >= CMD_ID_FLOOR And v <= ID_MAX And v = Fix(v))
+    Exit Function
+
+InvalidId:
+    IsNormalCommandId = False
+End Function
+
+' All receive sites use the same root-ID classification. expectedCommandId is supplied
+' only while SendAndReceive owns a command; outside correlation, every normal-band root ID
+' is necessarily a late or otherwise unknown response.
+Private Function ClassifyIncomingMessage(ByVal inId As String, _
+                                         Optional ByVal expectedCommandId As String = "") As IncomingMessageClass
+    If Len(expectedCommandId) > 0 And inId = expectedCommandId Then
+        ClassifyIncomingMessage = IncomingClass_MatchingCommandResponse
+    ElseIf IsReservedSystemId(inId) Then
+        ClassifyIncomingMessage = IncomingClass_ReservedSystemResponse
+    ElseIf Len(inId) > 0 Then
+        ClassifyIncomingMessage = IncomingClass_LateOrUnknownResponse
+    Else
+        ClassifyIncomingMessage = IncomingClass_Event
+    End If
+End Function
+
+' Root IDs other than the currently owned command or reserved system IDs are stale or
+' unknown replies. They are counted separately and never consume asynchronous FIFO space.
+Private Sub DropLateOrUnknownResponse(ByVal idStr As String)
+    ' Any root response proves peer progress even when its command owner already timed out.
+    m_consecutiveApplicationHeartbeatTimeouts = 0
+
+    If m_DroppedLateResponsesCount < 2147483647 Then
+        m_DroppedLateResponsesCount = m_DroppedLateResponsesCount + 1
+    End If
+
+    If COMMUNICATOR_DEBUG_ENABLED Then
+        Debug.Print "BiDi: Dropped late/unknown response ID=" & idStr
+    End If
+End Sub
+
+Private Sub TraceSessionDropSummary()
+    If m_DroppedEventsCount = 0 And m_DroppedLateResponsesCount = 0 Then Exit Sub
+
+    Trace ">>> [Session Summary] Connection closing. Dropped asynchronous events=" & _
+          m_DroppedEventsCount & "; dropped late/unknown command responses=" & _
+          m_DroppedLateResponsesCount, True
+End Sub
 
 Private Sub ResetEventBuffer()
     Set m_EventBuffer = New Collection
@@ -837,6 +954,7 @@ Private Sub ResetApplicationHeartbeatState()
     m_applicationHeartbeatOutstanding = False
     m_applicationHeartbeatId = 0
     m_lastApplicationHeartbeatAt = 0
+    m_consecutiveApplicationHeartbeatTimeouts = 0
 End Sub
 
 Public Function SendCommand(ByVal method As String, _
@@ -880,17 +998,30 @@ Public Function SendCommand(ByVal method As String, _
 End Function
 
 Public Sub Disconnect(Optional ByVal keepErrorState As Boolean = False)
+    If m_isRaisingStateChanged Then
+        Trace ">>> [Lifecycle] Disconnect rejected during StateChanged notification. " & _
+              "Schedule teardown after the event handler returns.", True
+        Exit Sub
+    End If
+
+    If m_isRecovering Then
+        m_recoveryCancelRequested = True
+        Trace ">>> [Recovery] Disconnect requested; cancelling the active recovery attempt.", True
+    End If
+
     If m_state = StateDisconnecting Or m_state = StateDisconnected Then Exit Sub
 
-    If m_DroppedEventsCount > 0 Then
-        Trace ">>> [Session Summary] Connection closing. Total events dropped during this session: " & m_DroppedEventsCount, True
-    End If
+    ' keepErrorState=True is transient transport cleanup before possible recovery; defer the
+    ' session summary until an actual session close so counters survive reconnects.
+    If Not keepErrorState Then TraceSessionDropSummary
 
     If Not keepErrorState Then SetState StateDisconnecting
     
     Call InternalCleanup
     
-    ResetEventBuffer
+    ' A transient recovery disconnect preserves complete queued events. Partial WebSocket
+    ' frames are owned and cleared by InternalCleanup/WsForceClose, not by this FIFO.
+    If Not keepErrorState Then ResetEventBuffer
     
     If Not keepErrorState Then
         SetState StateDisconnected
@@ -927,9 +1058,20 @@ Private Sub InternalCleanup()
     On Error GoTo 0
 End Sub
 
-' SendAndReceive correlates one ID around bounded non-blocking Pump calls and
-' suppresses Office message pumping for the entire command-response cycle.
+' SendAndReceive correlates one ID around bounded non-blocking Pump calls. Office
+' messages are suppressed except during guarded recovery backoff, where public I/O
+' entries reject re-entry and lifecycle teardown requests cancel the attempt.
 Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitTimeMs As Long = 0) As String
+    If m_isRaisingStateChanged Then
+        Err.Raise 606, "BiDiSocket", _
+            "SendAndReceive blocked during synchronous StateChanged notification."
+    End If
+
+    If m_isRecovering Then
+        Err.Raise 606, "BiDiSocket", _
+            "SendAndReceive blocked while connection recovery is in progress."
+    End If
+
     ' Re-entry raises before the local error handler is armed. The outer in-flight call
     ' therefore retains m_isSendReceiving and cannot be mistaken for an empty response.
     If m_isSendReceiving Then
@@ -944,13 +1086,20 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     
     On Error GoTo Cleanup
 
+    ' Validate before recovery or any transport work: an invalid public call must fail
+    ' without changing connection state.
+    cmdId = ExtractJsonId(jsonMessage)
+    If Not IsNormalCommandId(cmdId) Then
+        Err.Raise 607, "BiDiSocket", _
+            "SendAndReceive requires a numeric root command ID in [" & _
+            CMD_ID_FLOOR & ".." & ID_MAX & "]."
+    End If
+
     If m_state <> StateConnected Then
         If Not AttemptRecovery() Then
             Err.Raise 600, "BiDiSocket", "Not connected and recovery failed."
         End If
     End If
-    
-    cmdId = ExtractJsonId(jsonMessage)
     
     If Not SendMessage(jsonMessage) Then
         If m_state <> StateConnected Then
@@ -966,7 +1115,14 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     '   - 2x is a secondary overrun fail-safe and marks the socket failed.
     '   - StateError cleanup releases native handles automatically only with AutoReconnect.
     ' All native calls and Pump work are bounded, so silence cannot trap VBA in receive.
-    Dim TIMEOUT As Long: TIMEOUT = IIf(waitTimeMs > 0, waitTimeMs, m_DefaultTimeout)
+    Dim TIMEOUT As Long
+    If waitTimeMs > 0 Then
+        TIMEOUT = waitTimeMs
+    Else
+        TIMEOUT = m_DefaultTimeout
+    End If
+    If TIMEOUT > MAX_PUBLIC_TIMEOUT_MS Then TIMEOUT = MAX_PUBLIC_TIMEOUT_MS
+
     Dim softDeadline As Double: softDeadline = nowMs() + TIMEOUT
     Dim hardDeadline As Double: hardDeadline = nowMs() + (TIMEOUT * 2)
     
@@ -982,19 +1138,21 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
         
         If Len(msg) > 0 Then
             inId = ExtractJsonId(msg)
-            If inId = cmdId Then
-                SendAndReceive = msg
-                succeeded = True
-                GoTo Cleanup
-            Else
-                ' Queue id-less/asynchronous events, but consume reserved PostScript/heartbeat
-                ' replies internally rather than exposing them through GetMessage.
-                If Not IsReservedSystemId(inId) Then
-                    EnqueueEventBounded msg
-                Else
+            Select Case ClassifyIncomingMessage(inId, cmdId)
+                Case IncomingClass_MatchingCommandResponse
+                    SendAndReceive = msg
+                    succeeded = True
+                    GoTo Cleanup
+
+                Case IncomingClass_ReservedSystemResponse
                     ProcessReservedSystemResponse inId, msg, False
-                End If
-            End If
+
+                Case IncomingClass_LateOrUnknownResponse
+                    DropLateOrUnknownResponse inId
+
+                Case IncomingClass_Event
+                    EnqueueEventBounded msg
+            End Select
         End If
         
         Dim nowT As Double: nowT = nowMs()
@@ -1054,6 +1212,8 @@ End Function
 Private Function AttemptRecovery() As Boolean
     If m_isRecovering Then Exit Function
     m_isRecovering = True
+    m_recoveryConnectAuthorized = False
+    m_recoveryCancelRequested = False
     
     On Error GoTo ErrorHandler
 
@@ -1068,9 +1228,21 @@ Private Function AttemptRecovery() As Boolean
     Dim waitTime As Long: waitTime = (2 ^ (m_RetryCount - 1)) * 1000
     Trace ">>> [Recovery] Attempt #" & m_RetryCount & " (Waiting " & waitTime & "ms)", True
     
+    ' Recovery backoff stays interactive. Public I/O entries reject re-entry while
+    ' lifecycle teardown requests cancel the connection rebuild.
     YieldExecution waitTime, True
-    
-    If Connect(m_LastWsUrl, m_LastPort) Then
+
+    If m_recoveryCancelRequested Then
+        Trace ">>> [Recovery] Attempt cancelled by a lifecycle teardown request.", True
+        GoTo CleanExit
+    End If
+
+    m_recoveryConnectAuthorized = True
+    Dim recoveryConnected As Boolean
+    recoveryConnected = Connect(m_LastWsUrl, m_LastPort)
+    m_recoveryConnectAuthorized = False
+
+    If recoveryConnected Then
         Trace ">>> [Recovery] Success.", True
         m_RetryCount = 0
         AttemptRecovery = True
@@ -1080,6 +1252,8 @@ Private Function AttemptRecovery() As Boolean
     End If
     
 CleanExit:
+    m_recoveryConnectAuthorized = False
+    m_recoveryCancelRequested = False
     m_isRecovering = False
     On Error GoTo 0
     Exit Function
@@ -1096,6 +1270,9 @@ End Function
 ' ObserveWinsockMessage applies reserved-reply inspection consistently to both
 ' receive paths.
 Private Sub ObserveWinsockMessage(ByVal rawMsg As String)
+    ' Any assembled peer message proves transport progress and clears heartbeat suspicion.
+    m_consecutiveApplicationHeartbeatTimeouts = 0
+
     Dim isSuspicious As Boolean
     isSuspicious = (InStr(1, rawMsg, """error"":", vbTextCompare) > 0) Or _
                    (InStr(1, rawMsg, "chrome-error", vbTextCompare) > 0)
@@ -1118,6 +1295,8 @@ Private Sub ProcessReservedSystemResponse(ByVal inId As String, _
     End If
 
     If inId <> CStr(POST_SCRIPT_REPLY_ID) Then
+        ' A reserved reply, including a late heartbeat response, proves the peer is alive.
+        m_consecutiveApplicationHeartbeatTimeouts = 0
         If m_RetryCount > 0 Then m_RetryCount = 0
     End If
 End Sub
@@ -1145,14 +1324,19 @@ DrainCompleted:
     Do While WsTryDequeueText(candidate)
         inId = ExtractJsonId(candidate)
 
-        If IsReservedSystemId(inId) Then
-            ProcessReservedSystemResponse inId, candidate, False
-        Else
-            ObserveWinsockMessage candidate
-            realMsg = candidate
-            TryReadWinsockBeforeHeartbeat = True
-            GoTo FinalCleanup
-        End If
+        Select Case ClassifyIncomingMessage(inId)
+            Case IncomingClass_ReservedSystemResponse
+                ProcessReservedSystemResponse inId, candidate, False
+
+            Case IncomingClass_LateOrUnknownResponse
+                DropLateOrUnknownResponse inId
+
+            Case IncomingClass_Event
+                ObserveWinsockMessage candidate
+                realMsg = candidate
+                TryReadWinsockBeforeHeartbeat = True
+                GoTo FinalCleanup
+        End Select
     Loop
 
     If Not allowPump Or didPump Then GoTo FinalCleanup
@@ -1192,6 +1376,7 @@ End Function
 ' GetMessage serves the event FIFO, performs bounded receive work, then manages the
 ' reserved-band session.status heartbeat.
 Public Function GetMessage() As String
+    If m_isRaisingStateChanged Or m_isRecovering Then Exit Function
     If m_isSendReceiving Then Exit Function
 
     Dim bufferedEvent As String
@@ -1234,8 +1419,17 @@ Public Function GetMessage() As String
     If m_applicationHeartbeatOutstanding Then
         If (nowT - m_lastApplicationHeartbeatAt) < APPLICATION_HEARTBEAT_TIMEOUT_MS Then Exit Function
 
-        Trace ">>> [Heartbeat] session.status reply timeout. Retiring ID=" & _
-              m_applicationHeartbeatId & " without changing socket state.", True
+        If m_consecutiveApplicationHeartbeatTimeouts < 2147483647 Then
+            m_consecutiveApplicationHeartbeatTimeouts = m_consecutiveApplicationHeartbeatTimeouts + 1
+        End If
+
+        Trace ">>> [Heartbeat] session.status reply timeout. Consecutive=" & _
+              m_consecutiveApplicationHeartbeatTimeouts & _
+              "; retiring ID=" & m_applicationHeartbeatId & _
+              ". Socket state remains unchanged.", True
+
+        ' Heartbeat timeout is diagnostic evidence, not a transport verdict. A healthy
+        ' peer message resets the counter through ObserveWinsockMessage.
         m_applicationHeartbeatOutstanding = False
         m_applicationHeartbeatId = 0
     End If
@@ -1264,12 +1458,16 @@ Public Function GetMessage() As String
     Dim inId As String
     inId = ExtractJsonId(rawMsg)
 
-    If IsReservedSystemId(inId) Then
-        ProcessReservedSystemResponse inId, rawMsg, True
-        GetMessage = vbNullString
-    Else
-        GetMessage = rawMsg
-    End If
+    Select Case ClassifyIncomingMessage(inId)
+        Case IncomingClass_ReservedSystemResponse
+            ProcessReservedSystemResponse inId, rawMsg, True
+
+        Case IncomingClass_LateOrUnknownResponse
+            DropLateOrUnknownResponse inId
+
+        Case IncomingClass_Event
+            GetMessage = rawMsg
+    End Select
 End Function
 
 Public Function GetParsedEvent(Optional ByVal minMsgSize As Long = 10, _
@@ -1493,9 +1691,10 @@ ContinueLoop:
     Next i
 End Function
 
-' PumpMessages may run DoEvents only outside SendAndReceive; throttleMs limits how
-' often the Office queue is pumped.
+' PumpMessages may run DoEvents only outside SendAndReceive and recovery; throttleMs
+' limits how often the Office queue is pumped.
 Public Sub PumpMessages(Optional ByVal throttleMs As Long = 0)
+    If m_isRaisingStateChanged Or m_isRecovering Then Exit Sub
     If m_isSendReceiving Then Exit Sub
     If throttleMs > 0 And m_lastPumpTicks <> 0 Then
         If elapsedMs(m_lastPumpTicks) < throttleMs Then Exit Sub
@@ -1504,8 +1703,8 @@ Public Sub PumpMessages(Optional ByVal throttleMs As Long = 0)
     m_lastPumpTicks = NowTicks()
 End Sub
 
-' YieldExecution may pump Office messages only when explicitly requested and never
-' while a command owns response correlation.
+' YieldExecution pumps Office messages only when explicitly requested. The sole exception
+' to command-correlation suppression is guarded recovery backoff.
 Public Sub YieldExecution(Optional ByVal ms As Long = 1, Optional ByVal allowDoEvents As Boolean = False)
     Dim vMs As Long: vMs = ms
     If vMs < 0 Then vMs = 1
@@ -1513,7 +1712,7 @@ Public Sub YieldExecution(Optional ByVal ms As Long = 1, Optional ByVal allowDoE
     If vMs > 50 Then
         Call InterruptibleSleep(vMs, allowDoEvents)
     Else
-        If allowDoEvents And Not m_isSendReceiving Then
+        If allowDoEvents And (Not m_isSendReceiving Or m_isRecovering) Then
             DoEvents
         End If
 
@@ -1725,14 +1924,17 @@ Public Function ExtractOrigin(ByVal url As String) As String
     End If
 End Function
 
-' InterruptibleSleep pumps Office messages only when allowed and outside an active
-' SendAndReceive cycle; otherwise it is a physical chunked wait.
+' InterruptibleSleep normally suppresses Office messages during SendAndReceive. Guarded
+' recovery backoff may pump them because public I/O entries reject re-entry and
+' lifecycle teardown requests cancel the attempt.
 Private Sub InterruptibleSleep(ByVal totalMs As Long, Optional ByVal allowDoEvents As Boolean = True)
     Dim startTs As Double: startTs = nowMs()
     Const CHUNK_MS As Long = 50 ' Small granularity for better responsiveness
     
     Do While (nowMs() - startTs) < totalMs
-        If allowDoEvents And Not m_isSendReceiving Then
+        If m_isRecovering And m_recoveryCancelRequested Then Exit Do
+
+        If allowDoEvents And (Not m_isSendReceiving Or m_isRecovering) Then
             DoEvents
         End If
         
@@ -1742,9 +1944,21 @@ End Sub
 
 ' ForceClose skips the close handshake and performs non-raising emergency teardown.
 Public Sub ForceClose()
+    If m_isRaisingStateChanged Then
+        Trace ">>> [Lifecycle] ForceClose rejected during StateChanged notification. " & _
+              "Schedule emergency teardown after the event handler returns.", True
+        Exit Sub
+    End If
+
+    If m_isRecovering Then
+        m_recoveryCancelRequested = True
+        Trace ">>> [Recovery] ForceClose requested; cancelling the active recovery attempt.", True
+    End If
+
     ' Clear I/O guards before closing native transport so interrupted operations do not
     ' poison object reuse.
     On Error Resume Next
+    If m_state <> StateDisconnected Then TraceSessionDropSummary
     m_isSendReceiving = False
     m_isReading = False
 
@@ -1828,7 +2042,8 @@ Private Property Get WsMaxIncomingSize() As Long
 End Property
 
 Private Property Let WsMaxIncomingSize(ByVal value As Long)
-    If value < 300000 Then value = 300000
+    If value < MAX_MSG_SIZE Then value = MAX_MSG_SIZE
+    If value > MAX_CONFIGURED_INCOMING_SIZE Then value = MAX_CONFIGURED_INCOMING_SIZE
     m_ws_maxIncomingSize = value
 End Property
 
@@ -3006,7 +3221,7 @@ Private Sub WsCompleteCurrentFrame()
                     Set m_ws_messageChunks = New Collection
                 End If
 
-                m_ws_rawTextQueue.Add Item:=m_ws_messageChunks
+                m_ws_rawTextQueue.Add item:=m_ws_messageChunks
                 m_ws_rawTextLengthQueue.Add m_ws_messageCount
             End If
 
