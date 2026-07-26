@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.3 / MIT License / Copyright (c) hanamichi77777
+' Version 3.4 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -87,8 +87,12 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
+Private Const SPA_PROBE_VERSION As Long = 36 ' Internal probe generation/quiet/filter-diagnostic contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
+Private m_idleFilterRevision As Long          ' increments whenever VBA-side ignore filters change
+Private m_probeFilterRevisions As Dictionary ' context ID -> last filter revision pushed into that probe
+Private m_reportedInvalidSelectors As Dictionary ' selector -> one-shot diagnostic emitted this session
 
 Private m_recorderLogs As Collection
 Private m_isRecording As Boolean
@@ -105,10 +109,12 @@ Private m_sigDomXPath As String             ' armed target (diagnostics only)
 Private m_sigNetArmed As Boolean            ' ArmNetworkSignal active (API response arrival)
 Private m_sigNetSeen As Boolean             ' latched: matching responseCompleted observed
 Private m_sigNetPattern As String           ' armed URL pattern (UrlMatchesPattern notation)
+Private m_signalOwnerContextId As String    ' one browsing context owns every active completion arm
 Private m_sigVisArmed As Boolean            ' ArmVisibilitySignal active (new-element appearance)
 Private m_sigVisSeen As Boolean             ' latched: target became visible
 Private m_sigVisXPath As String             ' armed target (diagnostics only)
 Private m_sigLostWarned As Boolean          ' one-shot [SPA-SIGNAL-LOST] warning guard
+Private m_sigNetContextMissWarned As Boolean ' one-shot foreign/empty-context match diagnostic
 Private m_lastProbeQuietMs As Double        ' last polled domQuiet; quietAtHit for net hits
 
 ' Carryover is a one-wait diagnostic hint and never changes consensus.
@@ -147,6 +153,8 @@ Private Sub Class_Initialize()
     Set m_activeSubscriptions = New Dictionary
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
+    Set m_probeFilterRevisions = New Dictionary
+    Set m_reportedInvalidSelectors = New Dictionary
     Set m_blockingPatterns = New Collection
 
     ResetSignalState
@@ -315,6 +323,11 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
                 If m_validatedContexts.Exists(m_navigationContextId) Then m_validatedContexts.Remove m_navigationContextId
             End If
 
+            ' A new document has no applied VBA-side filter revision until its probe is injected.
+            If Not m_probeFilterRevisions Is Nothing Then
+                If m_probeFilterRevisions.Exists(m_navigationContextId) Then m_probeFilterRevisions.Remove m_navigationContextId
+            End If
+
             If m_debugMode Then
                 If m_navigationContextId = m_mainContextId Then
                     Debug.Print "BiDi: Navigation detected in main context " & _
@@ -327,13 +340,23 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
             ' an ignored endpoint may still be an explicitly armed completion signal.
             If method = "network.responseCompleted" And m_sigNetArmed And Not m_sigNetSeen Then
                 Dim sigUrl As String: sigUrl = GetPathString(json, "params.response.url")
-                If Len(sigUrl) > 0 Then
-                    If UrlMatchesPattern(sigUrl, m_sigNetPattern) Then
+                Dim sigContext As String: sigContext = GetPathString(json, "params.context")
+                If Len(sigUrl) > 0 And UrlMatchesPattern(sigUrl, m_sigNetPattern) Then
+                    If StrComp(sigContext, m_signalOwnerContextId, vbBinaryCompare) = 0 Then
                         m_sigNetSeen = True
                         Dim sigStatus As String: sigStatus = GetPathString(json, "params.response.status")
                         LogSignalLine "[SPA-SIGNAL-HIT] type=net | key=" & NormalizeEndpointKey(sigUrl) & _
                                       " | status=" & sigStatus & _
+                                      " | ctx=" & sigContext & _
                                       " | quietAtHit=" & Format(m_lastProbeQuietMs, "0") & "ms"
+                    ElseIf Not m_sigNetContextMissWarned Then
+                        m_sigNetContextMissWarned = True
+                        Dim actualSigContext As String: actualSigContext = sigContext
+                        If Len(actualSigContext) = 0 Then actualSigContext = "(empty)"
+                        LogSignalLine "[SPA-SIGNAL-CTX-MISS] type=net | key=" & _
+                                      NormalizeEndpointKey(sigUrl) & _
+                                      " | expectedCtx=" & m_signalOwnerContextId & _
+                                      " | actualCtx=" & actualSigContext
                     End If
                 End If
             End If
@@ -1809,6 +1832,8 @@ Public Sub ClearState()
 
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
+    Set m_probeFilterRevisions = New Dictionary
+    Set m_reportedInvalidSelectors = New Dictionary
 
     Set m_activeSubscriptions = New Dictionary
     
@@ -2115,25 +2140,56 @@ Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dict
 End Function
 
 Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = True)
-    Set m_recorderLogs = New Collection
-    m_isRecording = True
-    ' Recorder timestamps are seconds; NowMs values are divided by 1000 consistently.
-    m_recorderStartTime = socket_.nowMs() / 1000
-    ' A reused wrapper starts recording with all carryover diagnostics cleared.
-    m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
-    m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
-    m_excludeResources = excludeImagesAndCss
-    Set m_recSuppByKey = New Dictionary
-    m_droppedHeadCount = 0
+    ' Stage all recorder-owned objects and scalars locally. No live recorder state is changed
+    ' until session.subscribe succeeds, so a failed start leaves an existing recorder intact
+    ' and never creates a half-enabled new recorder.
+    Dim stagedLogs As New Collection
+    Dim stagedSuppByKey As New Dictionary
+    Dim stagedStartTime As Double
     Dim events(4) As String
+
+    On Error GoTo StartFailed
+
+    ' Recorder timestamps are seconds; NowMs values are divided by 1000 consistently.
+    stagedStartTime = socket_.nowMs() / 1000
+
     events(0) = "network.responseCompleted"
     events(1) = "network.fetchError"
     events(2) = "browsingContext.load"
     events(3) = "browsingContext.domContentLoaded"
     events(4) = "network.beforeRequestSent"
+
+    ' Subscribe before committing recorder state. ExecuteSessionSubscribe raises on failure;
+    ' in that case all fields below remain exactly as they were on entry.
     Me.ExecuteSessionSubscribe events
 
+    ' Commit the staged recorder as one logical transaction. Publish m_isRecording last so
+    ' guarded append paths never observe an enabled recorder with uninitialized collections.
+    m_isRecording = False
+    Set m_recorderLogs = stagedLogs
+    Set m_recSuppByKey = stagedSuppByKey
+    m_recorderStartTime = stagedStartTime
+    m_excludeResources = excludeImagesAndCss
+    m_droppedHeadCount = 0
+
+    ' A reused wrapper starts recording with all carryover diagnostics cleared.
+    m_unresolvedJsonThisWait = False
+    m_unresolvedJsonFirstKeyThisWait = ""
+    m_unresolvedJsonFirstSecThisWait = 0#
+    m_hasCarryoverHintForNextWait = False
+    m_carryoverNoteArmedThisWait = False
+    m_carryoverNoteEmittedThisWait = False
+
+    m_isRecording = True
     Debug.Print "BiDi Recorder: Started. (Filter Resources: " & excludeImagesAndCss & ")"
+    Exit Sub
+
+StartFailed:
+    Dim errNum As Long: errNum = Err.Number
+    Dim errSrc As String: errSrc = Err.source
+    Dim errDesc As String: errDesc = Err.description
+    On Error GoTo 0
+    Err.Raise errNum, errSrc, errDesc
 End Sub
 
 Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
@@ -2301,38 +2357,59 @@ Public Sub ProcessRecorderQueue()
     Dim json As Object
     Dim processedCount As Long
     Dim consecutiveErrors As Long
+    Dim droppedCount As Long
+    Dim dropLogCount As Long
     Const MAX_MESSAGES_PER_BATCH As Long = 1000
+    Const MAX_DROP_LOGS_PER_BATCH As Long = 5
     
     On Error GoTo Cleanup
     
     Do While processedCount < MAX_MESSAGES_PER_BATCH
-        Set json = socket_.GetParsedEvent(MIN_MSG_SIZE, MAX_MSG_SIZE)
-        If json Is Nothing Then Exit Do
-        
-        On Error Resume Next
-        DispatchGlobalEvents json
-        
-        If Err.Number <> 0 Then
-            consecutiveErrors = consecutiveErrors + 1
-            If m_debugMode Then
-                Debug.Print "BiDi: Dispatch error #" & consecutiveErrors & ": " & Err.description
-            End If
-            Err.Clear
-        Else
-            consecutiveErrors = 0
-        End If
-        On Error GoTo Cleanup ' Restore main handler
-        
-        ' Repeated dispatch failures trip a circuit breaker rather than looping indefinitely.
-        If consecutiveErrors >= 10 Then
-            Debug.Print "BiDi Critical: 10 consecutive dispatch errors. Abandoning queue."
-            Exit Do
-        End If
-        
+        Set json = Nothing
+
+        Dim dropReason As String
+        Dim messageConsumed As Boolean
+        messageConsumed = socket_.TryGetParsedEvent(json, dropReason, MIN_MSG_SIZE, MAX_MSG_SIZE)
+        If Not messageConsumed Then Exit Do
+
+        ' Count valid and dropped messages alike so malformed traffic cannot bypass the batch cap.
         processedCount = processedCount + 1
-        
+
+        If json Is Nothing Then
+            droppedCount = droppedCount + 1
+            If m_debugMode And dropLogCount < MAX_DROP_LOGS_PER_BATCH Then
+                Debug.Print "BiDi: Dropped recorder event: " & dropReason
+                dropLogCount = dropLogCount + 1
+            End If
+        Else
+            On Error Resume Next
+            DispatchGlobalEvents json
+
+            If Err.Number <> 0 Then
+                consecutiveErrors = consecutiveErrors + 1
+                If m_debugMode Then
+                    Debug.Print "BiDi: Dispatch error #" & consecutiveErrors & ": " & Err.description
+                End If
+                Err.Clear
+            Else
+                consecutiveErrors = 0
+            End If
+            On Error GoTo Cleanup ' Restore main handler
+
+            ' Repeated dispatch failures trip a circuit breaker rather than looping indefinitely.
+            If consecutiveErrors >= 10 Then
+                Debug.Print "BiDi Critical: 10 consecutive dispatch errors. Abandoning queue."
+                Exit Do
+            End If
+        End If
+
         If (processedCount Mod 100) = 0 Then socket_.PumpMessages 100
     Loop
+
+    If m_debugMode And droppedCount > dropLogCount Then
+        Debug.Print "BiDi: " & (droppedCount - dropLogCount) & _
+                    " additional recorder event drop(s) suppressed in this batch."
+    End If
 
 Cleanup:
     m_isProcessingQueue = False
@@ -2678,6 +2755,68 @@ Private Function QuerySpaProbe(Optional ByVal contextId As String = "") As Dicti
     On Error GoTo 0
 End Function
 
+' Presence of window.__vbaIdleProbe is insufficient: a framework may replace Fetch/XHR or
+' the input setter while leaving the shell object behind. Missing legacy health fields are
+' intentionally unhealthy so the bounded reinjection path upgrades the page probe.
+Private Function IsSpaProbeReady(ByVal probe As Dictionary) As Boolean
+    On Error GoTo NotReady
+
+    If probe Is Nothing Then Exit Function
+    If Not probe.Exists("active") Then Exit Function
+    If Not CBool(probe("active")) Then Exit Function
+    If Not probe.Exists("version") Then Exit Function
+    If CLng(probe("version")) <> SPA_PROBE_VERSION Then Exit Function
+    If Not probe.Exists("health") Then Exit Function
+    If Not IsObject(probe("health")) Then Exit Function
+
+    Dim health As Dictionary
+    Set health = probe("health")
+    If health Is Nothing Then Exit Function
+
+    If Not health.Exists("versionOk") Then Exit Function
+    If Not health.Exists("fetchWrapped") Then Exit Function
+    If Not health.Exists("xhrWrapped") Then Exit Function
+    If Not health.Exists("observerActive") Then Exit Function
+    If Not health.Exists("inputWrapped") Then Exit Function
+
+    IsSpaProbeReady = CBool(health("versionOk")) And _
+                      CBool(health("fetchWrapped")) And _
+                      CBool(health("xhrWrapped")) And _
+                      CBool(health("observerActive")) And _
+                      CBool(health("inputWrapped"))
+    Exit Function
+
+NotReady:
+    IsSpaProbeReady = False
+End Function
+
+Private Sub LogInvalidProbeSelectors(ByVal probe As Dictionary, ByVal contextId As String)
+    On Error GoTo Done
+    If probe Is Nothing Then Exit Sub
+    If Not probe.Exists("invalidSelectors") Then Exit Sub
+    If m_reportedInvalidSelectors Is Nothing Then Set m_reportedInvalidSelectors = New Dictionary
+
+    Dim invalidItems As Collection
+    Set invalidItems = probe("invalidSelectors")
+    If invalidItems Is Nothing Then Exit Sub
+
+    Dim item As Variant
+    For Each item In invalidItems
+        Dim selectorText As String: selectorText = CStr(item)
+        If Len(selectorText) > 0 Then
+            If Not m_reportedInvalidSelectors.Exists(selectorText) Then
+                m_reportedInvalidSelectors.Add selectorText, True
+                Dim safeText As String
+                safeText = Replace(Replace(selectorText, vbCr, " "), vbLf, " ")
+                If Len(safeText) > 200 Then safeText = Left$(safeText, 197) & "..."
+                LogProbeDiagnosticLine "[SPA-FILTER-INVALID] selector=" & safeText & _
+                                       " | ctx=" & contextId
+            End If
+        End If
+    Next item
+Done:
+End Sub
+
 ' COMPLETION SIGNAL GATE
 ' SPA idle is negative evidence and can pass during a response-to-render gap. Arm* adds
 ' caller-selected positive evidence:
@@ -2697,19 +2836,23 @@ Public Sub ArmContentSignal(ByVal signalXPath As String, _
         Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", "signalXPath is empty."
     End If
 
+    Dim targetCtx As String
+    targetCtx = ResolveSignalContextForArm(contextId, "ArmContentSignal")
+
     Dim js As String
     js = "var p=window.__vbaIdleProbe;if(!p||!p.armDomSignal)return -9;" & _
          "return p.armDomSignal(" & JsStringLiteral(signalXPath) & "," & _
          LCase$(CStr(includeAttributes)) & ");"
 
-    Dim rc As Long: rc = InvokeProbeArm(js, contextId)
+    Dim rc As Long: rc = InvokeProbeArm(js, targetCtx)
 
     Select Case rc
         Case 0
+            ClaimSignalOwner targetCtx
             If m_sigDomArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=dom | overwrite=true (previous dom arm replaced)"
             m_sigDomArmed = True: m_sigDomSeen = False: m_sigDomXPath = signalXPath
             m_sigLostWarned = False
-            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | xpath=" & signalXPath
+            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | xpath=" & signalXPath & " | ctx=" & targetCtx
         Case -1
             LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=not-found | xpath=" & signalXPath
             Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
@@ -2729,18 +2872,25 @@ End Sub
 
 ' ArmNetworkSignal uses the shared URL-pattern syntax and matches before ignore filters.
 ' Arrival is not rendering; increase the tail or combine with a DOM signal when needed.
-Public Sub ArmNetworkSignal(ByVal urlPattern As String)
+Public Sub ArmNetworkSignal(ByVal urlPattern As String, _
+                            Optional ByVal contextId As String = "")
     If Len(Trim$(urlPattern)) = 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:ArmNetworkSignal", "urlPattern is empty."
     End If
+
+    Dim targetCtx As String
+    targetCtx = ResolveSignalContextForArm(contextId, "ArmNetworkSignal")
 
     ' Ensure responseCompleted is subscribed even without the recorder; otherwise a network
     ' arm would silently never fire.
     Me.ExecuteSessionSubscribe Array("network.responseCompleted"), , True
 
+    ClaimSignalOwner targetCtx
     If m_sigNetArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=net | overwrite=true (previous net arm replaced)"
     m_sigNetArmed = True: m_sigNetSeen = False: m_sigNetPattern = urlPattern
-    LogSignalLine "[SPA-SIGNAL-ARM] type=net | pattern=" & urlPattern
+    m_sigNetContextMissWarned = False
+    LogSignalLine "[SPA-SIGNAL-ARM] type=net | pattern=" & urlPattern & _
+                  " | ctx=" & targetCtx
 End Sub
 
 ' ArmVisibilitySignal rejects an already-visible target because that would silently
@@ -2751,18 +2901,22 @@ Public Sub ArmVisibilitySignal(ByVal signalXPath As String, _
         Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", "signalXPath is empty."
     End If
 
+    Dim targetCtx As String
+    targetCtx = ResolveSignalContextForArm(contextId, "ArmVisibilitySignal")
+
     Dim js As String
     js = "var p=window.__vbaIdleProbe;if(!p||!p.armVisSignal)return -9;" & _
          "return p.armVisSignal(" & JsStringLiteral(signalXPath) & ");"
 
-    Dim rc As Long: rc = InvokeProbeArm(js, contextId)
+    Dim rc As Long: rc = InvokeProbeArm(js, targetCtx)
 
     Select Case rc
         Case 0
+            ClaimSignalOwner targetCtx
             If m_sigVisArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=vis | overwrite=true (previous vis arm replaced)"
             m_sigVisArmed = True: m_sigVisSeen = False: m_sigVisXPath = signalXPath
             m_sigLostWarned = False
-            LogSignalLine "[SPA-SIGNAL-ARM] type=vis | xpath=" & signalXPath
+            LogSignalLine "[SPA-SIGNAL-ARM] type=vis | xpath=" & signalXPath & " | ctx=" & targetCtx
         Case -3
             LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=already-visible | xpath=" & signalXPath
             Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
@@ -2785,29 +2939,48 @@ End Sub
 ' next SPA-idle wait.
 Public Sub DisarmSignal(Optional ByVal contextId As String = "")
     Dim wasArmed As Boolean
-    wasArmed = (m_sigDomArmed Or m_sigNetArmed Or m_sigVisArmed)
+    wasArmed = AnySignalArmed()
+
+    Dim ownerCtx As String
+    If wasArmed Then
+        ownerCtx = m_signalOwnerContextId
+        If Len(Trim$(contextId)) > 0 Then
+            Dim requestedCtx As String: requestedCtx = ResolveTargetContext(contextId)
+            If StrComp(requestedCtx, ownerCtx, vbBinaryCompare) <> 0 Then
+                Err.Raise ERR_ACTION_FAILED, "BiDi:DisarmSignal", _
+                    "DisarmSignal context does not own the active completion signals." & vbCrLf & _
+                    "Owner: " & ownerCtx & vbCrLf & "Requested: " & requestedCtx
+            End If
+        End If
+    Else
+        ownerCtx = ResolveTargetContext(contextId)
+    End If
 
     ResetSignalState
 
     ' Browser-side disarm is best-effort because a dead context already lost its observer.
     On Error Resume Next
     Call CallScript("var p=window.__vbaIdleProbe;if(p&&p.disarmSignal)p.disarmSignal();return 0;", _
-                    Nothing, ResolveTargetContext(contextId), False, False, 5000, _
+                    Nothing, ownerCtx, False, False, 5000, _
                     Silent:=True, allowAmbiguousRetry:=True)
     On Error GoTo 0
 
-    If wasArmed Then LogSignalLine "[SPA-SIGNAL-DISARM] scope=all | by=user"
+    If wasArmed Then LogSignalLine "[SPA-SIGNAL-DISARM] scope=all | by=user | ctx=" & ownerCtx
 End Sub
 
-' Consume all arm types after WriteSpaWaitEnd on every SPA-wait outcome.
+' Consume all arm types after WriteSpaWaitEnd on every SPA-wait outcome. Cleanup always
+' targets the saved owner, even if a caller accidentally supplies a different context.
 Private Sub ConsumeSignalArms(Optional ByVal contextId As String = "")
-    If Not (m_sigDomArmed Or m_sigNetArmed Or m_sigVisArmed) Then Exit Sub
+    If Not AnySignalArmed() Then Exit Sub
+
+    Dim ownerCtx As String: ownerCtx = m_signalOwnerContextId
+    If Len(ownerCtx) = 0 Then ownerCtx = ResolveTargetContext(contextId)
 
     ResetSignalState
 
     On Error Resume Next
     Call CallScript("var p=window.__vbaIdleProbe;if(p&&p.disarmSignal)p.disarmSignal();return 0;", _
-                    Nothing, ResolveTargetContext(contextId), False, False, 5000, _
+                    Nothing, ownerCtx, False, False, 5000, _
                     Silent:=True, allowAmbiguousRetry:=True)
     On Error GoTo 0
 End Sub
@@ -2826,11 +2999,59 @@ Private Function IsContentRenderPath(ByVal domPath As String) As Boolean
     IsContentRenderPath = (depth >= 3)
 End Function
 
+Private Function AnySignalArmed() As Boolean
+    AnySignalArmed = (m_sigDomArmed Or m_sigNetArmed Or m_sigVisArmed)
+End Function
+
+Private Function ResolveSignalContextForArm(ByVal contextId As String, _
+                                            ByVal callerName As String) As String
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+    If Len(targetCtx) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  callerName & ": unable to resolve the target browsing context."
+    End If
+
+    If AnySignalArmed() Then
+        If Len(m_signalOwnerContextId) = 0 Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                      callerName & ": active completion signals have no owner context."
+        End If
+        If StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                callerName & ": completion signals cannot span browsing contexts." & vbCrLf & _
+                "Owner: " & m_signalOwnerContextId & vbCrLf & "Requested: " & targetCtx
+        End If
+    End If
+
+    ResolveSignalContextForArm = targetCtx
+End Function
+
+Private Sub ClaimSignalOwner(ByVal targetCtx As String)
+    If Len(m_signalOwnerContextId) = 0 Then m_signalOwnerContextId = targetCtx
+End Sub
+
+Private Sub ValidateSignalWaitContext(ByVal targetCtx As String)
+    If Not AnySignalArmed() Then Exit Sub
+
+    If Len(m_signalOwnerContextId) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:WaitForNetworkIdleSpa", _
+                  "Active completion signals have no owner context."
+    End If
+
+    If StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:WaitForNetworkIdleSpa", _
+            "The SPA wait context does not own the active completion signals." & vbCrLf & _
+            "Owner: " & m_signalOwnerContextId & vbCrLf & "Requested: " & targetCtx
+    End If
+End Sub
+
 Private Sub ResetSignalState()
     m_sigDomArmed = False: m_sigDomSeen = False: m_sigDomXPath = ""
     m_sigNetArmed = False: m_sigNetSeen = False: m_sigNetPattern = ""
     m_sigVisArmed = False: m_sigVisSeen = False: m_sigVisXPath = ""
+    m_signalOwnerContextId = ""
     m_sigLostWarned = False
+    m_sigNetContextMissWarned = False
 End Sub
 
 Private Function InvokeProbeArm(ByVal jsBody As String, ByVal contextId As String) As Long
@@ -2886,6 +3107,15 @@ Private Sub LogSignalLine(ByVal line As String)
     If m_debugMode Then Debug.Print "BiDi Signal: " & line
 End Sub
 
+Private Sub LogProbeDiagnosticLine(ByVal line As String)
+    If m_isRecording Then
+        Dim relTime As String
+        relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+        PushTimelineLine "[" & relTime & "] " & line
+    End If
+    If m_debugMode Then Debug.Print "BiDi: " & line
+End Sub
+
 Private Function JsStringLiteral(ByVal s As String) As String
     Dim t As String
     t = Replace(s, "\", "\\")
@@ -2914,7 +3144,7 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     End If
     
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    
+    ValidateSignalWaitContext targetCtx
     
     ProcessRecorderQueue
 
@@ -2983,6 +3213,8 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
     ' Keep the pre-hit DOM-quiet duration so logs can show when a network hit prevented a
     ' premature consensus.
     m_lastProbeQuietMs = jsIdleDuration
+
+    LogInvalidProbeSelectors probe, CStr(ctx("contextId"))
 
     If probe.Exists("changes") Then
         Dim changes As Collection: Set changes = probe("changes")
@@ -3212,6 +3444,7 @@ Private Function StartSpaIdleProbe(Optional ByVal contextId As String = "") As B
 
     On Error GoTo InjectFailed
     Set validated = ValidateProtocolResponse(rawRes, "StartSpaIdleProbe")
+    MarkProbeFilterCurrent targetCtx
 
     StartSpaIdleProbe = True
     Exit Function
@@ -3263,20 +3496,83 @@ Private Function FormatJavaScriptError(ByVal details As Object) As String
     FormatJavaScriptError = msg
 End Function
 
+' Filter changes are pushed into an existing healthy probe on the next probe preparation;
+' installed hooks read p.selectors dynamically, so they do not need to be rebuilt.
 Public Sub AddIdleIgnoreSelector(ByVal cssSelector As String)
+    If Len(Trim$(cssSelector)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:AddIdleIgnoreSelector", "cssSelector is empty."
+    End If
+
     If m_userIgnoreSelectors Is Nothing Then Set m_userIgnoreSelectors = New Collection
     m_userIgnoreSelectors.Add cssSelector
+    BumpIdleFilterRevision
 End Sub
 
+' Network hooks read p.ignoreNetwork dynamically for the same reason.
 Public Sub AddIdleIgnoreNetworkPattern(ByVal urlPattern As String)
+    If Len(Trim$(urlPattern)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:AddIdleIgnoreNetworkPattern", "urlPattern is empty."
+    End If
+
     If m_userIgnoreNetworkPatterns Is Nothing Then Set m_userIgnoreNetworkPatterns = New Collection
     m_userIgnoreNetworkPatterns.Add urlPattern
+    BumpIdleFilterRevision
 End Sub
 
+' Clear removes user additions; built-in defaults are restored on the next probe preparation.
 Public Sub ClearIdleFilters()
     Set m_userIgnoreSelectors = Nothing
     Set m_userIgnoreNetworkPatterns = Nothing
+    BumpIdleFilterRevision
 End Sub
+
+' Filter revisions are wrapper-wide, while each browsing context owns a separate probe.
+' Track the revision applied to every context so updating one tab cannot mark another current.
+Private Sub BumpIdleFilterRevision()
+    If m_idleFilterRevision = 2147483647 Then
+        m_idleFilterRevision = 1
+        Set m_probeFilterRevisions = New Dictionary
+    Else
+        m_idleFilterRevision = m_idleFilterRevision + 1
+    End If
+End Sub
+
+Private Function IsProbeFilterCurrent(ByVal contextId As String) As Boolean
+    If m_probeFilterRevisions Is Nothing Then Set m_probeFilterRevisions = New Dictionary
+    If Not m_probeFilterRevisions.Exists(contextId) Then Exit Function
+    IsProbeFilterCurrent = (CLng(m_probeFilterRevisions(contextId)) = m_idleFilterRevision)
+End Function
+
+Private Sub MarkProbeFilterCurrent(ByVal contextId As String)
+    If Len(contextId) = 0 Then Exit Sub
+    If m_probeFilterRevisions Is Nothing Then Set m_probeFilterRevisions = New Dictionary
+    m_probeFilterRevisions(contextId) = m_idleFilterRevision
+End Sub
+
+' Update only the mutable arrays. Existing healthy Fetch/XHR/DOM hooks remain unchanged.
+Private Function PushIdleFiltersToProbe(ByVal contextId As String) As Boolean
+    On Error GoTo PushFailed
+
+    Dim js As String
+    js = "var p=window.__vbaIdleProbe;if(!p||p.version!==" & SPA_PROBE_VERSION & ")return false;" & _
+         "p.selectors=" & MergeToJsArray(DEFAULT_IGNORE_SELECTORS, m_userIgnoreSelectors) & ";" & _
+         "p.ignoreNetwork=" & MergeToJsArray(DEFAULT_IGNORE_NETWORK, m_userIgnoreNetworkPatterns) & ";" & _
+         "if(!(p.invalidSelectors instanceof Set))p.invalidSelectors=new Set();else p.invalidSelectors.clear();" & _
+         "return true;"
+
+    Dim strRes As String
+    strRes = CallScript(js, Nothing, contextId, False, False, 10000, _
+                        Silent:=True, allowAmbiguousRetry:=True)
+
+    Dim result As Variant
+    result = GetCleanResult(strRes)
+    If Not IsEmpty(result) Then PushIdleFiltersToProbe = CBool(result)
+    If PushIdleFiltersToProbe Then MarkProbeFilterCurrent contextId
+    Exit Function
+
+PushFailed:
+    PushIdleFiltersToProbe = False
+End Function
 
 Private Function MergeToJsArray(ByVal defaultItems As String, ByVal userItems As Collection) As String
     Dim items As New Collection
@@ -3542,48 +3838,53 @@ Private Function GetProbeJs(ByVal probeType As String) As String
 
     Select Case LCase$(probeType)
         Case "inject"
-            js = js & "(function(){if(window.__vbaSpaProbeInstalled&&window.__vbaIdleProbe)return true;window.__vbaSpaProbeInstalled=true;var selectors=" & selArray & ",ignoreNetwork=" & netArray & ","
-            js = js & "p=window.__vbaIdleProbe||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],inflightUrls:new Set()};window.__vbaIdleProbe=p;if(!p.inflightUrls)p.inflightUrls=new Set();"
-            js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath='';}"
-            js = js & "var gX=function(e){if(!e||e.nodeType!==1)return '';var s=[];while(e&&e.nodeType===1){if(e.id){s.unshift('//*[@id=\''+e.id+'\']');return s.join('/')}"
-            js = js & "var i=1,b=e.previousSibling;while(b){if(b.nodeType===1&&b.tagName===e.tagName)i++;b=b.previousSibling}s.unshift(e.tagName.toLowerCase()+'['+i+']');e=e.parentNode}return '/'+s.join('/')};"
-
+            ' A probe is reusable only when its version and all tracked hooks remain healthy.
+            ' On repair, known wrappers are unwrapped to their saved originals; legacy wrappers
+            ' are adopted once so an in-page upgrade does not stack duplicate Fetch/XHR hooks.
+            js = js & "(function(){var V=" & SPA_PROBE_VERSION & ",selectors=" & selArray & ",ignoreNetwork=" & netArray & ",p=window.__vbaIdleProbe;"
+            js = js & "var proto=(typeof XMLHttpRequest==='function')?XMLHttpRequest.prototype:null;"
+            js = js & "var getInputDesc=()=>{try{return Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')}catch(e){return null}};"
+            js = js & "var probeHealth=()=>{var d=getInputDesc();return{versionOk:!!p&&p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p&&!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p&&!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p&&!!p.baseObserver,inputWrapped:!!d&&(!!p&&!!p.inputSetterWrapper&&d.set===p.inputSetterWr"
+            js = js & "apper)}};"
+            js = js & "if(p){p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;var h0=probeHealth();if(h0.versionOk&&h0.fetchWrapped&&h0.xhrWrapped&&h0.observerActive&&h0.inputWrapped){window.__vbaSpaProbeInstalled=true;return true}}"
+            js = js & "var legacy=!!(window.__vbaSpaProbeInstalled&&p&&(p.version===undefined||p.version===null));"
+            js = js & "p=p||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],inflightUrlCounts:new Map()};window.__vbaIdleProbe=p;window.__vbaSpaProbeInstalled=true;p.version=V;p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;"
+            js = js & "if(typeof p.inflightFetchCount!=='number')p.inflightFetchCount=0;if(typeof p.inflightXhrCount!=='number')p.inflightXhrCount=0;if(typeof p.lastMutationTs!=='number')p.lastMutationTs=performance.now();if(!Array.isArray(p.changeList))p.changeList=[];"
+            js = js & "if(!(p.inflightUrlCounts instanceof Map)){p.inflightUrlCounts=new Map();if(p.inflightUrls&&p.inflightUrls.forEach)p.inflightUrls.forEach((u)=>p.inflightUrlCounts.set(u,1))}"
+            js = js & "p.invalidSelectors=new Set();"
+            js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath=''}"
+            js = js & "var gX=function(e){if(!e||e.nodeType!==1)return '';var s=[];while(e&&e.nodeType===1){if(e.id){s.unshift('//*[@id=\''+e.id+'\']');return s.join('/')}var i=1,b=e.previousSibling;while(b){if(b.nodeType===1&&b.tagName===e.tagName)i++;b=b.previousSibling}s.unshift(e.tagName.toLowerCase()+'['+i+']');e=e.parentNode}return '/'+s.join('/')};"
             js = js & "p.vChk=function(e){if(!e||!e.isConnected)return false;var s=window.getComputedStyle(e),r=e.getBoundingClientRect();return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0))};"
-            ' DOM signal counters are monotonic latches; content arms require an existing valid XPath.
-            js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;"
-            js = js & "if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;"
-            js = js & "p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
-            ' Visibility arms reject an already-visible target; target absence is valid because
-            ' appearance is the signal.
+            js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
             js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visXPath=x;p.visArmed=true;p.visSeen=false;return 0};"
             js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath=''};"
-
-            
-            js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{"
-            js = js & "if(e && !/sizzle|signon_javascript|conversation_button/.test(e) && p.changeList.indexOf(e)===-1){"
-            js = js & "if(p.changeList.length<50)p.changeList.push(e);uT()}};"
-            js = js & "iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;return t?s.some((x)=>t.closest(x)!==null):0};"
-            js = js & "try{const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');Object.defineProperty(HTMLInputElement.prototype,'value',{set:function(v){lg('PROP:'+gX(this)+'[value]');return d.set.call(this,v)},get:function(){return d.get.call(this)},configurable:true})}catch(e){}"
-            js = js & "try{new MutationObserver((ms)=>{ms.forEach((m)=>{if(iN(m.target,selectors))return;var path=gX(m.target),entry=(m.type==='attributes')?'ATTR:'+path+'['+m.attributeName+']':'DOM:'+path;"
-            
-            js = js & "if(entry.indexOf('sizzle')===-1) lg(entry);})}).observe(document,{childList:true,subtree:true,attributes:true})}catch(e){}"
-            
-            ' fetch wrapping decrements on resolve, reject, and synchronous throw; a leaked counter
-            ' would permanently block idle consensus.
+            js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{if(e&&!/sizzle|signon_javascript|conversation_button/.test(e)){uT();if(p.changeList.indexOf(e)===-1&&p.changeList.length<50)p.changeList.push(e)}};p.touch=uT;p.logChange=lg;"
+            js = js & "var iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;if(!t)return 0;for(var i=0;i<s.length;i++){var x=s[i],k=String(x);if(p.invalidSelectors.has(k))continue;try{if(t.closest(x)!==null)return 1}catch(e){p.invalidSelectors.add(k)}}return 0};"
+            js = js & "try{var d=getInputDesc();if(legacy&&!p.inputSetterWrapper&&d&&typeof d.set==='function'){p.inputSetterWrapper=d.set;p.inputGetterWrapper=d.get||null}else if(!(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&!p.inputOriginalSet)){var bS=(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&p.inputOriginalSet)?p.inputOriginalSet:(d&&d.set),bG=(p.inputGetterWrapper&&d&&d.get===p.inputGetterWrapper&&p.inputOrigi"
+            js = js & "nalGet)?p.inputOriginalGet:(d&&d.get);if(bS&&bG){var sW=function(v){lg('PROP:'+gX(this)+'[value]');return bS.call(this,v)},gW=function(){return bG.call(this)};Object.defineProperty(HTMLInputElement.prototype,'value',{set:sW,get:gW,configurable:true});p.inputOriginalSet=bS;p.inputOriginalGet=bG;p.inputSetterWrapper=sW;p.inputGetterWrapper=gW}}}catch(e){p.lastHealthError='input:'+String(e&&e.message||e)}"
+            js = js & "try{if(p.baseObserver&&p.baseObserver.disconnect)p.baseObserver.disconnect()}catch(e){}p.baseObserver=null;"
+            js = js & "try{p.baseObserver=new MutationObserver((ms)=>{ms.forEach((m)=>{if(iN(m.target,p.selectors||[]))return;var t=(m.type==='characterData')?m.target.parentElement:m.target,path=gX(t),entry=(m.type==='attributes')?'ATTR:'+path+'['+m.attributeName+']':'DOM:'+path;if(entry.indexOf('sizzle')===-1)lg(entry)})});p.baseObserver.observe(document,{childList:true,characterData:true,subtree:true,attributes:true})}catch(e){p.baseObserver="
+            js = js & "null;p.lastHealthError='observer:'+String(e&&e.message||e)}"
             js = js & "var __vbaMatch=function(u,pat){if(pat.indexOf('*')<0)return u.indexOf(pat)!==-1;var re=pat.replace(/[.+^${}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*').replace(/\?/g,'.');try{return new RegExp(re).test(u)}catch(e){return u.indexOf(pat)!==-1}};"
-            js = js & "if(typeof window.fetch==='function'&&!window.fetch.__vbaWrapped){var oF=window.fetch;window.fetch=function(u,o){var r=(typeof u==='string')?u:(u&&u.url)||'';if(ignoreNetwork.some((pat)=>__vbaMatch(r,pat)))return oF.apply(this,arguments);"
-            js = js & "p.inflightFetchCount++;p.inflightUrls.add(r);var dec=()=>{p.inflightFetchCount--;p.inflightUrls.delete(r);uT()};try{return oF.apply(this,arguments).then((r2)=>{dec();return r2}).catch((e)=>{dec();throw e})}catch(e2){dec();throw e2}};window.fetch.__vbaWrapped=true}"
-            ' XHR wrapping decrements on loadend and synchronous send failure for the same reason.
-            js = js & "if(!XMLHttpRequest.prototype.__vbaWrapped){var oO=XMLHttpRequest.prototype.open,oS=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this.__vbaUrl=u;this.__vbaHooked=true;return oO.apply(this,arguments)};"
-            js = js & "XMLHttpRequest.prototype.send=function(){var s=this,u=this.__vbaUrl||'';if(ignoreNetwork.some((pat)=>__vbaMatch(u,pat))){s.__vbaHooked=false;return oS.apply(this,arguments)}p.inflightXhrCount++;p.inflightUrls.add(u);"
-            js = js & "var dn=()=>{if(s.__vbaHooked){p.inflightXhrCount--;p.inflightUrls.delete(u);s.__vbaHooked=false;uT()}s.removeEventListener('loadend',dn)};this.addEventListener('loadend',dn);try{return oS.apply(this,arguments)}catch(e2){dn();throw e2}};XMLHttpRequest.prototype.__vbaWrapped=true}return true})();"
+            js = js & "if(typeof window.fetch==='function'){if(legacy&&!p.fetchWrapper&&window.fetch.__vbaWrapped){p.fetchWrapper=window.fetch}else if(!(p.fetchWrapper&&window.fetch===p.fetchWrapper&&!p.fetchOriginal)){var oF=(p.fetchWrapper&&window.fetch===p.fetchWrapper&&p.fetchOriginal)?p.fetchOriginal:window.fetch;p.fetchGen=(p.fetchGen||0)+1;var myFetchGen=p.fetchGen;var fW=function(u,o){if(myFetchGen!==p.fetchGen)return oF.apply(this,arguments);var r=(typeof u==='string')?u:(u&&u.url)||'';if((p.ignoreNetwork||[]).some((pat)=>__vbaMatch(r,pat)))return oF"
+            js = js & ".apply(this,arguments);p.inflightFetchCount++;p.inflightUrlCounts.set(r,(p.inflightUrlCounts.get(r)||0)+1);var dec=()=>{p.inflightFetchCount=Math.max(0,p.inflightFetchCount-1);var n=(p.inflightUrlCounts.get(r)||0)-1;if(n<=0)p.inflightUrlCounts.delete(r);else p.inflightUrlCounts.set(r,n);uT()};try{return oF.apply(this,arguments).then((r2)=>{dec();return r2}).catch((e)=>{dec();throw e})}catch(e2){dec();throw e2}};fW.__"
+            js = js & "vbaWrapped=true;fW.__vbaProbeVersion=V;fW.__vbaProbeGeneration=myFetchGen;p.fetchOriginal=oF;p.fetchWrapper=fW;window.fetch=fW}}else{p.fetchOriginal=null;p.fetchWrapper=null}"
+            js = js & "if(proto){if(legacy&&!p.xhrOpenWrapper&&proto.__vbaWrapped){p.xhrOpenWrapper=proto.open;p.xhrSendWrapper=proto.send}else if(!(p.xhrOpenWrapper&&p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper&&(!p.xhrOpenOriginal||!p.xhrSendOriginal))){var oO=(p.xhrOpenWrapper&&proto.open===p.xhrOpenWrapper&&p.xhrOpenOriginal)?p.xhrOpenOriginal:proto.open,oS=(p.xhrSendWrapper&&proto.send===p.xhrSendWrap"
+            js = js & "per&&p.xhrSendOriginal)?p.xhrSendOriginal:proto.send;p.xhrGen=(p.xhrGen||0)+1;var myXhrGen=p.xhrGen;var xO=function(m,u){if(myXhrGen!==p.xhrGen)return oO.apply(this,arguments);this.__vbaUrl=u;this.__vbaHooked=true;return oO.apply(this,arguments)},xS=function(){if(myXhrGen!==p.xhrGen)return oS.apply(this,arguments);var s=this,u=this.__vbaUrl||'';if((p.ignoreNetwork||[]).some((pat)=>__vbaMatch(u,pat))){s.__vbaHooked=false;return oS.apply(this,arguments)}p.inflightXhrCount++;p.inflightUrlCounts.set(u,(p.inflightUrlCounts.get(u)||0)+1);var dn=()=>{if(s.__vbaHooked){p.inflightXhrCoun"
+            js = js & "t=Math.max(0,p.inflightXhrCount-1);var n=(p.inflightUrlCounts.get(u)||0)-1;if(n<=0)p.inflightUrlCounts.delete(u);else p.inflightUrlCounts.set(u,n);s.__vbaHooked=false;uT()}s.removeEventListener('loadend',dn)};this.addEventListener('loadend',dn);try{return oS.apply(this,arguments)}catch(e2){dn();throw e2}};xO.__vbaProbeGeneration=myXhrGen;xS.__vbaProbeGeneration=myXhrGen;p.xhrOpenOriginal=oO;p.xhrSendOriginal=oS;p.xhrOpenWrapper=xO;p.xhrSendWrapper=xS;proto.open=xO;proto.send=xS;pro"
+            js = js & "to.__vbaWrapped=true;proto.__vbaProbeVersion=V}}"
+            js = js & "var h=probeHealth();return h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.inputWrapped})();"
+
         Case "query"
-            js = js & "var p=window.__vbaIdleProbe;if(!p)return JSON.stringify({active:false});"
-            ' Visibility XPath polling stops after the first latch.
+            ' Query reports hook-by-hook health. VBA treats any missing/mismatched field as
+            ' inactive, resets the stable window, and routes through bounded probe recovery.
+            js = js & "var V=" & SPA_PROBE_VERSION & ";"
+            js = js & "var p=window.__vbaIdleProbe;if(!p)return JSON.stringify({active:false,version:0,health:{versionOk:false,fetchWrapped:false,xhrWrapped:false,observerActive:false,inputWrapped:false}});"
+            js = js & "var proto=(typeof XMLHttpRequest==='function')?XMLHttpRequest.prototype:null,d=null;try{d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')}catch(e){}"
+            js = js & "var h={versionOk:p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p.baseObserver,inputWrapped:!!d&&(!!p.inputSetterWrapper&&d.set===p.inputSetterWrapper)};"
+            js = js & "var healthy=h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.inputWrapped;"
             js = js & "if(p.visArmed&&!p.visSeen&&p.visXPath){try{var vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
-            js = js & "var res={active:true,now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,inflightUrls:Array.from(p.inflightUrls||[]),"
-            js = js & "sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};"
-            js = js & "p.changeList=[];return JSON.stringify(res);"
+            js = js & "var res={active:healthy,version:p.version||0,health:h,now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,inflightUrls:Array.from((p.inflightUrlCounts||new Map()).keys()),invalidSelectors:Array.from(p.invalidSelectors||[]),sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};p.changeList=[];return JSON.stringify(res);"
     End Select
     GetProbeJs = js
 End Function
@@ -3718,10 +4019,21 @@ CleanExit:
         End If
         On Error GoTo 0
         
+        ' Pending counts are authoritative for SPA waits. URL details are diagnostic only because
+        ' concurrent requests to the same URL may collapse in the JavaScript Set.
+        Dim pendingFetch As Long
+        Dim pendingXhr As Long
+        If mode = WaitMode_SpaIdle Then
+            If ctx.Exists("lastInflFetch") Then pendingFetch = CLng(ctx("lastInflFetch"))
+            If ctx.Exists("lastInflXhr") Then pendingXhr = CLng(ctx("lastInflXhr"))
+        End If
+        Dim hasPendingNetwork As Boolean
+        hasPendingNetwork = (pendingFetch > 0 Or pendingXhr > 0)
+        
         ' Record failure outcome before raising so saved logs distinguish timeout, halt, and
         ' non-504 error.
         Dim endStatus As String
-        If errNum = 504 And Len(inflightDetail) > 0 Then
+        If errNum = 504 And hasPendingNetwork Then
             endStatus = "HALT"
         ElseIf errNum = 504 Then
             endStatus = "TIMEOUT"
@@ -3735,15 +4047,21 @@ CleanExit:
         Err.Clear
         On Error GoTo 0
 
-        If errNum = 504 And Len(inflightDetail) > 0 Then
+        If errNum = 504 And hasPendingNetwork Then
             ' A 504 with pending requests becomes non-absorbable ERR_CONSENSUS_HALT.
             Debug.Print String(60, "=")
             Debug.Print "[" & Format(Now, "hh:mm:ss") & "] CONSENSUS HALT"
-            Debug.Print "  Pending Fetch/XHR:" & inflightDetail
+            Debug.Print "  Pending counts: Fetch=" & pendingFetch & "; XHR=" & pendingXhr
+            If Len(inflightDetail) > 0 Then
+                Debug.Print "  Pending URLs:" & inflightDetail
+            Else
+                Debug.Print "  Pending URLs: (details unavailable)"
+            End If
             Debug.Print String(60, "=")
             
             Dim haltMsg As String
             haltMsg = "CONSENSUS HALT: SPA stability consensus was not reached." & vbCrLf & _
+                      "Pending Fetch=" & pendingFetch & "; XHR=" & pendingXhr & "." & vbCrLf & _
                       "Check Immediate Window for details."
             
             Err.Raise ERR_CONSENSUS_HALT, "BiDi:MasterWaitEngine:" & errSrc, haltMsg
@@ -3825,10 +4143,7 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
 
         Case WaitMode_SpaIdle
             Dim probe As Dictionary: Set probe = QuerySpaProbe(targetCtx)
-            Dim isProbeActive As Boolean: isProbeActive = False
-            If Not probe Is Nothing Then
-                If probe.Exists("active") Then isProbeActive = CBool(probe("active"))
-            End If
+            Dim isProbeActive As Boolean: isProbeActive = IsSpaProbeReady(probe)
 
             If isProbeActive Then
                 ctx("missingProbeCount") = 0
@@ -4262,17 +4577,21 @@ End Function
 
 Private Sub PrepareProbeForAction(ByVal contextId As String)
     Dim probe As Dictionary
-    Dim isReady As Boolean: isReady = False
-    
+    Dim isReady As Boolean
+
     Set probe = QuerySpaProbe(contextId)
-    
-    If Not probe Is Nothing Then
-        If probe.Exists("active") Then isReady = CBool(probe("active"))
-    End If
+    isReady = IsSpaProbeReady(probe)
 
     If Not isReady Then
         StartSpaIdleProbe contextId
         WaitHeartbeat 150
+    ElseIf Not IsProbeFilterCurrent(contextId) Then
+        ' A healthy probe can accept new arrays in place. If the lightweight push fails,
+        ' use the existing bounded reinjection path, which also refreshes the arrays.
+        If Not PushIdleFiltersToProbe(contextId) Then
+            StartSpaIdleProbe contextId
+            WaitHeartbeat 150
+        End If
     End If
 End Sub
 

@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.3 / MIT License / Copyright (c) hanamichi77777
+' Version 3.4 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
@@ -105,6 +105,10 @@ Private m_DefaultTimeout As Long
 Private m_PollingInterval As Long
 Private m_DroppedEventsCount As Long
 Private m_DroppedLateResponsesCount As Long
+Private m_DroppedParsedOversizeCount As Long
+Private m_DroppedParsedMalformedCount As Long
+Private m_DroppedParsedFilteredCount As Long
+Private m_LastParsedEventDropReason As String
 Private m_lastPollTime As Double
 Private m_lastApplicationHeartbeatAt As Double
 Private m_RegExp As RegExp
@@ -407,10 +411,20 @@ Private Sub Class_Terminate()
     On Error GoTo 0
 End Sub
 
+' Logical connectivity requires agreement between the communicator state machine and
+' the native WebSocket. StateError must never surface as connected merely because a stale
+' native handle still reports OPEN (notably when AutoReconnect is disabled).
 Public Property Get IsConnected() As Boolean
-    If m_wsTransportInitialized Then
-        IsConnected = WsIsOpen
-    End If
+    ' VBA And does not short-circuit; guard native access explicitly.
+    If m_state <> StateConnected Then Exit Property
+    If Not m_wsTransportInitialized Then Exit Property
+    IsConnected = WsIsOpen
+End Property
+
+' Diagnostic-only native state. This may remain True briefly while logical state is
+' StateError; callers deciding whether commands are usable must use IsConnected instead.
+Public Property Get IsTransportOpen() As Boolean
+    If m_wsTransportInitialized Then IsTransportOpen = WsIsOpen
 End Property
 
 ' Compatibility shim: WinSock is the only transport; False is rejected and True
@@ -471,6 +485,10 @@ End Property
 Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_maxIncomingSize: End Property
 Public Property Get DroppedEventsCount() As Long: DroppedEventsCount = m_DroppedEventsCount: End Property
 Public Property Get DroppedLateResponsesCount() As Long: DroppedLateResponsesCount = m_DroppedLateResponsesCount: End Property
+Public Property Get DroppedParsedOversizeCount() As Long: DroppedParsedOversizeCount = m_DroppedParsedOversizeCount: End Property
+Public Property Get DroppedParsedMalformedCount() As Long: DroppedParsedMalformedCount = m_DroppedParsedMalformedCount: End Property
+Public Property Get DroppedParsedFilteredCount() As Long: DroppedParsedFilteredCount = m_DroppedParsedFilteredCount: End Property
+Public Property Get LastParsedEventDropReason() As String: LastParsedEventDropReason = m_LastParsedEventDropReason: End Property
 
 Private Sub SetState(ByVal NewState As BiDiSocketState)
     If m_state = NewState Then Exit Sub
@@ -550,6 +568,10 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
         ResetEventBuffer
         m_DroppedEventsCount = 0
         m_DroppedLateResponsesCount = 0
+        m_DroppedParsedOversizeCount = 0
+        m_DroppedParsedMalformedCount = 0
+        m_DroppedParsedFilteredCount = 0
+        m_LastParsedEventDropReason = vbNullString
     End If
 
     If LenB(wsUrl) = 0 Or localPort = 0 Then
@@ -882,11 +904,18 @@ Private Sub DropLateOrUnknownResponse(ByVal idStr As String)
 End Sub
 
 Private Sub TraceSessionDropSummary()
-    If m_DroppedEventsCount = 0 And m_DroppedLateResponsesCount = 0 Then Exit Sub
+    If m_DroppedEventsCount = 0 And _
+       m_DroppedLateResponsesCount = 0 And _
+       m_DroppedParsedOversizeCount = 0 And _
+       m_DroppedParsedMalformedCount = 0 And _
+       m_DroppedParsedFilteredCount = 0 Then Exit Sub
 
     Trace ">>> [Session Summary] Connection closing. Dropped asynchronous events=" & _
           m_DroppedEventsCount & "; dropped late/unknown command responses=" & _
-          m_DroppedLateResponsesCount, True
+          m_DroppedLateResponsesCount & "; parsed-event oversize drops=" & _
+          m_DroppedParsedOversizeCount & "; malformed drops=" & _
+          m_DroppedParsedMalformedCount & "; filtered drops=" & _
+          m_DroppedParsedFilteredCount, True
 End Sub
 
 Private Sub ResetEventBuffer()
@@ -1470,26 +1499,85 @@ Public Function GetMessage() As String
     End Select
 End Function
 
-Public Function GetParsedEvent(Optional ByVal minMsgSize As Long = 10, _
-                               Optional ByVal maxMsgSize As Long = 300000) As Object
-    Dim rawMsg As String: rawMsg = GetMessage()
+' Three-state parsed-event reader:
+'   False                     = no message was available.
+'   True + parsed Is Object   = one valid message was consumed and parsed.
+'   True + parsed Is Nothing  = one invalid/filtered message was consumed and dropped.
+' This distinction lets queue drains skip a bad event and continue with following events.
+Public Function TryGetParsedEvent(ByRef parsed As Object, _
+                                  ByRef dropReason As String, _
+                                  Optional ByVal minMsgSize As Long = 10, _
+                                  Optional ByVal maxMsgSize As Long = 300000) As Boolean
+    Set parsed = Nothing
+    dropReason = vbNullString
+
+    Dim rawMsg As String
+    rawMsg = GetMessage()
     If Len(rawMsg) = 0 Then Exit Function
-    
-    If Len(rawMsg) < minMsgSize Or Len(rawMsg) > maxMsgSize Then Exit Function
-    
-    If InStr(rawMsg, """method"":") = 0 And InStr(rawMsg, """id"":") = 0 Then Exit Function
-    
-    Dim parsed As Object
-    On Error Resume Next
-    Set parsed = WebJsonConverter.ParseJson(rawMsg)
-    If Err.Number <> 0 Or parsed Is Nothing Then
-        Err.Clear
-        On Error GoTo 0
+
+    ' A message was removed from the event FIFO even when it is rejected below.
+    TryGetParsedEvent = True
+
+    Dim rawLength As Long
+    rawLength = Len(rawMsg)
+
+    If rawLength < minMsgSize Then
+        dropReason = "too-short event (chars=" & rawLength & _
+                     "; minimum=" & minMsgSize & ")"
+        If m_DroppedParsedFilteredCount < 2147483647 Then _
+            m_DroppedParsedFilteredCount = m_DroppedParsedFilteredCount + 1
+        m_LastParsedEventDropReason = dropReason
         Exit Function
     End If
+
+    If rawLength > maxMsgSize Then
+        dropReason = "oversized parsed event (chars=" & rawLength & _
+                     "; maximum=" & maxMsgSize & ")"
+        If m_DroppedParsedOversizeCount < 2147483647 Then _
+            m_DroppedParsedOversizeCount = m_DroppedParsedOversizeCount + 1
+        m_LastParsedEventDropReason = dropReason
+        Exit Function
+    End If
+
+    If InStr(rawMsg, """method"":") = 0 And _
+       InStr(rawMsg, """id"":") = 0 Then
+        dropReason = "message has neither a root method nor id"
+        If m_DroppedParsedFilteredCount < 2147483647 Then _
+            m_DroppedParsedFilteredCount = m_DroppedParsedFilteredCount + 1
+        m_LastParsedEventDropReason = dropReason
+        Exit Function
+    End If
+
+    Dim parseErr As Long
+    Dim candidate As Object
+    On Error Resume Next
+    Set candidate = WebJsonConverter.ParseJson(rawMsg)
+    parseErr = Err.Number
+    Err.Clear
     On Error GoTo 0
-    
-    Set GetParsedEvent = parsed
+
+    If parseErr <> 0 Or candidate Is Nothing Then
+        dropReason = "malformed JSON event"
+        If parseErr <> 0 Then dropReason = dropReason & " (Err " & parseErr & ")"
+        If m_DroppedParsedMalformedCount < 2147483647 Then _
+            m_DroppedParsedMalformedCount = m_DroppedParsedMalformedCount + 1
+        m_LastParsedEventDropReason = dropReason
+        Exit Function
+    End If
+
+    m_LastParsedEventDropReason = vbNullString
+    Set parsed = candidate
+End Function
+
+' Compatibility API: callers that only understand Object/Nothing retain the old contract.
+Public Function GetParsedEvent(Optional ByVal minMsgSize As Long = 10, _
+                               Optional ByVal maxMsgSize As Long = 300000) As Object
+    Dim parsed As Object
+    Dim dropReason As String
+
+    If TryGetParsedEvent(parsed, dropReason, minMsgSize, maxMsgSize) Then
+        If Not parsed Is Nothing Then Set GetParsedEvent = parsed
+    End If
 End Function
 
 Private Function ReadFromWinsock(Optional ByVal deadline As Double = 0) As String
