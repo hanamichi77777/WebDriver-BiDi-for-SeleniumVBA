@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.4 / MIT License / Copyright (c) hanamichi77777
+' Version 3.5 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -2192,7 +2192,7 @@ StartFailed:
     Err.Raise errNum, errSrc, errDesc
 End Sub
 
-Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
+Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discovery_log.txt")
     ' Drain the queue before setting m_isRecording=False because event dispatch records only
     ' while that flag is True.
     Call ProcessRecorderQueue
@@ -2204,6 +2204,9 @@ Public Sub StopAndSaveDiscoveryLog(ByVal filePath As String)
     AppendSuppressedSummary
     
     If m_recorderLogs.count > 0 Then
+        ' Resolve relative paths against the folder of the document that owns the active VBA project.
+        filePath = WebShared.getFullLocalPath(filePath, targetExists:=False)
+
         ' ADODB.Stream is used to write UTF-8 without a BOM.
         Dim stm As ADODB.stream
         Set stm = New ADODB.stream

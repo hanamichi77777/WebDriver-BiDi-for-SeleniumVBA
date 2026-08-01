@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v3.4
+# WebDriver BiDi for SeleniumVBA v3.5
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
@@ -28,13 +28,17 @@ The structured log can also be provided to an AI assistant for analysis. By exam
 In other words, the Discovery Log is not just an execution log.
 It is a diagnostic tool for discovering what should be waited for—and for helping AI devise practical synchronization solutions—when automating unknown third-party SPAs.
 
-## Validation Benchmark
+## Validation Benchmarks
 
-For validation, this project uses a challenging benchmark: entering text into the ServiceNow login form.
+For validation, this project uses two challenging automation benchmarks: entering text into the ServiceNow login form and performing a flight search on Google Flights.
 
-ServiceNow is frequently regarded as one of the more difficult Single Page Applications to automate due to its complex SPA behavior, Shadow DOM usage, and asynchronous UI updates.
+ServiceNow is frequently regarded as one of the more difficult Single Page Applications to automate because of its complex SPA behavior, extensive use of Shadow DOM, and asynchronous UI updates.
 
-The validation code is contained in the `Main07` procedure.
+Google Flights provides another demanding benchmark. The validation scenario performs a one-way flight search from Sapporo to Paris, including interactions with dynamically generated destination suggestions, the fare calendar, and asynchronously updated search results.
+
+These benchmarks verify that WebDriver BiDi for SeleniumVBA can reliably handle complex dynamic websites by detecting browser events and waiting for meaningful application-level completion signals rather than relying on fixed delays.
+
+The ServiceNow validation code is contained in the `Main07` procedure, and the Google Flights validation code is contained in the `Main08` procedure.
 
 
 ## VirusTotal Scan Results
@@ -65,7 +69,7 @@ Setup and import instructions are available in the **[Wiki](https://github.com/h
 
 ## 📂 Procedure Overview (Sample Module: `BiDi_Sample`)
 
-These descriptions are aligned with the `BiDi_Sample` module included in WebDriver BiDi for SeleniumVBA v2.7. The procedures are learning and diagnostic examples rather than permanent integration tests for the referenced public websites. Third-party URLs, XPath expressions, ARIA labels, extension folders, and observed network endpoints can change without notice. When adapting a sample, first identify the application's real completion condition, then update selectors, signal patterns, noise rules, and business-level verification accordingly.
+These descriptions are aligned with the `BiDi_Sample` module included in WebDriver BiDi for SeleniumVBA. The procedures are learning and diagnostic examples rather than permanent integration tests for the referenced public websites. Third-party URLs, XPath expressions, ARIA labels, extension folders, and observed network endpoints can change without notice. When adapting a sample, first identify the application's real completion condition, then update selectors, signal patterns, noise rules, and business-level verification accordingly.
 
 ### 1. Main01: Google Translate Extension Installation through WebDriver BiDi
 This procedure is intentionally limited to one task: installing the unpacked Google Translate extension into the current Chrome automation session.

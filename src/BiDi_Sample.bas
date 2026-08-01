@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.4 / MIT License / Copyright (c) hanamichi77777
+' Version 3.5 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -274,9 +274,8 @@ Public Sub Main07()
     ' Use a non-sensitive test value when adapting this sample.
     bidi.ExecuteInputValueByXPath "//input[@id='username']", "aaa"
     
-    Dim logPath As String
-    logPath = .ResolvePath(".\") & "\discovery_log.txt"
-    bidi.StopAndSaveDiscoveryLog logPath
+    ' Saves discovery_log.txt in the same folder as the current VBA host file.
+    bidi.StopAndSaveDiscoveryLog
     
     bidi.Shutdown: Set bidi = Nothing
     .CloseBrowser: .Shutdown
@@ -368,9 +367,8 @@ Public Sub Main08()
         bidi.ArmNetworkSignal "GetShoppingResults"
         bidi.ExecuteClickByXPath searchXPath
         
-        Dim logPath As String
-        logPath = .ResolvePath(".\") & "\discovery_log.txt"
-        bidi.StopAndSaveDiscoveryLog logPath
+        ' Saves discovery_log.txt in the same folder as the current VBA host file.
+        bidi.StopAndSaveDiscoveryLog
         
         bidi.Shutdown: Set bidi = Nothing
         .CloseBrowser: .Shutdown
@@ -413,12 +411,10 @@ Sub Main09()
     bidi.StartDiscoveryLog excludeImagesAndCss:=True
     bidi.RecordEventsForSeconds RECORDING_SECONDS
     
+    ' Saves discovery_log.txt in the same folder as the current VBA host file.
+    bidi.StopAndSaveDiscoveryLog
     
-    Dim logPath As String
-    logPath = .ResolvePath(".\") & "\discovery_log.txt"
-    bidi.StopAndSaveDiscoveryLog logPath
-    
-    MsgBox "Discovery Log Saved!" & vbCrLf & logPath
+    MsgBox "Discovery Log Saved!"
     
     bidi.Shutdown: Set bidi = Nothing
     .CloseBrowser: .Shutdown
@@ -457,9 +453,8 @@ Public Sub Main10()
     bidi.ArmContentSignal "//*[@id='table-body']"
     bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2014']"
     
-    Dim logPath As String
-    logPath = .ResolvePath(".\") & "\discovery_log.txt"
-    bidi.StopAndSaveDiscoveryLog logPath
+    ' Saves discovery_log.txt in the same folder as the current VBA host file.
+    bidi.StopAndSaveDiscoveryLog
 
     bidi.Shutdown: Set bidi = Nothing
     .CloseBrowser: .Shutdown
