@@ -480,12 +480,10 @@ Public Sub Main11()
     
     Dim targetUrl As String
     Dim filePath As String
-    Dim result As String
     
     targetUrl = "https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/file-dialog-probe/"
     
     With driver
-    
         .StartEdge
     
         ' Create the file used by this example.
@@ -496,60 +494,37 @@ Public Sub Main11()
     
         Set caps = .CreateCapabilities
         caps.EnableBiDiMode
-    
         .OpenBrowser caps
-    
-        Set bidi = New BiDiCommandWrapper
-        bidi.ConnectTo driver.GetWebSocketUrl
+        Set bidi = New BiDiCommandWrapper: bidi.ConnectTo driver.GetWebSocketUrl
     
         bidi.StartDiscoveryLog
-    
         bidi.ExecuteNavigateAndGetStatus targetUrl
-    
         ' ------------------------------------------------------------
         ' Completion signal.
-        '
         ' On the test page, #done is initially hidden and becomes
         ' visible only after the short-lived file input fires change.
         '
         ' The waiting strategy can be replaced as appropriate when
         ' adapting this example to an actual application.
         ' ------------------------------------------------------------
+        
         bidi.ArmVisibilitySignal "//*[@id='done']"
         ' ------------------------------------------------------------
         ' IMPORTANT:
-        '
         ' This XPath identifies the visible trigger button.
         ' It does NOT identify input[type=file].
         '
         ' The input does not exist until this button is clicked and
         ' is removed immediately after input.click().
         ' ------------------------------------------------------------
-        result = bidi.ExecuteSetFileSelectionViaDialog("//*[@id='short-lived']", filePath)
-    
-        Debug.Print "input.setFiles response:"
-        Debug.Print result
-    
-        Debug.Print "Selected file:"
-        Debug.Print bidi.ExecuteGetTextByXPath("//*[@id='file-name']")
-    
-        Debug.Print "changeCount:"
-        Debug.Print bidi.ExecuteGetTextByXPath("//*[@id='change-count']")
-    
-        Debug.Print "cancelCount:"
-        Debug.Print bidi.ExecuteGetTextByXPath("//*[@id='cancel-count']")
-    
-        ' Saves discovery_log.txt in the same folder as
-        ' the current VBA host file.
+        bidi.ExecuteSetFileSelectionViaDialog "//*[@id='short-lived']", filePath
+        
+        ' Saves discovery_log.txt in the same folder as the current VBA host file.
         bidi.StopAndSaveDiscoveryLog
     
-        bidi.Shutdown
-        Set bidi = Nothing
-    
-        .CloseBrowser
-        .Shutdown
+        bidi.Shutdown: Set bidi = Nothing
+        .CloseBrowser: .Shutdown
     
     End With
 
 End Sub
-
