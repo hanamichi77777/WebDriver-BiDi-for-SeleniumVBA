@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.5 / MIT License / Copyright (c) hanamichi77777
+' Version 3.6 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -26,6 +26,7 @@ Option Explicit
 '   - Ambiguous outcomes are never replayed when they may duplicate state or overlap.
 '   - ERR_CONSENSUS_HALT propagates; ordinary post-action sync failure is best-effort.
 '   - Completion arms are one-shot and consumed by the next SPA-idle wait.
+'   - File-dialog composite actions preserve completion arms until input.setFiles completes.
 '   - Polling retries only classified transient protocol errors; fatal errors surface immediately.
 '   - PostScript id 2 is reserved, send-only, and its response is discarded.
 '
@@ -74,6 +75,7 @@ Private m_isProcessingQueue As Boolean
 ' classify [BLOCK] by matching the URL against the installed block patterns.
 Private m_blockingPatterns As Collection
 
+Private Const BIDI_WRAPPER_VERSION As String = "3.6"
 Private Const DEFAULT_IDLE_STABLE_MS As Long = 500
 Private Const DEFAULT_IDLE_TIMEOUT_MS As Long = 10000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
@@ -116,6 +118,25 @@ Private m_sigVisXPath As String             ' armed target (diagnostics only)
 Private m_sigLostWarned As Boolean          ' one-shot [SPA-SIGNAL-LOST] warning guard
 Private m_sigNetContextMissWarned As Boolean ' one-shot foreign/empty-context match diagnostic
 Private m_lastProbeQuietMs As Double        ' last polled domQuiet; quietAtHit for net hits
+
+' Short-lived file-input capture. input.fileDialogOpened is subscribed persistently;
+' this local arm is one-shot and owned by exactly one browsing context.
+Private m_fileDlgArmed As Boolean
+Private m_fileDlgSeen As Boolean
+Private m_fileDlgOwnerContextId As String
+Private m_fileDlgHasElement As Boolean
+Private m_fileDlgSharedId As String
+Private m_fileDlgMultipleKnown As Boolean
+Private m_fileDlgMultiple As Boolean
+Private m_fileDlgContextMissWarned As Boolean
+
+' Native file-chooser interception is target/session state outside the VBA object.
+' "MayBeActive" is intentionally conservative: it is set BEFORE the enable command is sent
+' so an ambiguous transport failure cannot make us forget a browser-side interception state.
+Private m_fileChooserInterceptMayBeActive As Boolean
+Private m_fileChooserInterceptSessionId As String
+Private m_fileChooserInterceptContextId As String
+
 
 ' Carryover is a one-wait diagnostic hint and never changes consensus.
 Private m_unresolvedJsonThisWait As Boolean       ' this wait saw a tracked json/API, no content render yet
@@ -163,6 +184,10 @@ Private Sub Class_Initialize()
     m_debugMode = True
 End Sub
 
+Public Property Get Version() As String
+    Version = BIDI_WRAPPER_VERSION
+End Property
+
 Public Sub ConnectTo(ByVal webSocketUrl As String, _
                      Optional ByVal requireShadowUnlocker As Boolean = False)
     ' Validate before ClearState; otherwise a rejected reconnect can erase wrapper state
@@ -205,6 +230,11 @@ Public Sub ConnectTo(ByVal webSocketUrl As String, _
     m_shutdownCompleted = False
     
     Me.ExecuteSessionSubscribe Array("log.entryAdded", "browsingContext.navigationStarted"), , True
+
+    ' Hard-reset insurance: a previous VBA project may have died after enabling Chromium's
+    ' file-chooser interceptor. Sweep current Chromium page sessions back to disabled.
+    ' Unsupported browsers are ignored without failing ConnectTo.
+    RecoverResidualFileChooserInterceptionOnConnectBestEffort
 
     Dim shadowErrNum As Long
     Dim shadowErrSrc As String
@@ -310,6 +340,9 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
         Case "log.entryAdded"
             Call HandleConsoleLog(json)
 
+        Case "input.fileDialogOpened"
+            Call HandleFileDialogOpenedEvent(json)
+
         Case "browsingContext.navigationStarted"
             m_navigationDetected = True
             m_navigationContextId = GetPathString(json, "params.context")
@@ -382,6 +415,60 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
     If m_isRecording Then
         FormatAndStoreLog json
     End If
+End Sub
+
+Private Sub HandleFileDialogOpenedEvent(ByVal json As Object)
+    If Not m_fileDlgArmed Or m_fileDlgSeen Then Exit Sub
+
+    Dim eventCtx As String
+    eventCtx = GetPathString(json, "params.context")
+
+    If Len(eventCtx) = 0 Then
+        LogSignalLine "[FILE-DIALOG-IGNORED] reason=missing-context"
+        Exit Sub
+    End If
+
+    If StrComp(eventCtx, m_fileDlgOwnerContextId, vbBinaryCompare) <> 0 Then
+        If Not m_fileDlgContextMissWarned Then
+            m_fileDlgContextMissWarned = True
+            LogSignalLine "[FILE-DIALOG-CTX-MISS] expectedCtx=" & m_fileDlgOwnerContextId & _
+                          " | actualCtx=" & eventCtx
+        End If
+        Exit Sub
+    End If
+
+    Dim p As Object
+    Set p = GetPathObject(json, "params")
+    If p Is Nothing Then
+        LogSignalLine "[FILE-DIALOG-IGNORED] reason=missing-params | ctx=" & eventCtx
+        Exit Sub
+    End If
+
+    m_fileDlgSeen = True
+    m_fileDlgArmed = False
+
+    m_fileDlgMultipleKnown = p.Exists("multiple")
+    If m_fileDlgMultipleKnown Then m_fileDlgMultiple = CBool(p("multiple"))
+
+    m_fileDlgHasElement = False
+    m_fileDlgSharedId = vbNullString
+
+    If p.Exists("element") Then
+        If IsObject(p("element")) Then
+            Dim elementRef As Object
+            Set elementRef = p("element")
+            If Not elementRef Is Nothing Then
+                If elementRef.Exists("sharedId") Then
+                    m_fileDlgSharedId = CStr(elementRef("sharedId"))
+                    m_fileDlgHasElement = (Len(m_fileDlgSharedId) > 0)
+                End If
+            End If
+        End If
+    End If
+
+    LogSignalLine "[FILE-DIALOG-HIT] ctx=" & eventCtx & _
+                  " | hasElement=" & LCase$(CStr(m_fileDlgHasElement)) & _
+                  " | multiple=" & IIf(m_fileDlgMultipleKnown, LCase$(CStr(m_fileDlgMultiple)), "unknown")
 End Sub
 
 Public Function GetIframeContextIdByUrl(ByVal partialUrl As String, Optional ByVal timeoutMs As Long = 5000) As String
@@ -1198,6 +1285,220 @@ Public Function ExecuteSetFilesByXPath(ByVal xpath As String, _
     If m_debugMode Then Debug.Print "BiDi: Action 'set_files' completed."
 End Function
 
+' Short-lived input[type=file] path.
+'
+' PUBLIC CONTRACT
+' ---------------
+' Name: ExecuteSetFileSelectionViaDialog
+'
+' "FileSelection" is intentional terminology. input.setFiles changes the selection state of
+' an HTML file input; it does not itself mean that an application upload has completed.
+' The caller must arm ArmNetworkSignal, ArmContentSignal, and/or ArmVisibilitySignal first;
+' the selected signal(s) describe the application-level completion condition after setFiles.
+'
+' Native picker suppression is Chromium-specific and deliberately narrow:
+'   CDP Page.setInterceptFileChooserDialog(enabled=True, cancel=False)
+' The CDP session is resolved from the SAME BiDi browsing context as triggerXPath and is held
+' for cleanup so iframe/popup contexts do not silently fall back to the main-context session.
+'
+' File-dialog observation and file selection remain WebDriver BiDi:
+'   input.fileDialogOpened -> event.element.sharedId -> input.setFiles
+'
+' The trigger always uses a trusted BiDi pointer action; UseTrustedClick does not change this
+' composite operation. No SPA wait occurs after the trigger click. Final synchronization starts
+' only after input.setFiles succeeds and after the native-picker interceptor is released.
+'
+' RETRY CONTRACT
+' --------------
+' The trigger click and input.setFiles are state-changing and are never replayed internally after
+' an ambiguous outcome. If the final completion wait fails after input.setFiles succeeds, the
+' raised error is prefixed PostSelectionCompletionFailed and explicitly warns that selection may
+' already have started application work; callers must not blindly retry the whole operation.
+Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
+                                                  ByVal filePaths As Variant, _
+                                                  Optional ByVal searchTimeoutMs As Long = 10000, _
+                                                  Optional ByVal fileDialogTimeoutMs As Long = 10000, _
+                                                  Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                                  Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                                  Optional ByVal contextId As String = "") As String
+    ResetLastSyncState
+
+    If Not AnySignalArmed() Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "CompletionSignalRequired: A completion signal is required for the short-lived " & _
+                  "file-input path. Call ArmNetworkSignal, ArmContentSignal, or " & _
+                  "ArmVisibilitySignal first."
+    End If
+
+    On Error GoTo Failed
+
+    Dim targetCtx As String
+    targetCtx = ResolveTargetContext(contextId)
+
+    If Len(m_signalOwnerContextId) = 0 Or _
+       StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "CompletionSignalContextMismatch: The active completion signal does not belong " & _
+                  "to the file-selection context." & vbCrLf & _
+                  "Signal owner: " & m_signalOwnerContextId & vbCrLf & _
+                  "Target: " & targetCtx
+    End If
+
+    ' Never begin another chooser operation while a previous interception may still be active.
+    If m_fileChooserInterceptMayBeActive Then
+        If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                      "ResidualFileChooserInterception: a previous native file-chooser " & _
+                      "interception could not be confirmed disabled. Call Shutdown or " & _
+                      "reconnect before starting another file-selection operation."
+        End If
+    End If
+
+    Dim paths As Variant
+    paths = NormalizeFilePaths(filePaths)
+
+    Dim pathCount As Long
+    pathCount = VariantArrayCount(paths)
+    If pathCount = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "NoFilesSupplied: No file paths were supplied for file selection."
+    End If
+
+    Dim vDialogTimeout As Long
+    Dim vMinStable As Long
+    Dim vMaxTimeout As Long
+    vDialogTimeout = SanitizeMs(fileDialogTimeoutMs, "fileDialogTimeoutMs", 10000)
+    vMinStable = SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS)
+    vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
+
+    ' Subscribe before enabling interception and before the trigger click. Subscription remains
+    ' session-scoped; the one-shot local arm below decides which event this operation consumes.
+    Me.ExecuteSessionSubscribe Array("input.fileDialogOpened"), , True
+
+    ' Resolve the trigger before the local capture arm. A slow XPath lookup must not create a
+    ' window in which an unrelated chooser can satisfy this operation.
+    Dim triggerSharedId As String
+    triggerSharedId = ResolveXPathOrThrow(triggerXPath, targetCtx, searchTimeoutMs, _
+                                          "ExecuteSetFileSelectionViaDialog")
+
+    ' Dispatch already-buffered events while the local arm is still down. This is not a formal
+    ' queue watermark, but it prevents ordinary stale fileDialogOpened events from being accepted.
+    ProcessRecorderQueue
+
+    ' Resolve a fresh CDP session for the SAME BiDi context as the trigger, then hold that session
+    ' id for cleanup. This matters for out-of-process frames and non-main top-level contexts.
+    Dim fileChooserCdpSessionId As String
+    fileChooserCdpSessionId = GetCdpSessionIdForContext(targetCtx)
+    BeginNativeFileChooserInterception targetCtx, fileChooserCdpSessionId
+
+    ArmFileDialogCapture targetCtx
+
+    Dim clickArgs As Collection
+    Set clickArgs = NewElementArgs(triggerSharedId)
+
+    ' File-picker triggers require real user activation. PerformTrustedClick uses BiDi
+    ' input.performActions and does not replay an ambiguous click.
+    Dim clickResult As String
+    clickResult = PerformTrustedClick(targetCtx, clickArgs, vMaxTimeout)
+
+    If Not WaitForFileDialogCapture(vDialogTimeout) Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "FileDialogTimeout: input.fileDialogOpened was not observed within " & _
+                  vDialogTimeout & "ms."
+    End If
+
+    If Not m_fileDlgMultipleKnown Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "FileDialogMissingMultiple: input.fileDialogOpened did not include the " & _
+                  "required 'multiple' field."
+    End If
+
+    If Not m_fileDlgHasElement Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "FileDialogHasNoInputElement: input.fileDialogOpened had no HTML " & _
+                  "file-input element. Elementless picker paths are outside this API contract."
+    End If
+
+    If pathCount > 1 And Not m_fileDlgMultiple Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "MultipleFilesNotAllowed: the opened file input does not allow multiple files."
+    End If
+
+    Dim capturedSharedId As String
+    capturedSharedId = m_fileDlgSharedId
+
+    ' Send input.setFiles first, but deliberately postpone the required application-completion wait.
+    ' The interceptor is needed only through the chooser/setFiles hand-off.
+    Dim setFilesResult As String
+    setFilesResult = PerformSetFiles(targetCtx, capturedSharedId, paths, _
+                                     vMaxTimeout, False, vMinStable)
+
+    Dim selectionApplied As Boolean
+    selectionApplied = True
+
+    ResetFileDialogCaptureState
+
+    ' input.setFiles is already state-changing, so cleanup failure is surfaced as NON-RETRYABLE.
+    ' Keep the tracked residual state if both the held session and a fresh session fail to disable.
+    If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
+        Me.DisarmSignal
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "PostSelectionInterceptionCleanupFailed: input.setFiles succeeded, but native " & _
+                  "file-chooser interception could not be confirmed disabled. The selection may " & _
+                  "already have triggered application work; do not retry the whole operation. " & _
+                  "Call Shutdown or reconnect before further file-chooser use."
+    End If
+
+    RunRequiredSpaSync targetCtx, vMinStable, vMaxTimeout
+    ExecuteSetFileSelectionViaDialog = setFilesResult
+
+    If m_debugMode Then Debug.Print "BiDi: Action 'set_file_selection_via_dialog' completed."
+    Exit Function
+
+Failed:
+    Dim primaryErrNum As Long
+    Dim primaryErrSrc As String
+    Dim primaryErrDesc As String
+    primaryErrNum = Err.Number
+    primaryErrSrc = Err.source
+    primaryErrDesc = Err.description
+
+    ' Abnormal-flow cleanup must never replace the primary error. The tracked interceptor state
+    ' survives a failed disable so Shutdown / reconnect can retry it.
+    Dim cleanupConfirmed As Boolean
+    On Error Resume Next
+    ResetFileDialogCaptureState
+    cleanupConfirmed = ReleaseTrackedFileChooserInterceptionBestEffort(True)
+    Me.DisarmSignal
+    On Error GoTo 0
+
+    If primaryErrNum = 0 Then primaryErrNum = ERR_ACTION_FAILED
+
+    If selectionApplied And InStr(1, primaryErrDesc, "PostSelectionInterceptionCleanupFailed:", vbBinaryCompare) = 0 Then
+        Dim underlyingSrc As String
+        underlyingSrc = primaryErrSrc
+        If Len(underlyingSrc) = 0 Then underlyingSrc = "(unknown)"
+
+        primaryErrSrc = "BiDi:ExecuteSetFileSelectionViaDialog"
+        primaryErrDesc = _
+            "PostSelectionCompletionFailed: input.setFiles succeeded before the completion " & _
+            "wait failed. File selection may already have triggered application work; do not " & _
+            "blindly retry the whole file-selection operation." & vbCrLf & _
+            "Underlying source: " & underlyingSrc & vbCrLf & _
+            "Underlying error: " & primaryErrDesc
+    ElseIf Len(primaryErrSrc) = 0 Then
+        primaryErrSrc = "BiDi:ExecuteSetFileSelectionViaDialog"
+    End If
+
+    If m_fileChooserInterceptMayBeActive And Not cleanupConfirmed Then
+        primaryErrDesc = primaryErrDesc & vbCrLf & _
+            "InterceptionCleanupPending: native file-chooser interception may still be active. " & _
+            "Call Shutdown or reconnect before further file-chooser use."
+    End If
+
+    Err.Raise primaryErrNum, primaryErrSrc, primaryErrDesc
+End Function
+
 Private Function NormalizeFilePaths(ByVal value As Variant) As Variant
     Dim source As Variant
     If IsArray(value) Then
@@ -1206,9 +1507,16 @@ Private Function NormalizeFilePaths(ByVal value As Variant) As Variant
         source = Split(Replace(CStr(value), vbCrLf, vbLf), vbLf)
     End If
 
+    Dim srcLb As Long
+    Dim srcUb As Long
+    If Not TryGetVariantArrayBounds(source, srcLb, srcUb) Then
+        NormalizeFilePaths = Array()
+        Exit Function
+    End If
+
     Dim out() As String, count As Long, i As Long
-    ReDim out(0 To UBound(source) - LBound(source))
-    For i = LBound(source) To UBound(source)
+    ReDim out(0 To srcUb - srcLb)
+    For i = srcLb To srcUb
         Dim item As String: item = Trim$(CStr(source(i)))
         If Len(item) > 0 Then out(count) = item: count = count + 1
     Next i
@@ -1220,6 +1528,315 @@ Private Function NormalizeFilePaths(ByVal value As Variant) As Variant
         NormalizeFilePaths = out
     End If
 End Function
+
+Private Function TryGetVariantArrayBounds(ByVal values As Variant, _
+                                          ByRef lb As Long, _
+                                          ByRef ub As Long) As Boolean
+    If Not IsArray(values) Then Exit Function
+
+    On Error GoTo NoBounds
+    lb = LBound(values)
+    ub = UBound(values)
+    TryGetVariantArrayBounds = (ub >= lb)
+    Exit Function
+
+NoBounds:
+    Err.Clear
+End Function
+
+Private Function VariantArrayCount(ByVal values As Variant) As Long
+    Dim lb As Long
+    Dim ub As Long
+    If TryGetVariantArrayBounds(values, lb, ub) Then
+        VariantArrayCount = ub - lb + 1
+    End If
+End Function
+
+Private Sub ArmFileDialogCapture(ByVal contextId As String)
+    ResetFileDialogCaptureState
+    m_fileDlgOwnerContextId = contextId
+    m_fileDlgArmed = True
+    LogSignalLine "[FILE-DIALOG-ARM] ctx=" & contextId
+End Sub
+
+Private Function WaitForFileDialogCapture(ByVal timeoutMs As Long) As Boolean
+    Dim startTick As Currency
+    startTick = socket_.NowTicks()
+
+    Do
+        ProcessRecorderQueue
+
+        If m_fileDlgSeen Then
+            WaitForFileDialogCapture = True
+            Exit Function
+        End If
+
+        If IsTimeout(startTick, CDbl(timeoutMs)) Then Exit Do
+        WaitHeartbeat 50
+    Loop
+End Function
+
+Private Sub ResetFileDialogCaptureState()
+    m_fileDlgArmed = False
+    m_fileDlgSeen = False
+    m_fileDlgOwnerContextId = vbNullString
+    m_fileDlgHasElement = False
+    m_fileDlgSharedId = vbNullString
+    m_fileDlgMultipleKnown = False
+    m_fileDlgMultiple = False
+    m_fileDlgContextMissWarned = False
+End Sub
+
+Private Function GetCdpSessionIdForContext(ByVal contextId As String) As String
+    Dim targetCtx As String
+    targetCtx = ResolveTargetContext(contextId)
+
+    Dim params As New Dictionary
+    params.Add "context", targetCtx
+
+    ' Always resolve this operation's session fresh. A cached main-context CDP session may be
+    ' wrong for an OOPIF/popup, or stale after navigation performed outside this wrapper.
+    Dim raw As String
+    raw = ExecuteBiDiCommand("goog:cdp.getSession", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=True, _
+                             allowContextRetarget:=False)
+
+    Dim json As Object
+    Set json = ValidateProtocolResponse(raw, "goog:cdp.getSession")
+
+    Dim sessionId As String
+    sessionId = GetPathString(json, "result.session")
+    If Len(sessionId) = 0 Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "NativeFileChooserInterceptionUnavailable: goog:cdp.getSession returned no " & _
+                  "CDP session for context " & targetCtx & "."
+    End If
+
+    ' Keep the existing main-context cache coherent for unrelated CDP features.
+    If StrComp(targetCtx, m_mainContextId, vbBinaryCompare) = 0 Then
+        m_cdpSessionId = sessionId
+        m_consecutiveCdpFailures = 0
+    End If
+
+    GetCdpSessionIdForContext = sessionId
+End Function
+
+Private Sub BeginNativeFileChooserInterception(ByVal contextId As String, _
+                                               ByVal cdpSessionId As String)
+    ' Mark MAY-BE-ACTIVE before the state-changing CDP command. If the command reaches Chromium
+    ' but its response is lost, cleanup still knows that it must send an explicit disable.
+    m_fileChooserInterceptMayBeActive = True
+    m_fileChooserInterceptSessionId = cdpSessionId
+    m_fileChooserInterceptContextId = contextId
+
+    SetNativeFileChooserInterceptionOnSession True, cdpSessionId
+End Sub
+
+Private Sub SetNativeFileChooserInterceptionOnSession(ByVal enabled As Boolean, _
+                                                       ByVal cdpSessionId As String, _
+                                                       Optional ByVal logSuccess As Boolean = True)
+    If Len(cdpSessionId) = 0 Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "NativeFileChooserInterceptionUnavailable: CDP session id is empty."
+    End If
+
+    Dim cdpParams As New Dictionary
+    cdpParams.Add "enabled", enabled
+
+    ' cancel=False is the experimentally verified coexistence mode:
+    ' suppress the native picker UI without synthesizing a site-visible cancel.
+    cdpParams.Add "cancel", False
+
+    Dim res As Object
+    Set res = ExecuteCDPCommand("Page.setInterceptFileChooserDialog", cdpParams, _
+                                True, True, cdpSessionId, enabled)
+
+    If res Is Nothing Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "NativeFileChooserInterceptionUnavailable: CDP " & _
+                  "Page.setInterceptFileChooserDialog returned no result object."
+    End If
+
+    If Not CBool(res("Ok")) Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                  "NativeFileChooserInterceptionUnavailable: CDP " & _
+                  "Page.setInterceptFileChooserDialog failed: " & CStr(res("Error"))
+    End If
+
+    If m_debugMode And logSuccess Then
+        Debug.Print "BiDi: Native file chooser interception " & _
+                    IIf(enabled, "ENABLED", "DISABLED") & _
+                    " (cancel=False, session=" & Left$(cdpSessionId, 16) & "...)."
+    End If
+End Sub
+
+Private Sub ClearTrackedFileChooserInterception()
+    m_fileChooserInterceptMayBeActive = False
+    m_fileChooserInterceptSessionId = vbNullString
+    m_fileChooserInterceptContextId = vbNullString
+End Sub
+
+Private Function TryDisableFileChooserInterceptionOnSession(ByVal cdpSessionId As String, _
+                                                             Optional ByVal logSuccess As Boolean = True) As Boolean
+    If Len(cdpSessionId) = 0 Then Exit Function
+
+    On Error GoTo Failed
+    SetNativeFileChooserInterceptionOnSession False, cdpSessionId, logSuccess
+    TryDisableFileChooserInterceptionOnSession = True
+    Exit Function
+
+Failed:
+    If m_debugMode Then
+        Debug.Print "BiDi Warning: failed to disable native file chooser interception. " & _
+                    Err.description
+    End If
+    Err.Clear
+End Function
+
+Private Function ReleaseTrackedFileChooserInterceptionBestEffort( _
+    Optional ByVal tryFreshSession As Boolean = True) As Boolean
+
+    If Not m_fileChooserInterceptMayBeActive Then
+        ReleaseTrackedFileChooserInterceptionBestEffort = True
+        Exit Function
+    End If
+
+    Dim oldSession As String
+    oldSession = m_fileChooserInterceptSessionId
+
+    If Len(oldSession) > 0 Then
+        If TryDisableFileChooserInterceptionOnSession(oldSession, True) Then
+            ClearTrackedFileChooserInterception
+            ReleaseTrackedFileChooserInterceptionBestEffort = True
+            Exit Function
+        End If
+    End If
+
+    If tryFreshSession And Len(m_fileChooserInterceptContextId) > 0 Then
+        On Error Resume Next
+        Err.Clear
+        Dim freshSession As String
+        freshSession = GetCdpSessionIdForContext(m_fileChooserInterceptContextId)
+        Dim freshErr As Long
+        freshErr = Err.Number
+        Err.Clear
+        On Error GoTo 0
+
+        If freshErr = 0 And Len(freshSession) > 0 Then
+            If StrComp(freshSession, oldSession, vbBinaryCompare) <> 0 Or Len(oldSession) = 0 Then
+                If TryDisableFileChooserInterceptionOnSession(freshSession, True) Then
+                    ClearTrackedFileChooserInterception
+                    ReleaseTrackedFileChooserInterceptionBestEffort = True
+                    Exit Function
+                End If
+            End If
+        End If
+    End If
+
+    ReleaseTrackedFileChooserInterceptionBestEffort = False
+End Function
+
+Private Sub RecoverResidualFileChooserInterceptionOnConnectBestEffort()
+    ' This is the hard-reset insurance path. A fresh VBA object has no memory of an earlier
+    ' interceptor, so on Chromium we explicitly send disabled=False-equivalent state (enabled=False)
+    ' to every current browsing-context CDP session once at ConnectTo. Firefox/other BiDi
+    ' implementations that do not support goog:cdp are silently left untouched.
+    On Error GoTo Done
+
+    Dim params As New Dictionary
+    Dim raw As String
+    raw = ExecuteBiDiCommand("browsingContext.getTree", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=True, _
+                             allowContextRetarget:=False)
+
+    Dim tree As Object
+    Set tree = ValidateProtocolResponse(raw, "browsingContext.getTree")
+
+    Dim roots As Collection
+    Set roots = GetPathObject(tree, "result.contexts")
+    If roots Is Nothing Then GoTo Done
+    If roots.count = 0 Then GoTo Done
+
+    Dim contexts As New Collection
+    CollectContextIdsForCleanup roots, contexts
+    If contexts.count = 0 Then GoTo Done
+
+    Dim seenSessions As New Dictionary
+    Dim i As Long
+    Dim ctx As String
+    Dim sessionId As String
+    Dim chromiumDetected As Boolean
+    Dim allDisabled As Boolean
+    allDisabled = True
+
+    For i = 1 To contexts.count
+        ctx = CStr(contexts(i))
+        sessionId = TryGetCdpSessionIdForCleanup(ctx)
+
+        If Len(sessionId) = 0 Then
+            ' If the first probe cannot obtain goog:cdp, treat this as a non-Chromium browser.
+            If Not chromiumDetected Then GoTo Done
+        Else
+            chromiumDetected = True
+            If Not seenSessions.Exists(sessionId) Then
+                seenSessions.Add sessionId, True
+                If Not TryDisableFileChooserInterceptionOnSession(sessionId, False) Then
+                    allDisabled = False
+                    If Not m_fileChooserInterceptMayBeActive Then
+                        m_fileChooserInterceptMayBeActive = True
+                        m_fileChooserInterceptSessionId = sessionId
+                        m_fileChooserInterceptContextId = ctx
+                    End If
+                    If m_debugMode Then
+                        Debug.Print "BiDi Warning: ConnectTo could not confirm native file chooser " & _
+                                    "interception cleanup for context " & Left$(ctx, 16) & "..."
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    If chromiumDetected And allDisabled Then
+        ClearTrackedFileChooserInterception
+        If m_debugMode Then
+            Debug.Print "BiDi: Native file chooser residual-state cleanup completed on ConnectTo."
+        End If
+    ElseIf chromiumDetected And Not allDisabled Then
+        If m_debugMode Then
+            Debug.Print "BiDi Warning: native file chooser residual-state cleanup remains pending."
+        End If
+    End If
+
+Done:
+    Err.Clear
+End Sub
+
+Private Function TryGetCdpSessionIdForCleanup(ByVal contextId As String) As String
+    On Error GoTo Failed
+    TryGetCdpSessionIdForCleanup = GetCdpSessionIdForContext(contextId)
+    Exit Function
+Failed:
+    Err.Clear
+    TryGetCdpSessionIdForCleanup = vbNullString
+End Function
+
+Private Sub CollectContextIdsForCleanup(ByVal nodes As Collection, ByRef output As Collection)
+    Dim node As Variant
+    For Each node In nodes
+        If IsObject(node) Then
+            If node.Exists("context") Then output.Add CStr(node("context"))
+            If node.Exists("children") Then
+                If IsObject(node("children")) Then
+                    If Not node("children") Is Nothing Then
+                        CollectContextIdsForCleanup node("children"), output
+                    End If
+                End If
+            End If
+        End If
+    Next node
+End Sub
 
 Private Function PerformSetFiles(ByVal contextId As String, _
                                  ByVal sharedId As String, _
@@ -1841,6 +2458,7 @@ Public Sub ClearState()
     
     ' Clear local completion flags because page/connection loss destroys browser observers.
     ResetSignalState
+    ResetFileDialogCaptureState
 
     m_lastHudKey = ""
     m_lastHudCtx = ""
@@ -1868,6 +2486,7 @@ Private Sub ResetSessionBoundaryState()
     m_shadowUnlockerRegistered = False
     m_shadowUnlockerScriptId = vbNullString
     ResetLastSyncState
+    ResetFileDialogCaptureState
 
     m_unresolvedJsonThisWait = False
     m_unresolvedJsonFirstKeyThisWait = ""
@@ -3357,7 +3976,9 @@ End Function
 Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
                                    ByVal cdpParams As Dictionary, _
                                    Optional ByVal useSession As Boolean = True, _
-                                   Optional ByVal Silent As Boolean = False) As Object
+                                   Optional ByVal Silent As Boolean = False, _
+                                   Optional ByVal sessionIdOverride As String = "", _
+                                   Optional ByVal countFailure As Boolean = True) As Object
     Dim res As New Dictionary
     res.Add "Ok", False: res.Add "Json", "": res.Add "Error", ""
 
@@ -3366,7 +3987,7 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
         Set ExecuteCDPCommand = res: Exit Function
     End If
 
-    If m_consecutiveCdpFailures >= MAX_CONSECUTIVE_CDP_FAILURES Then
+    If countFailure And m_consecutiveCdpFailures >= MAX_CONSECUTIVE_CDP_FAILURES Then
         Call PerformFatalReset
         res("Error") = "Fatal: CDP instability. Context state has been cleared."
         Set ExecuteCDPCommand = res
@@ -3378,11 +3999,17 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
     params.Add "params", EnsureDictionary(cdpParams)
 
     If useSession Then
-        Dim sessionId As String: sessionId = GetCdpSessionId()
+        Dim sessionId As String
+        If Len(sessionIdOverride) > 0 Then
+            sessionId = sessionIdOverride
+        Else
+            sessionId = GetCdpSessionId()
+        End If
+
         If sessionId <> "" Then
             params.Add "session", sessionId
         Else
-            m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
+            If countFailure Then m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
             res("Error") = "CDP session unavailable."
             Set ExecuteCDPCommand = res: Exit Function
         End If
@@ -3397,16 +4024,18 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
     
     If cdpCallErr <> 0 Then
         res("Error") = "Socket Error: " & cdpCallDesc
-        m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
+        If countFailure Then m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
         Set ExecuteCDPCommand = res: Exit Function
     End If
 
     If InStr(strRes, """error"":") > 0 Then
         res("Error") = "CDP Error: " & strRes: res("Json") = strRes
-        m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
+        If countFailure Then m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
         socket_.LogEvent "CDP Command FAILED: " & cdpMethod, strRes, "[CDP:ERR]"
     Else
-        res("Ok") = True: res("Json") = strRes: m_consecutiveCdpFailures = 0
+        res("Ok") = True
+        res("Json") = strRes
+        If countFailure Then m_consecutiveCdpFailures = 0
         If m_debugMode And Not Silent Then
             socket_.LogEvent "CDP Command OK: " & cdpMethod, strRes, "[CDP:OK]"
         End If
@@ -4706,6 +5335,17 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     ' Shutdown is best-effort from this point; cleanup must continue even after detach or
     ' close failure.
     On Error Resume Next
+
+    ' File-chooser interception is browser-side state and must be explicitly released BEFORE
+    ' detaching or force-closing the transport. Keep a loud warning if confirmation fails.
+    If m_fileChooserInterceptMayBeActive Then
+        If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
+            If m_debugMode Then
+                Debug.Print "BiDi CRITICAL: Shutdown could not confirm native file chooser " & _
+                            "interception cleanup. Reconnect before further chooser use."
+            End If
+        End If
+    End If
     
     ' ForceClose skips acknowledged CDP detach because teardown should not spend a receive
     ' timeout on a suspended browser. The tunnel dies with the BiDi socket. Graceful callers

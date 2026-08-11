@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.5 / MIT License / Copyright (c) hanamichi77777
+' Version 3.6 / MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
@@ -18,6 +18,8 @@ Option Explicit
 '
 ' Preserve these invariants:
 '   - Accept only local unencrypted ws:// endpoints.
+'   - Never send an Origin header. Firefox RemoteAgent rejects a non-empty
+'     Origin with HTTP 400; Chromium drivers ignore it either way.
 '   - One SendAndReceive call owns response correlation; only guarded recovery backoff may pump Office messages.
 '   - m_isReading and m_isRecovering are released only by structured cleanup.
 '   - IDs [1..99] are system traffic; normal commands use [100..ID_MAX].
@@ -178,7 +180,7 @@ Private Declare PtrSafe Function WsApi_BCryptDestroyHash Lib "bcrypt.dll" Alias 
 
 
 Private Type WsWSADATA
-    version As Integer
+    Version As Integer
     highVersion As Integer
     description(0 To 256) As Byte
     systemStatus(0 To 128) As Byte
@@ -277,9 +279,10 @@ Private Const WS_BCRYPT_SHA1_ALGORITHM As String = "SHA1"
 Private Const WS_BCRYPT_OBJECT_LENGTH As String = "ObjectLength"
 Private Const WS_BCRYPT_HASH_LENGTH As String = "HashDigestLength"
 
-Private Const WS_HANDSHAKE_ORIGIN_SCHEME As String = "http://"
-Private Const WS_HANDSHAKE_USER_AGENT As String = _
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+Private Const BIDI_SOCKET_VERSION As String = "3.6"
+
+Private Const WS_HANDSHAKE_USER_AGENT As String = "SeleniumVBA-BiDi"
+Private Const WS_HANDSHAKE_STATUS_ECHO_MAX As Long = 120
 
 
 Private Enum WsWinsockTransportState
@@ -314,7 +317,6 @@ Private m_ws_handshakeTimeoutMs As Long
 
 Private m_ws_handshakeClientKey As String
 Private m_ws_expectedHandshakeAccept As String
-Private m_ws_handshakeOrigin As String
 Private m_ws_handshakeUserAgent As String
 Private m_ws_handshakeValidationError As String
 Private m_ws_LastErrorCode As Long
@@ -410,6 +412,12 @@ Private Sub Class_Terminate()
     ResetApplicationHeartbeatState
     On Error GoTo 0
 End Sub
+
+' Mirrors BiDiCommandWrapper.Version. A mismatch between the two classes means the
+' pair was imported from different releases.
+Public Property Get Version() As String
+    Version = BIDI_SOCKET_VERSION
+End Property
 
 ' Logical connectivity requires agreement between the communicator state machine and
 ' the native WebSocket. StateError must never surface as connected merely because a stale
@@ -2557,7 +2565,6 @@ Private Sub WsBeginHandshake()
         "Connection: Upgrade" & vbCrLf & _
         "Sec-WebSocket-Key: " & m_ws_handshakeClientKey & vbCrLf & _
         "Sec-WebSocket-Version: 13" & vbCrLf & _
-        "Origin: " & m_ws_handshakeOrigin & vbCrLf & _
         "User-Agent: " & m_ws_handshakeUserAgent & vbCrLf & vbCrLf
 
     Dim requestBytes() As Byte
@@ -2684,7 +2691,9 @@ Private Function WsValidateHandshakeHeader(ByVal headerText As String) As Boolea
     End If
 
     If Not statusValid Then
-        m_ws_handshakeValidationError = "HTTP status is not 101"
+        m_ws_handshakeValidationError = _
+            "HTTP status is not 101. Peer status line: " & _
+            Left$(firstLine, WS_HANDSHAKE_STATUS_ECHO_MAX)
     ElseIf Not hasUpgrade Then
         m_ws_handshakeValidationError = _
             "Upgrade header is not websocket"
@@ -2703,12 +2712,6 @@ Private Function WsValidateHandshakeHeader(ByVal headerText As String) As Boolea
 End Function
 
 Private Sub WsPrepareHandshakeHeaders()
-    If m_ws_port = 80 Then
-        m_ws_handshakeOrigin = WS_HANDSHAKE_ORIGIN_SCHEME & m_ws_host
-    Else
-        m_ws_handshakeOrigin = WS_HANDSHAKE_ORIGIN_SCHEME & m_ws_hostHeader
-    End If
-
     m_ws_handshakeUserAgent = WS_HANDSHAKE_USER_AGENT
 End Sub
 
@@ -3769,7 +3772,6 @@ Private Sub WsResetRuntimeState()
     m_ws_clientPingOutstandingSequence = 0
     m_ws_handshakeClientKey = vbNullString
     m_ws_expectedHandshakeAccept = vbNullString
-    m_ws_handshakeOrigin = vbNullString
     m_ws_handshakeUserAgent = vbNullString
     m_ws_handshakeValidationError = vbNullString
 

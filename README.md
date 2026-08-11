@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v3.5
+# WebDriver BiDi for SeleniumVBA v3.6
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
@@ -162,4 +162,18 @@ This procedure demonstrates `ArmContentSignal` for cases where a response settle
 * **Fail-fast configuration:** A missing target at arm time raises immediately, exposing a mistyped or obsolete XPath instead of silently creating a meaningless wait.
 * **Noise filtering:** Known background telemetry is ignored for idle judgment so unrelated traffic does not prevent the content-gated wait from settling.
 * **What to customize:** Choose a stable existing subtree whose rewrite genuinely marks business completion. Avoid broad ancestors that also mutate for animations, clocks, advertisements, or unrelated telemetry.
+
+### 11. Main11: Short-Lived File Input Selection with an Application-Level Completion Gate
+This procedure demonstrates the v3.6 file-selection path for applications that create an `input[type=file]` only when the user clicks a visible trigger and remove that input immediately after opening the file chooser.
+
+* **Self-contained sample file:** SeleniumVBA creates `sample.txt` at runtime with `SaveStringToFile`, so the example does not depend on a separately prepared local test file.
+* **HTTPS test fixture:** The sample uses the project's public GitHub Pages file-dialog probe rather than a local `file://` fixture. The page provides a reproducible top-level HTTPS environment for the short-lived file-input pattern.
+* **Trigger element instead of file-input XPath:** `ExecuteSetFileSelectionViaDialog` receives the XPath of the visible file-selection button. The underlying `input[type=file]` does not need to remain discoverable in the DOM; the page creates it, calls `input.click()`, and removes it immediately.
+* **BiDi-based file selection:** The wrapper captures `input.fileDialogOpened`, obtains the event's element SharedReference, and uses `input.setFiles` to apply the requested local file.
+* **Application completion is separate from file selection:** A successful `input.setFiles` command confirms browser-side file selection, but it does not prove that the target application has accepted or finished processing that selection. The sample therefore arms an explicit completion signal before starting the composite action.
+* **Arm before act:** The test page exposes `#done` only after its file-input `change` handler runs, so `ArmVisibilitySignal "//*[@id='done']"` is armed before `ExecuteSetFileSelectionViaDialog`. On a real application, replace this with the network, content, or visibility condition that genuinely represents application completion.
+* **The trigger click does not consume the completion signal:** Opening the file dialog is only an intermediate step of the composite operation. The wrapper therefore does not perform the normal SPA completion synchronization after the trigger click; the armed one-shot signal is preserved until after `input.setFiles`, when the application-side result can actually occur.
+* **Discovery Log as the adaptation tool:** When applying this pattern to an unknown site, use the Discovery Log to observe what happens after file selection and identify a reliable `ArmNetworkSignal`, `ArmContentSignal`, or `ArmVisibilitySignal`. Prefer a signal causally tied to the selected file over broad background activity or arbitrary delays.
+* **Chromium-specific native-picker suppression:** On Edge/Chrome, CDP is used internally only to suppress the native file chooser without intentionally generating a cancel operation. WebDriver BiDi remains responsible for `input.fileDialogOpened` and `input.setFiles`.
+* **What to customize:** Replace the probe URL, trigger XPath, and completion signal when adapting the sample to a real application. The key rule is that the completion condition should represent application acceptance or completion, not merely successful execution of `input.setFiles`.
 ---

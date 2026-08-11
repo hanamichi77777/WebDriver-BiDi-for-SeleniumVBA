@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.5 / MIT License / Copyright (c) hanamichi77777
+' Version 3.6 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -461,3 +461,95 @@ Public Sub Main10()
 
     End With
 End Sub
+' Main11 - File selection with a short-lived input[type=file]
+'
+' The sample file is created by SeleniumVBA, so this example
+' does not require any external local file.
+'
+' Test page:
+'   GitHub Pages / docs/file-dialog-probe/index.html
+'
+' The page creates input[type=file] when the button is clicked,
+' calls input.click(), and immediately removes the input.
+
+Public Sub Main11()
+
+    Dim driver As New WebDriver
+    Dim caps As WebCapabilities
+    Dim bidi As BiDiCommandWrapper
+    
+    Dim targetUrl As String
+    Dim filePath As String
+    Dim result As String
+    
+    targetUrl = "https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/file-dialog-probe/"
+    
+    With driver
+    
+        .StartEdge
+    
+        ' Create the file used by this example.
+        .SaveStringToFile "Hello World", ".\sample.txt"
+    
+        ' input.setFiles needs the actual local file path.
+        filePath = .ResolvePath(".\sample.txt", True)
+    
+        Set caps = .CreateCapabilities
+        caps.EnableBiDiMode
+    
+        .OpenBrowser caps
+    
+        Set bidi = New BiDiCommandWrapper
+        bidi.ConnectTo driver.GetWebSocketUrl
+    
+        bidi.StartDiscoveryLog
+    
+        bidi.ExecuteNavigateAndGetStatus targetUrl
+    
+        ' ------------------------------------------------------------
+        ' Completion signal.
+        '
+        ' On the test page, #done is initially hidden and becomes
+        ' visible only after the short-lived file input fires change.
+        '
+        ' The waiting strategy can be replaced as appropriate when
+        ' adapting this example to an actual application.
+        ' ------------------------------------------------------------
+        bidi.ArmVisibilitySignal "//*[@id='done']"
+        ' ------------------------------------------------------------
+        ' IMPORTANT:
+        '
+        ' This XPath identifies the visible trigger button.
+        ' It does NOT identify input[type=file].
+        '
+        ' The input does not exist until this button is clicked and
+        ' is removed immediately after input.click().
+        ' ------------------------------------------------------------
+        result = bidi.ExecuteSetFileSelectionViaDialog("//*[@id='short-lived']", filePath)
+    
+        Debug.Print "input.setFiles response:"
+        Debug.Print result
+    
+        Debug.Print "Selected file:"
+        Debug.Print bidi.ExecuteGetTextByXPath("//*[@id='file-name']")
+    
+        Debug.Print "changeCount:"
+        Debug.Print bidi.ExecuteGetTextByXPath("//*[@id='change-count']")
+    
+        Debug.Print "cancelCount:"
+        Debug.Print bidi.ExecuteGetTextByXPath("//*[@id='cancel-count']")
+    
+        ' Saves discovery_log.txt in the same folder as
+        ' the current VBA host file.
+        bidi.StopAndSaveDiscoveryLog
+    
+        bidi.Shutdown
+        Set bidi = Nothing
+    
+        .CloseBrowser
+        .Shutdown
+    
+    End With
+
+End Sub
+
