@@ -10,7 +10,7 @@ Attribute VB_Exposed = True
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.6 / MIT License / Copyright (c) hanamichi77777
+' MIT License / Copyright (c) hanamichi77777
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -75,7 +75,7 @@ Private m_isProcessingQueue As Boolean
 ' classify [BLOCK] by matching the URL against the installed block patterns.
 Private m_blockingPatterns As Collection
 
-Private Const BIDI_WRAPPER_VERSION As String = "3.6"
+Private Const BIDI_WRAPPER_VERSION As String = "3.7"
 Private Const DEFAULT_IDLE_STABLE_MS As Long = 500
 Private Const DEFAULT_IDLE_TIMEOUT_MS As Long = 10000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
@@ -1381,15 +1381,23 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     triggerSharedId = ResolveXPathOrThrow(triggerXPath, targetCtx, searchTimeoutMs, _
                                           "ExecuteSetFileSelectionViaDialog")
 
-    ' Dispatch already-buffered events while the local arm is still down. This is not a formal
-    ' queue watermark, but it prevents ordinary stale fileDialogOpened events from being accepted.
-    ProcessRecorderQueue
-
     ' Resolve a fresh CDP session for the SAME BiDi context as the trigger, then hold that session
     ' id for cleanup. This matters for out-of-process frames and non-main top-level contexts.
     Dim fileChooserCdpSessionId As String
     fileChooserCdpSessionId = GetCdpSessionIdForContext(targetCtx)
     BeginNativeFileChooserInterception targetCtx, fileChooserCdpSessionId
+
+    ' Dispatch already-buffered events immediately before the local arm. CDP resolution and
+    ' interception above can perform command round-trips that preserve asynchronous events in
+    ' the socket FIFO. Process them while the local arm is still down so ordinary stale
+    ' fileDialogOpened events are rejected.
+    ' This deliberately remains a best-effort drain rather than introducing a queue watermark.
+    ProcessRecorderQueue
+
+    ' DroppedEventsCount is session-cumulative (and survives recovery reconnects), so diagnostics
+    ' must compare against the value at this operation's arm boundary rather than report an absolute.
+    Dim droppedEventsAtArm As Long
+    droppedEventsAtArm = socket_.DroppedEventsCount
 
     ArmFileDialogCapture targetCtx
 
@@ -1402,9 +1410,14 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     clickResult = PerformTrustedClick(targetCtx, clickArgs, vMaxTimeout)
 
     If Not WaitForFileDialogCapture(vDialogTimeout) Then
+        Dim droppedEventsDuringWait As Long
+        droppedEventsDuringWait = socket_.DroppedEventsCount - droppedEventsAtArm
+        If droppedEventsDuringWait < 0 Then droppedEventsDuringWait = 0
+
         Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
                   "FileDialogTimeout: input.fileDialogOpened was not observed within " & _
-                  vDialogTimeout & "ms."
+                  vDialogTimeout & "ms. AsyncEventsDroppedSinceArm=" & _
+                  CStr(droppedEventsDuringWait) & "."
     End If
 
     If Not m_fileDlgMultipleKnown Then
