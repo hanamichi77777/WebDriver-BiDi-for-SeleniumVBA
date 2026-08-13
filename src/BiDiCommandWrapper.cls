@@ -11,6 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
+Private Const BIDI_WRAPPER_VERSION As String = "3.8"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -75,7 +76,6 @@ Private m_isProcessingQueue As Boolean
 ' classify [BLOCK] by matching the URL against the installed block patterns.
 Private m_blockingPatterns As Collection
 
-Private Const BIDI_WRAPPER_VERSION As String = "3.7"
 Private Const DEFAULT_IDLE_STABLE_MS As Long = 500
 Private Const DEFAULT_IDLE_TIMEOUT_MS As Long = 10000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
@@ -1293,8 +1293,17 @@ End Function
 '
 ' "FileSelection" is intentional terminology. input.setFiles changes the selection state of
 ' an HTML file input; it does not itself mean that an application upload has completed.
-' The caller must arm ArmNetworkSignal, ArmContentSignal, and/or ArmVisibilitySignal first;
+' The caller SHOULD arm ArmNetworkSignal, ArmContentSignal, and/or ArmVisibilitySignal first;
 ' the selected signal(s) describe the application-level completion condition after setFiles.
+'
+' Arming is deliberately NOT enforced. Without an armed signal the final wait falls back to
+' idle-only consensus, which cannot distinguish "the application finished" from "the application
+' ignored the change" -- both are quiet. That weakness is reported rather than pre-empted:
+' [SPA-WAIT-BEGIN]/[SPA-WAIT-END] simply omit the signal= field for an ungated wait, and the
+' [SPA-ACT] burst recorded after setFiles lists the mutation paths this site actually produces.
+' An unarmed run is therefore the discovery run: it completes, and its log yields the xpath to
+' arm next time (DOM: -> ArmContentSignal, ATTR:..[style] -> ArmVisibilitySignal). Refusing to
+' run would withhold exactly the evidence the caller needs to write the signal.
 '
 ' Native picker suppression is Chromium-specific and deliberately narrow:
 '   CDP Page.setInterceptFileChooserDialog(enabled=True, cancel=False)
@@ -1323,25 +1332,22 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
                                                   Optional ByVal contextId As String = "") As String
     ResetLastSyncState
 
-    If Not AnySignalArmed() Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
-                  "CompletionSignalRequired: A completion signal is required for the short-lived " & _
-                  "file-input path. Call ArmNetworkSignal, ArmContentSignal, or " & _
-                  "ArmVisibilitySignal first."
-    End If
-
     On Error GoTo Failed
 
     Dim targetCtx As String
     targetCtx = ResolveTargetContext(contextId)
 
-    If Len(m_signalOwnerContextId) = 0 Or _
-       StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
-                  "CompletionSignalContextMismatch: The active completion signal does not belong " & _
-                  "to the file-selection context." & vbCrLf & _
-                  "Signal owner: " & m_signalOwnerContextId & vbCrLf & _
-                  "Target: " & targetCtx
+    ' Ownership is checked only when a signal is actually armed. With no arm, an empty owner is
+    ' the normal ungated state, not a mismatch.
+    If AnySignalArmed() Then
+        If Len(m_signalOwnerContextId) = 0 Or _
+           StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                      "CompletionSignalContextMismatch: The active completion signal does not belong " & _
+                      "to the file-selection context." & vbCrLf & _
+                      "Signal owner: " & m_signalOwnerContextId & vbCrLf & _
+                      "Target: " & targetCtx
+        End If
     End If
 
     ' Never begin another chooser operation while a previous interception may still be active.

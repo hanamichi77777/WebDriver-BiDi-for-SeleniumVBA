@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.7 / MIT License / Copyright (c) hanamichi77777
+' Version 3.8 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -461,17 +461,11 @@ Public Sub Main10()
 
     End With
 End Sub
-' Main11 - File selection with a short-lived input[type=file]
-'
-' The sample file is created by SeleniumVBA, so this example
-' does not require any external local file.
-'
-' Test page:
-'   GitHub Pages / docs/file-dialog-probe/index.html
-'
-' The page creates input[type=file] when the button is clicked,
-' calls input.click(), and immediately removes the input.
 
+' Main11: short-lived file input (created on click, removed immediately after).
+' Run as-is first: with no completion signal the wait falls back to idle only, and
+' discovery_log.txt reports the DOM paths this page produced in its [SPA-ACT] burst.
+' Pick one from that burst, uncomment the Arm line below, and run again.
 Public Sub Main11()
 
     Dim driver As New WebDriver
@@ -508,7 +502,7 @@ Public Sub Main11()
         ' adapting this example to an actual application.
         ' ------------------------------------------------------------
         
-        bidi.ArmVisibilitySignal "//*[@id='done']"
+'        bidi.ArmVisibilitySignal "//*[@id='done']"
         ' ------------------------------------------------------------
         ' IMPORTANT:
         ' This XPath identifies the visible trigger button.
