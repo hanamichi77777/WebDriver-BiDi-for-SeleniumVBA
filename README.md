@@ -164,7 +164,7 @@ This procedure demonstrates `ArmContentSignal` for cases where a response settle
 * **What to customize:** Choose a stable existing subtree whose rewrite genuinely marks business completion. Avoid broad ancestors that also mutate for animations, clocks, advertisements, or unrelated telemetry.
 
 ### 11. Main11: Short-Lived File Input Selection with an Application-Level Completion Gate
-This procedure demonstrates the v3.6 file-selection path for applications that create an `input[type=file]` only when the user clicks a visible trigger and remove that input immediately after opening the file chooser.
+This procedure demonstrates the file-selection path for applications that create an `input[type=file]` only when the user clicks a visible trigger and remove that input immediately after opening the file chooser.
 
 * **Self-contained sample file:** SeleniumVBA creates `sample.txt` at runtime with `SaveStringToFile`, so the example does not depend on a separately prepared local test file.
 * **HTTPS test fixture:** The sample uses the project's public GitHub Pages file-dialog probe rather than a local `file://` fixture. The page provides a reproducible top-level HTTPS environment for the short-lived file-input pattern.
