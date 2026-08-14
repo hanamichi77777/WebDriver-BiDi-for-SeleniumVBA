@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v3.8
+# WebDriver BiDi for SeleniumVBA v3.9
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
@@ -176,4 +176,18 @@ This procedure demonstrates the file-selection path for applications that create
 * **Discovery Log as the adaptation tool:** When applying this pattern to an unknown site, use the Discovery Log to observe what happens after file selection and identify a reliable `ArmNetworkSignal`, `ArmContentSignal`, or `ArmVisibilitySignal`. Prefer a signal causally tied to the selected file over broad background activity or arbitrary delays.
 * **Chromium-specific native-picker suppression:** On Edge/Chrome, CDP is used internally only to suppress the native file chooser without intentionally generating a cancel operation. WebDriver BiDi remains responsible for `input.fileDialogOpened` and `input.setFiles`.
 * **What to customize:** Replace the probe URL, trigger XPath, and completion signal when adapting the sample to a real application. The key rule is that the completion condition should represent application acceptance or completion, not merely successful execution of `input.setFiles`.
+
+### 12. Main12: Correlated Browser Download Observation and Destination Control
+This procedure demonstrates the WebDriver BiDi download path using a reproducible GitHub Pages fixture. It triggers one browser download, correlates `browsingContext.downloadWillBegin` with the matching `browsingContext.downloadEnd`, records the observation in the Discovery Log, and returns the browser-reported terminal result.
+
+* **HTTPS download fixture:** The sample uses the project's public GitHub Pages download probe at `docs/download-probe/index.html`, published as `https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/download-probe/`. The page exposes a deterministic `#download-single` button that creates a small Blob download.
+* **Explicit destination folder:** The sample resolves `.\download-sample` through SeleniumVBA's `ResolvePath(..., False)`, creates the folder when necessary, and passes it to `SetDownloadFolder`. `SetDownloadFolder` performs its own API-boundary path normalization and existence check before sending `browser.setDownloadBehavior`.
+* **One trigger, one observed transaction:** `ExecuteDownloadByXPath` resolves the trigger XPath, arms download observation, clicks the trigger once, waits for an accepted `downloadWillBegin`, and then waits for the correlated `downloadEnd`. Ambiguous outcomes are not handled by replaying the trigger.
+* **Correlation is observable:** The returned `Dictionary` includes `correlationMode`, together with the available download or navigation identity. When a browser does not provide a usable download identifier, the wrapper can correlate the transaction by owner browsing context plus navigation identity.
+* **Discovery Log preserves the signal chain:** `StartDiscoveryLog` is called before navigation and `StopAndSaveDiscoveryLog` after the download result is obtained. This preserves lines such as `DOWNLOAD-ARM`, `DOWNLOAD-START-ACCEPTED`, `DOWNLOAD-END-MATCHED`, and any context-mismatch diagnostics even when Immediate-window debug output is not being relied upon.
+* **Browser-authoritative terminal status:** The sample displays `status` from the matching `downloadEnd`. A result such as `complete` or `canceled` is treated as the browser's terminal report; the sample does not infer the reason for cancellation.
+* **Browser-reported filepath only:** `filePath` is displayed as reported by WebDriver BiDi. The sample does not treat that value as proof that the file currently exists on disk, has a particular size or hash, or will never be renamed by another process.
+* **Cleanup of browser-side download policy:** After the sample result is displayed, `ClearDownloadBehavior` explicitly restores the browser's default download behavior. `Shutdown` also contains a best-effort cleanup path if a wrapper-owned download override is still active.
+* **What to customize:** Replace the probe URL, trigger XPath, destination folder, and timeouts when adapting the sample. Keep the exactly-one-download assumption in mind; workflows that intentionally start multiple downloads from one trigger require a different application-level contract.
+
 ---

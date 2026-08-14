@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebDriver BiDi Download Probe</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      max-width: 760px;
+      margin: 48px auto;
+      padding: 0 20px;
+      line-height: 1.6;
+    }
+    button {
+      font: inherit;
+      padding: 10px 18px;
+      cursor: pointer;
+    }
+    #status {
+      margin-top: 18px;
+    }
+    code {
+      background: #f3f3f3;
+      padding: 2px 5px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>WebDriver BiDi Download Probe</h1>
+
+  <p>
+    This page provides a deterministic download trigger for the
+    <code>Main12</code> SeleniumVBA sample.
+  </p>
+
+  <button id="download-single" type="button">Download sample file</button>
+
+  <p id="status" role="status" aria-live="polite">Ready.</p>
+
+  <script>
+    document.getElementById("download-single").addEventListener("click", () => {
+      const content =
+        "WebDriver BiDi for SeleniumVBA\n" +
+        "Main12 download sample\n";
+
+      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+
+      anchor.href = url;
+      anchor.download = "bidi-main12-sample.txt";
+      anchor.style.display = "none";
+
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+
+      document.getElementById("status").textContent =
+        "Download was requested: bidi-main12-sample.txt";
+
+      // Revoke after the download request has been handed to the browser.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+  </script>
+</body>
+</html>

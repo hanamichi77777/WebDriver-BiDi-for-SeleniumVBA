@@ -522,3 +522,89 @@ Public Sub Main11()
     End With
 
 End Sub
+
+' Main12 - Browser download lifecycle and destination-folder sample
+' The trigger is clicked exactly once. ExecuteDownloadByXPath observes one
+' correlatable owner-context download through downloadWillBegin/downloadEnd.
+'
+' StartDiscoveryLog preserves the download signal chain even when DebugMode is
+' disabled, including the accepted correlation mode and any context mismatch.
+'
+' status is the browser-reported terminal result. filePath is browser-reported
+' only; this sample does not assert filesystem existence, size or hash.
+
+Public Sub Main12()
+
+    Dim driver As New WebDriver
+    Dim caps As WebCapabilities
+    Dim bidi As BiDiCommandWrapper
+    Dim result As Dictionary
+    Dim fso As New FileSystemObject
+
+    Dim targetUrl As String
+    Dim downloadFolder As String
+    Dim msgText As String
+    Dim msgCaption As String
+
+    targetUrl = "https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/download-probe/"
+
+    With driver
+        .StartEdge
+
+        ' Resolve the sample folder through WebDriver, as in Main11.
+        ' The folder does not exist yet, so targetExists=False is intentional.
+        downloadFolder = .ResolvePath(".\download-sample", False)
+        If Not fso.FolderExists(downloadFolder) Then fso.CreateFolder downloadFolder
+
+        Set caps = .CreateCapabilities
+        caps.AddArguments "--start-maximized"
+        caps.EnableBiDiMode
+
+        .OpenBrowser caps
+
+        Set bidi = New BiDiCommandWrapper
+        bidi.ConnectTo .GetWebSocketUrl
+
+        ' SetDownloadFolder performs its own API-boundary path normalization and
+        ' existence check even though downloadFolder is already absolute here.
+        bidi.SetDownloadFolder downloadFolder
+
+        ' Preserve the complete download signal chain in discovery_log.txt.
+        bidi.StartDiscoveryLog
+
+        bidi.ExecuteNavigateAndGetStatus targetUrl
+
+        Set result = bidi.ExecuteDownloadByXPath( _
+                        "//*[@id='download-single']", _
+                        searchTimeoutMs:=5000, _
+                        timeoutMs:=30000)
+
+        Debug.Print "Download status: " & CStr(result("status"))
+        Debug.Print "Suggested filename: " & CStr(result("suggestedFilename"))
+        Debug.Print "Correlation: " & CStr(result("correlationMode"))
+        Debug.Print "Browser-reported filepath: " & CStr(result("filePath"))
+
+        ' Saves discovery_log.txt in the same folder as the current VBA host file.
+        ' The log contains DOWNLOAD-ARM / DOWNLOAD-START-ACCEPTED /
+        ' DOWNLOAD-END-MATCHED and any context-mismatch diagnostics.
+        bidi.StopAndSaveDiscoveryLog
+
+        msgText = "Status: " & CStr(result("status")) & vbCrLf & _
+                  "Suggested filename: " & CStr(result("suggestedFilename")) & vbCrLf & _
+                  "Correlation: " & CStr(result("correlationMode")) & vbCrLf & _
+                  "Browser-reported filepath:" & vbCrLf & CStr(result("filePath"))
+
+        ' Do not label a canceled terminal result as "Complete".
+        msgCaption = "BiDi Download - " & CStr(result("status"))
+        MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
+
+        ' Explicitly restore the browser/default download policy.
+        ' Shutdown also performs best-effort cleanup if an override is still active.
+        bidi.ClearDownloadBehavior
+
+        bidi.Shutdown: Set bidi = Nothing
+        .CloseBrowser: .Shutdown
+
+    End With
+
+End Sub

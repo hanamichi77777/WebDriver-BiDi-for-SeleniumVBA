@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "3.8"
+Private Const BIDI_SOCKET_VERSION As String = "3.9"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -490,6 +490,12 @@ Public Property Let MaxIncomingSize(ByVal v As Long)
 End Property
 Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_maxIncomingSize: End Property
 Public Property Get DroppedEventsCount() As Long: DroppedEventsCount = m_DroppedEventsCount: End Property
+' Current depth of the bounded asynchronous-event FIFO. Diagnostic only; it does not classify
+' observer health and does not include messages that have not yet reached this FIFO.
+Public Property Get EventQueueDepth() As Long
+    If m_EventBuffer Is Nothing Then Exit Property
+    EventQueueDepth = m_EventBuffer.count
+End Property
 Public Property Get DroppedLateResponsesCount() As Long: DroppedLateResponsesCount = m_DroppedLateResponsesCount: End Property
 Public Property Get DroppedParsedOversizeCount() As Long: DroppedParsedOversizeCount = m_DroppedParsedOversizeCount: End Property
 Public Property Get DroppedParsedMalformedCount() As Long: DroppedParsedMalformedCount = m_DroppedParsedMalformedCount: End Property
