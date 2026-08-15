@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 4.0 / MIT License / Copyright (c) hanamichi77777
+' Version 4.1 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -11,7 +11,7 @@ Option Explicit
 '
 ' MessageBoxA with hWnd=0 keeps sample result dialogs above the browser.
 Public Declare PtrSafe Function MESSAGEbox Lib "user32.dll" Alias "MessageBoxA" _
-                                (ByVal hwnd As LongPtr, ByVal lpText As String, ByVal lpCaption As String, ByVal uType As Long) As Long
+                                (ByVal hWnd As LongPtr, ByVal lpText As String, ByVal lpCaption As String, ByVal uType As Long) As Long
 Public Const MB_OK = &H0                          ' OK button flag
 Public Const MB_ForeFront = &H40000              ' Topmost flag (MB_TOPMOST)
 
