@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "3.9"
+Private Const BIDI_SOCKET_VERSION As String = "4.0"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -51,9 +51,12 @@ Private Const MIN_POLLING_INTERVAL_MS As Long = 10
 Private Const MAX_POLLING_INTERVAL_MS As Long = 5000 ' Must not exceed the application-heartbeat timeout
 Private Const EVENT_BUFFER_MAX_COUNT As Long = 2000
 Private Const EVENT_BUFFER_MAX_BYTES As Long = 33554432 ' 32 MiB of VBA string storage measured by LenB
+Private Const RAW_TEXT_QUEUE_MAX_COUNT As Long = 2000
+Private Const RAW_TEXT_QUEUE_MAX_BYTES As Long = 33554432 ' 32 MiB of retained UTF-8 payload bytes
 Private Const APPLICATION_HEARTBEAT_INTERVAL_MS As Long = 1000
 Private Const APPLICATION_HEARTBEAT_TIMEOUT_MS As Long = 5000
-Private Const MAX_PUBLIC_TIMEOUT_MS As Long = 600000
+Private Const MAX_CONSECUTIVE_APPLICATION_HEARTBEAT_TIMEOUTS As Long = 3
+Private Const MAX_PUBLIC_TIMEOUT_MS As Long = 605000
 
 Private m_wsTransportInitialized As Boolean
 ' Only symbolic localhost may fall back from [::1] to 127.0.0.1.
@@ -110,6 +113,10 @@ Private m_DroppedLateResponsesCount As Long
 Private m_DroppedParsedOversizeCount As Long
 Private m_DroppedParsedMalformedCount As Long
 Private m_DroppedParsedFilteredCount As Long
+Private m_LifecycleEventLossCount As Long
+Private m_DownloadEventLossCount As Long
+Private m_FileDialogEventLossCount As Long
+Private m_UnknownCriticalEventLossCount As Long
 Private m_LastParsedEventDropReason As String
 Private m_lastPollTime As Double
 Private m_lastApplicationHeartbeatAt As Double
@@ -137,7 +144,7 @@ Private m_maxIncomingSize As Long ' Receive-side cap; oversized messages are dra
 ' Lowest-level integrated WinSock transport diagnostics only (OPEN/FAILED).
 Private Const WINSOCK_TRANSPORT_DEBUG_ENABLED As Boolean = False
 
-Private Declare PtrSafe Function WsApi_WSAStartup Lib "ws2_32.dll" Alias "WSAStartup" (ByVal wVersionRequired As Integer, ByRef lpWSAData As WsWSADATA) As Long
+Private Declare PtrSafe Function WsApi_WSAStartup Lib "ws2_32.dll" Alias "WSAStartup" (ByVal wVersionRequired As Integer, ByRef lpWSAData As Byte) As Long
 Private Declare PtrSafe Function WsApi_WSACleanup Lib "ws2_32.dll" Alias "WSACleanup" () As Long
 Private Declare PtrSafe Function WsApi_socket Lib "ws2_32.dll" Alias "socket" (ByVal af As Long, ByVal socketType As Long, ByVal protocol As Long) As LongPtr
 Private Declare PtrSafe Function WsApi_closesocket Lib "ws2_32.dll" Alias "closesocket" (ByVal s As LongPtr) As Long
@@ -178,16 +185,6 @@ Private Declare PtrSafe Function WsApi_BCryptHashData Lib "bcrypt.dll" Alias "BC
 Private Declare PtrSafe Function WsApi_BCryptFinishHash Lib "bcrypt.dll" Alias "BCryptFinishHash" (ByVal hashHandle As LongPtr, ByRef outputBuffer As Byte, ByVal outputSize As Long, ByVal flags As Long) As Long
 Private Declare PtrSafe Function WsApi_BCryptDestroyHash Lib "bcrypt.dll" Alias "BCryptDestroyHash" (ByVal hashHandle As LongPtr) As Long
 
-
-Private Type WsWSADATA
-    Version As Integer
-    highVersion As Integer
-    description(0 To 256) As Byte
-    systemStatus(0 To 128) As Byte
-    maxSockets As Integer
-    maxUdpDg As Integer
-    vendorInfo As LongPtr
-End Type
 
 Private Type WsSOCKADDR_IN
     family As Integer
@@ -258,6 +255,7 @@ Private Const WS_BCRYPT_STATUS_SUCCESS As Long = 0
 Private Const WS_MASK_KEY_SIZE As Long = 4
 
 Private Const WS_CLIENT_PING_INTERVAL_MS As Long = 15000
+Private Const WS_CLIENT_PONG_TIMEOUT_MS As Long = 10000
 Private Const WS_CLIENT_PING_PAYLOAD_SIZE As Long = 4
 Private Const WS_CLIENT_PING_BUSY_RETRY_MS As Long = 1000
 
@@ -332,6 +330,7 @@ Private m_ws_rawReadPos As Long
 
 Private m_ws_rawTextQueue As Collection
 Private m_ws_rawTextLengthQueue As Collection
+Private m_ws_rawTextQueueBytes As Long
 Private m_ws_maxIncomingSize As Long
 
 Private m_ws_frameState As WsFrameParserState
@@ -363,6 +362,7 @@ Private m_ws_nextClientPingAtMs As Double
 Private m_ws_clientPingOutstanding As Boolean
 Private m_ws_clientPingSequence As Long
 Private m_ws_clientPingOutstandingSequence As Long
+Private m_ws_clientPingSentAtMs As Double
 
 Private Sub Class_Initialize()
     If QueryPerformanceFrequency(m_qpcFreq) = 0 Or m_qpcFreq <= 0 Then
@@ -433,12 +433,12 @@ Public Property Get IsTransportOpen() As Boolean
     If m_wsTransportInitialized Then IsTransportOpen = WsIsOpen
 End Property
 
-' Compatibility shim: WinSock is the only transport; False is rejected and True
-' is accepted only while disconnected.
+' Compatibility property retained for older callers. The integrated WinSock
+' transport is always enabled and can only be confirmed while disconnected.
 Public Property Let UseWinsockTransport(ByVal v As Boolean)
     If Not v Then
         Err.Raise vbObjectError + 9105, "BiDiSocketCommunicator", _
-                  "The legacy WinHTTP transport has been removed. WinSock is the only supported transport."
+                  "The integrated WinSock transport is always enabled and cannot be disabled."
     End If
     If m_state <> StateDisconnected Then
         Err.Raise vbObjectError + 9102, "BiDiSocketCommunicator", _
@@ -490,6 +490,26 @@ Public Property Let MaxIncomingSize(ByVal v As Long)
 End Property
 Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_maxIncomingSize: End Property
 Public Property Get DroppedEventsCount() As Long: DroppedEventsCount = m_DroppedEventsCount: End Property
+Public Property Get TotalDroppedEventsCount() As Long
+    Dim total As Double
+    total = CDbl(m_DroppedEventsCount) + CDbl(m_DroppedParsedOversizeCount) + _
+            CDbl(m_DroppedParsedMalformedCount) + CDbl(m_DroppedParsedFilteredCount)
+    If total >= 2147483647# Then
+        TotalDroppedEventsCount = 2147483647
+    Else
+        TotalDroppedEventsCount = CLng(total)
+    End If
+End Property
+Public Property Get TotalAsyncEventLossCount() As Long
+    Dim total As Double
+    total = CDbl(m_DroppedEventsCount) + CDbl(m_DroppedParsedOversizeCount) + _
+            CDbl(m_DroppedParsedMalformedCount)
+    If total >= 2147483647# Then
+        TotalAsyncEventLossCount = 2147483647
+    Else
+        TotalAsyncEventLossCount = CLng(total)
+    End If
+End Property
 ' Current depth of the bounded asynchronous-event FIFO. Diagnostic only; it does not classify
 ' observer health and does not include messages that have not yet reached this FIFO.
 Public Property Get EventQueueDepth() As Long
@@ -500,6 +520,10 @@ Public Property Get DroppedLateResponsesCount() As Long: DroppedLateResponsesCou
 Public Property Get DroppedParsedOversizeCount() As Long: DroppedParsedOversizeCount = m_DroppedParsedOversizeCount: End Property
 Public Property Get DroppedParsedMalformedCount() As Long: DroppedParsedMalformedCount = m_DroppedParsedMalformedCount: End Property
 Public Property Get DroppedParsedFilteredCount() As Long: DroppedParsedFilteredCount = m_DroppedParsedFilteredCount: End Property
+Public Property Get LifecycleEventLossCount() As Long: LifecycleEventLossCount = m_LifecycleEventLossCount: End Property
+Public Property Get DownloadEventLossCount() As Long: DownloadEventLossCount = m_DownloadEventLossCount: End Property
+Public Property Get FileDialogEventLossCount() As Long: FileDialogEventLossCount = m_FileDialogEventLossCount: End Property
+Public Property Get UnknownCriticalEventLossCount() As Long: UnknownCriticalEventLossCount = m_UnknownCriticalEventLossCount: End Property
 Public Property Get LastParsedEventDropReason() As String: LastParsedEventDropReason = m_LastParsedEventDropReason: End Property
 
 Private Sub SetState(ByVal NewState As BiDiSocketState)
@@ -583,6 +607,10 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
         m_DroppedParsedOversizeCount = 0
         m_DroppedParsedMalformedCount = 0
         m_DroppedParsedFilteredCount = 0
+        m_LifecycleEventLossCount = 0
+        m_DownloadEventLossCount = 0
+        m_FileDialogEventLossCount = 0
+        m_UnknownCriticalEventLossCount = 0
         m_LastParsedEventDropReason = vbNullString
     End If
 
@@ -835,10 +863,17 @@ Public Function SendMessage(ByVal msg As String, Optional ByVal allowRecovery As
     SendMessage = False
 End Function
 
-' Fire-and-forget contract: any send failure is dropped, including the deterministic
-' invalid-UTF-16 rejection now raised by WsQueueText. This path must never raise.
+' Fire-and-forget contract: invalid or oversized payloads are dropped.
+' This path must never raise to the caller.
 Public Sub PostScript(ByVal msg As String)
     On Error Resume Next
+
+    If Len(msg) > MAX_MSG_SIZE Then
+        Trace ">>> [PostScript] Outgoing payload dropped. Size=" & _
+              CStr(Len(msg)) & " chars; Max=" & CStr(MAX_MSG_SIZE) & ".", True
+        Exit Sub
+    End If
+
     SendMessage msg, False
     On Error GoTo 0
 End Sub
@@ -927,7 +962,165 @@ Private Sub TraceSessionDropSummary()
           m_DroppedLateResponsesCount & "; parsed-event oversize drops=" & _
           m_DroppedParsedOversizeCount & "; malformed drops=" & _
           m_DroppedParsedMalformedCount & "; filtered drops=" & _
-          m_DroppedParsedFilteredCount, True
+          m_DroppedParsedFilteredCount & "; lifecycle losses=" & _
+          m_LifecycleEventLossCount & "; download losses=" & _
+          m_DownloadEventLossCount & "; file-dialog losses=" & _
+          m_FileDialogEventLossCount & "; unknown critical losses=" & _
+          m_UnknownCriticalEventLossCount, True
+End Sub
+
+Private Sub IncrementLossCounter(ByRef counter As Long)
+    If counter < 2147483647 Then counter = counter + 1
+End Sub
+
+' Returns the JSON container depth immediately before targetPos.
+Private Function JsonContainerDepthBefore(ByVal jsonText As String, _
+                                          ByVal targetPos As Long, _
+                                          ByRef validPrefix As Boolean) As Long
+    Dim i As Long
+    Dim depth As Long
+    Dim inString As Boolean
+    Dim escaped As Boolean
+    Dim ch As String
+
+    validPrefix = False
+
+    For i = 1 To targetPos - 1
+        ch = Mid$(jsonText, i, 1)
+
+        If inString Then
+            If escaped Then
+                escaped = False
+            ElseIf ch = "\" Then
+                escaped = True
+            ElseIf ch = """" Then
+                inString = False
+            End If
+        Else
+            Select Case ch
+                Case """"
+                    inString = True
+                Case "{", "["
+                    depth = depth + 1
+                Case "}", "]"
+                    depth = depth - 1
+                    If depth < 0 Then Exit Function
+            End Select
+        End If
+    Next i
+
+    If inString Or escaped Or depth < 0 Then Exit Function
+
+    validPrefix = True
+    JsonContainerDepthBefore = depth
+End Function
+
+' Extracts only a top-level BiDi method from a bounded prefix.
+' Failure is handled as unknown critical loss by the caller.
+Private Function TryExtractTopLevelEventMethod(ByVal rawMsg As String, _
+                                               ByRef methodName As String) As Boolean
+    Const METHOD_SCAN_LIMIT As Long = 4096
+
+    methodName = vbNullString
+
+    Dim scanText As String
+    scanText = rawMsg
+    If Len(scanText) > METHOD_SCAN_LIMIT Then scanText = Left$(scanText, METHOD_SCAN_LIMIT)
+
+    Dim firstNonSpace As Long
+    Dim i As Long
+    Dim ch As String
+
+    For i = 1 To Len(scanText)
+        ch = Mid$(scanText, i, 1)
+        If ch <> " " And ch <> vbTab And ch <> vbCr And ch <> vbLf Then
+            firstNonSpace = i
+            Exit For
+        End If
+    Next i
+
+    If firstNonSpace = 0 Then Exit Function
+    If Mid$(scanText, firstNonSpace, 1) <> "{" Then Exit Function
+
+    Dim searchPos As Long
+    searchPos = firstNonSpace + 1
+
+    Do
+        Dim keyPos As Long
+        keyPos = InStr(searchPos, scanText, """method""", vbBinaryCompare)
+        If keyPos = 0 Then Exit Function
+
+        Dim validPrefix As Boolean
+        Dim depth As Long
+        depth = JsonContainerDepthBefore(scanText, keyPos, validPrefix)
+
+        If validPrefix And depth = 1 Then
+            Dim p As Long
+            p = keyPos + Len("""method""")
+
+            Do While p <= Len(scanText)
+                ch = Mid$(scanText, p, 1)
+                If ch <> " " And ch <> vbTab And ch <> vbCr And ch <> vbLf Then Exit Do
+                p = p + 1
+            Loop
+
+            If p <= Len(scanText) And Mid$(scanText, p, 1) = ":" Then
+                p = p + 1
+
+                Do While p <= Len(scanText)
+                    ch = Mid$(scanText, p, 1)
+                    If ch <> " " And ch <> vbTab And ch <> vbCr And ch <> vbLf Then Exit Do
+                    p = p + 1
+                Loop
+
+                If p <= Len(scanText) And Mid$(scanText, p, 1) = """" Then
+                    Dim valueStart As Long
+                    valueStart = p + 1
+                    p = valueStart
+
+                    Do While p <= Len(scanText)
+                        ch = Mid$(scanText, p, 1)
+
+                        If ch = "\" Then
+                            Exit Function
+                        ElseIf ch = """" Then
+                            methodName = Mid$(scanText, valueStart, p - valueStart)
+                            TryExtractTopLevelEventMethod = (Len(methodName) > 0)
+                            Exit Function
+                        End If
+
+                        p = p + 1
+                    Loop
+                End If
+            End If
+        End If
+
+        searchPos = keyPos + Len("""method""")
+    Loop
+End Function
+
+Private Sub RecordAsyncMessageLoss(ByVal rawMsg As String, _
+                                   ByRef detectedMethod As String)
+    detectedMethod = vbNullString
+
+    If Not TryExtractTopLevelEventMethod(rawMsg, detectedMethod) Then
+        IncrementLossCounter m_UnknownCriticalEventLossCount
+        Exit Sub
+    End If
+
+    Select Case detectedMethod
+        Case "browsingContext.contextCreated", _
+             "browsingContext.contextDestroyed", _
+             "browsingContext.navigationStarted"
+            IncrementLossCounter m_LifecycleEventLossCount
+
+        Case "browsingContext.downloadWillBegin", _
+             "browsingContext.downloadEnd"
+            IncrementLossCounter m_DownloadEventLossCount
+
+        Case "input.fileDialogOpened"
+            IncrementLossCounter m_FileDialogEventLossCount
+    End Select
 End Sub
 
 Private Sub ResetEventBuffer()
@@ -946,7 +1139,11 @@ Private Sub DropOldestBufferedEvent()
     m_EventBufferBytes = m_EventBufferBytes - LenB(dropped)
     If m_EventBufferBytes < 0 Then m_EventBufferBytes = 0
 
-    m_DroppedEventsCount = m_DroppedEventsCount + 1
+    If m_DroppedEventsCount < 2147483647 Then _
+        m_DroppedEventsCount = m_DroppedEventsCount + 1
+
+    Dim droppedMethod As String
+    RecordAsyncMessageLoss dropped, droppedMethod
 End Sub
 
 ' Preserve FIFO order while bounding both retained event count and VBA string bytes.
@@ -956,7 +1153,11 @@ Private Sub EnqueueEventBounded(ByVal msg As String)
     msgBytes = LenB(msg)
 
     If msgBytes > EVENT_BUFFER_MAX_BYTES Then
-        m_DroppedEventsCount = m_DroppedEventsCount + 1
+        If m_DroppedEventsCount < 2147483647 Then _
+            m_DroppedEventsCount = m_DroppedEventsCount + 1
+
+        Dim oversizedMethod As String
+        RecordAsyncMessageLoss msg, oversizedMethod
         Exit Sub
     End If
 
@@ -1000,7 +1201,8 @@ End Sub
 
 Public Function SendCommand(ByVal method As String, _
                             ByRef params As Object, _
-                            Optional ByVal Silent As Boolean = False) As String
+                            Optional ByVal Silent As Boolean = False, _
+                            Optional ByVal waitTimeMs As Long = 0) As String
     
     Dim requestId As Long: requestId = GetNextRequestId()
     
@@ -1027,7 +1229,7 @@ Public Function SendCommand(ByVal method As String, _
     End If
     
     Dim strRes As String
-    strRes = SendAndReceive(sendMsg)
+    strRes = SendAndReceive(sendMsg, waitTimeMs)
     
     If COMMUNICATOR_DEBUG_ENABLED And Not Silent Then
         Dim displayRes As String: displayRes = strRes
@@ -1315,8 +1517,7 @@ Private Sub ObserveWinsockMessage(ByVal rawMsg As String)
     m_consecutiveApplicationHeartbeatTimeouts = 0
 
     Dim isSuspicious As Boolean
-    isSuspicious = (InStr(1, rawMsg, """error"":", vbTextCompare) > 0) Or _
-                   (InStr(1, rawMsg, "chrome-error", vbTextCompare) > 0)
+    isSuspicious = (InStr(1, rawMsg, """error"":", vbTextCompare) > 0)
 
     If isSuspicious Then
         m_consecutiveInternalErrors = m_consecutiveInternalErrors + 1
@@ -1414,6 +1615,27 @@ ErrorHandler:
     Resume FinalCleanup
 End Function
 
+
+' Non-yielding event read for wrapper-side lifecycle reconciliation. It never sends a
+' heartbeat, attempts recovery, sleeps, or pumps Office messages.
+Private Function GetMessageNonBlocking() As String
+    If m_isRaisingStateChanged Or m_isRecovering Then Exit Function
+    If m_isSendReceiving Then Exit Function
+
+    Dim bufferedEvent As String
+    If TryDequeueBufferedEvent(bufferedEvent) Then
+        GetMessageNonBlocking = bufferedEvent
+        Exit Function
+    End If
+
+    If m_state <> StateConnected Then Exit Function
+
+    Dim transportEvent As String
+    If TryReadWinsockBeforeHeartbeat(transportEvent, True) Then
+        GetMessageNonBlocking = transportEvent
+    End If
+End Function
+
 ' GetMessage serves the event FIFO, performs bounded receive work, then manages the
 ' reserved-band session.status heartbeat.
 Public Function GetMessage() As String
@@ -1466,13 +1688,19 @@ Public Function GetMessage() As String
 
         Trace ">>> [Heartbeat] session.status reply timeout. Consecutive=" & _
               m_consecutiveApplicationHeartbeatTimeouts & _
-              "; retiring ID=" & m_applicationHeartbeatId & _
-              ". Socket state remains unchanged.", True
+              "/" & MAX_CONSECUTIVE_APPLICATION_HEARTBEAT_TIMEOUTS & _
+              "; retiring ID=" & m_applicationHeartbeatId & ".", True
 
-        ' Heartbeat timeout is diagnostic evidence, not a transport verdict. A healthy
-        ' peer message resets the counter through ObserveWinsockMessage.
         m_applicationHeartbeatOutstanding = False
         m_applicationHeartbeatId = 0
+
+        If m_consecutiveApplicationHeartbeatTimeouts >= _
+           MAX_CONSECUTIVE_APPLICATION_HEARTBEAT_TIMEOUTS Then
+            Trace ">>> [Heartbeat] Application liveness failure. " & _
+                  "Consecutive session.status timeouts reached the limit.", True
+            SetState StateError
+            Exit Function
+        End If
     End If
 
     If (nowT - m_lastApplicationHeartbeatAt) < APPLICATION_HEARTBEAT_INTERVAL_MS Then Exit Function
@@ -1519,15 +1747,20 @@ End Function
 Public Function TryGetParsedEvent(ByRef parsed As Object, _
                                   ByRef dropReason As String, _
                                   Optional ByVal minMsgSize As Long = 10, _
-                                  Optional ByVal maxMsgSize As Long = 300000) As Boolean
+                                  Optional ByVal maxMsgSize As Long = 300000, _
+                                  Optional ByVal nonBlocking As Boolean = False) As Boolean
     Set parsed = Nothing
     dropReason = vbNullString
 
     Dim rawMsg As String
-    rawMsg = GetMessage()
+    If nonBlocking Then
+        rawMsg = GetMessageNonBlocking()
+    Else
+        rawMsg = GetMessage()
+    End If
     If Len(rawMsg) = 0 Then Exit Function
 
-    ' A message was removed from the event FIFO even when it is rejected below.
+    ' One event message was consumed even when it is rejected below.
     TryGetParsedEvent = True
 
     Dim rawLength As Long
@@ -1543,8 +1776,18 @@ Public Function TryGetParsedEvent(ByRef parsed As Object, _
     End If
 
     If rawLength > maxMsgSize Then
+        Dim oversizeMethod As String
+        RecordAsyncMessageLoss rawMsg, oversizeMethod
+
         dropReason = "oversized parsed event (chars=" & rawLength & _
-                     "; maximum=" & maxMsgSize & ")"
+                     "; maximum=" & maxMsgSize & "; method="
+
+        If Len(oversizeMethod) > 0 Then
+            dropReason = dropReason & oversizeMethod & ")"
+        Else
+            dropReason = dropReason & "unknown)"
+        End If
+
         If m_DroppedParsedOversizeCount < 2147483647 Then _
             m_DroppedParsedOversizeCount = m_DroppedParsedOversizeCount + 1
         m_LastParsedEventDropReason = dropReason
@@ -1569,8 +1812,18 @@ Public Function TryGetParsedEvent(ByRef parsed As Object, _
     On Error GoTo 0
 
     If parseErr <> 0 Or candidate Is Nothing Then
+        Dim malformedMethod As String
+        RecordAsyncMessageLoss rawMsg, malformedMethod
+
         dropReason = "malformed JSON event"
         If parseErr <> 0 Then dropReason = dropReason & " (Err " & parseErr & ")"
+
+        If Len(malformedMethod) > 0 Then
+            dropReason = dropReason & "; method=" & malformedMethod
+        Else
+            dropReason = dropReason & "; method=unknown"
+        End If
+
         If m_DroppedParsedMalformedCount < 2147483647 Then _
             m_DroppedParsedMalformedCount = m_DroppedParsedMalformedCount + 1
         m_LastParsedEventDropReason = dropReason
@@ -2079,17 +2332,16 @@ Private Sub WsTransportInitialize()
     End If
     m_ws_qpcFrequency = frequency
 
-    Dim data As WsWSADATA
+    Dim wsaDataBuffer(0 To 511) As Byte
     Dim result As Long
-    result = WsApi_WSAStartup(&H202, data)
+    result = WsApi_WSAStartup(&H202, wsaDataBuffer(0))
     If result <> 0 Then
         Err.Raise vbObjectError + 9101, "BiDiSocketCommunicator", "WSAStartup failed: " & result
     End If
     m_ws_wsaStarted = True
 
     Set m_ws_sendQueue = New Collection
-    Set m_ws_rawTextQueue = New Collection
-    Set m_ws_rawTextLengthQueue = New Collection
+    WsResetDeferredTextQueue
     m_ws_socket = -1
     m_ws_state = WsTransportDisconnected
     m_ws_maxIncomingSize = WS_DEFAULT_MAX_INCOMING_SIZE
@@ -2370,15 +2622,97 @@ FailTransport:
                  "Outgoing WebSocket frame construction failed: " & savedDescription
 End Function
 
+Private Sub WsResetDeferredTextQueue()
+    Set m_ws_rawTextQueue = New Collection
+    Set m_ws_rawTextLengthQueue = New Collection
+    m_ws_rawTextQueueBytes = 0
+End Sub
+
+' This queue contains both events and command responses, so overflow is fatal.
+' Silent eviction could break BiDi response-ID correlation.
+Private Function WsEnqueueDeferredText(ByVal chunks As Collection, _
+                                       ByVal totalBytes As Long) As Boolean
+    On Error GoTo ErrorHandler
+
+    If chunks Is Nothing Then
+        WsSetFailure 9222, "Deferred text queue received a missing chunk collection."
+        Exit Function
+    End If
+
+    If totalBytes < 0 Then
+        WsSetFailure 9222, "Deferred text queue received a negative payload length."
+        Exit Function
+    End If
+
+    If m_ws_rawTextQueue Is Nothing Then
+        WsSetFailure 9222, "Deferred text queue is unavailable."
+        Exit Function
+    End If
+
+    If m_ws_rawTextLengthQueue Is Nothing Then
+        WsSetFailure 9222, "Deferred text length queue is unavailable."
+        Exit Function
+    End If
+
+    If m_ws_rawTextQueue.count <> m_ws_rawTextLengthQueue.count Then
+        WsSetFailure 9222, "Deferred text queue is inconsistent before enqueue."
+        Exit Function
+    End If
+
+    If totalBytes > RAW_TEXT_QUEUE_MAX_BYTES Then
+        WsSetFailure 9222, _
+            "Deferred text message exceeds the raw queue byte limit. IncomingBytes=" & _
+            CStr(totalBytes) & "; MaxBytes=" & CStr(RAW_TEXT_QUEUE_MAX_BYTES) & "."
+        Exit Function
+    End If
+
+    If m_ws_rawTextQueue.count >= RAW_TEXT_QUEUE_MAX_COUNT Or _
+       m_ws_rawTextQueueBytes > (RAW_TEXT_QUEUE_MAX_BYTES - totalBytes) Then
+
+        WsSetFailure 9222, _
+            "Deferred text queue retention limit exceeded. Count=" & _
+            CStr(m_ws_rawTextQueue.count) & "; RetainedBytes=" & _
+            CStr(m_ws_rawTextQueueBytes) & "; IncomingBytes=" & CStr(totalBytes) & _
+            "; MaxCount=" & CStr(RAW_TEXT_QUEUE_MAX_COUNT) & "; MaxBytes=" & _
+            CStr(RAW_TEXT_QUEUE_MAX_BYTES) & "."
+        Exit Function
+    End If
+
+    m_ws_rawTextQueue.Add item:=chunks
+    m_ws_rawTextLengthQueue.Add totalBytes
+    m_ws_rawTextQueueBytes = m_ws_rawTextQueueBytes + totalBytes
+
+    WsEnqueueDeferredText = True
+    Exit Function
+
+ErrorHandler:
+    WsSetFailure 9222, "Deferred text queue enqueue failed: " & Err.description
+End Function
+
 Private Function WsTryDequeueText(ByRef message As String) As Boolean
     On Error GoTo ErrorHandler
+
+    If m_ws_rawTextQueue Is Nothing Then
+        WsSetFailure 9218, "Deferred text queue is unavailable."
+        Exit Function
+    End If
+
+    If m_ws_rawTextLengthQueue Is Nothing Then
+        WsSetFailure 9218, "Deferred text length queue is unavailable."
+        Exit Function
+    End If
 
     If m_ws_rawTextLengthQueue.count <> m_ws_rawTextQueue.count Then
         WsSetFailure 9218, "Deferred text queue is inconsistent."
         Exit Function
     End If
 
-    If m_ws_rawTextQueue.count = 0 Then Exit Function
+    If m_ws_rawTextQueue.count = 0 Then
+        If m_ws_rawTextQueueBytes <> 0 Then
+            WsSetFailure 9218, "Deferred text queue byte accounting is inconsistent."
+        End If
+        Exit Function
+    End If
 
     Dim chunks As Collection
     Dim totalBytes As Long
@@ -2386,8 +2720,14 @@ Private Function WsTryDequeueText(ByRef message As String) As Boolean
     Set chunks = m_ws_rawTextQueue(1)
     totalBytes = CLng(m_ws_rawTextLengthQueue(1))
 
+    If totalBytes < 0 Or totalBytes > m_ws_rawTextQueueBytes Then
+        WsSetFailure 9218, "Deferred text queue byte accounting is invalid."
+        Exit Function
+    End If
+
     m_ws_rawTextQueue.Remove 1
     m_ws_rawTextLengthQueue.Remove 1
+    m_ws_rawTextQueueBytes = m_ws_rawTextQueueBytes - totalBytes
 
     message = WsDecodeUtf8Chunks(chunks, totalBytes)
     WsTryDequeueText = (m_ws_state <> WsTransportFailed)
@@ -2494,8 +2834,7 @@ Private Sub WsForceClose()
     End If
 
     Set m_ws_sendQueue = New Collection
-    Set m_ws_rawTextQueue = New Collection
-    Set m_ws_rawTextLengthQueue = New Collection
+    WsResetDeferredTextQueue
     Set m_ws_messageChunks = Nothing
 
     Erase m_ws_sendCurrent
@@ -2729,7 +3068,7 @@ Private Function WsPrepareHandshakeValues() As Boolean
     If status <> WS_BCRYPT_STATUS_SUCCESS Then
         WsSetFailure 9230, _
                    "Handshake BCryptGenRandom failed. NTSTATUS=0x" & _
-                   Right$("00000000" & hex$(status), 8)
+                   Right$("00000000" & Hex$(status), 8)
         Exit Function
     End If
 
@@ -2778,7 +3117,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     If status <> WS_BCRYPT_STATUS_SUCCESS Then
         failureText = _
             "BCryptOpenAlgorithmProvider NTSTATUS=0x" & _
-            Right$("00000000" & hex$(status), 8)
+            Right$("00000000" & Hex$(status), 8)
         GoTo Cleanup
     End If
 
@@ -2795,7 +3134,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     If status <> WS_BCRYPT_STATUS_SUCCESS Or objectLength <= 0 Then
         failureText = _
             "ObjectLength query NTSTATUS=0x" & _
-            Right$("00000000" & hex$(status), 8)
+            Right$("00000000" & Hex$(status), 8)
         GoTo Cleanup
     End If
 
@@ -2812,7 +3151,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     If status <> WS_BCRYPT_STATUS_SUCCESS Or hashLength <= 0 Then
         failureText = _
             "HashDigestLength query NTSTATUS=0x" & _
-            Right$("00000000" & hex$(status), 8)
+            Right$("00000000" & Hex$(status), 8)
         GoTo Cleanup
     End If
 
@@ -2827,7 +3166,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     If status <> WS_BCRYPT_STATUS_SUCCESS Then
         failureText = _
             "BCryptCreateHash NTSTATUS=0x" & _
-            Right$("00000000" & hex$(status), 8)
+            Right$("00000000" & Hex$(status), 8)
         GoTo Cleanup
     End If
 
@@ -2845,7 +3184,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     If status <> WS_BCRYPT_STATUS_SUCCESS Then
         failureText = _
             "BCryptHashData NTSTATUS=0x" & _
-            Right$("00000000" & hex$(status), 8)
+            Right$("00000000" & Hex$(status), 8)
         GoTo Cleanup
     End If
 
@@ -2855,7 +3194,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     If status <> WS_BCRYPT_STATUS_SUCCESS Then
         failureText = _
             "BCryptFinishHash NTSTATUS=0x" & _
-            Right$("00000000" & hex$(status), 8)
+            Right$("00000000" & Hex$(status), 8)
         GoTo Cleanup
     End If
 
@@ -3316,8 +3655,10 @@ Private Sub WsCompleteCurrentFrame()
                     Set m_ws_messageChunks = New Collection
                 End If
 
-                m_ws_rawTextQueue.Add item:=m_ws_messageChunks
-                m_ws_rawTextLengthQueue.Add m_ws_messageCount
+                If Not WsEnqueueDeferredText(m_ws_messageChunks, m_ws_messageCount) Then
+                    WsResetMessageAccumulator
+                    Exit Sub
+                End If
             End If
 
             If m_ws_messageOversized Then WsTraceOversizedMessageDiagnostic
@@ -3373,17 +3714,23 @@ Private Sub WsMaybeQueueClientPing()
     Dim nowMs As Double
     nowMs = WsMonotonicMs()
 
+    If m_ws_clientPingOutstanding Then
+        If m_ws_clientPingSentAtMs > 0 Then
+            If (nowMs - m_ws_clientPingSentAtMs) >= WS_CLIENT_PONG_TIMEOUT_MS Then
+                WsSetFailure 9221, _
+                    "Client Ping timed out waiting for matching Pong. Sequence=" & _
+                    CStr(m_ws_clientPingOutstandingSequence) & "."
+            End If
+        End If
+        Exit Sub
+    End If
+
     If m_ws_nextClientPingAtMs <= 0 Then
         m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
         Exit Sub
     End If
 
     If nowMs < m_ws_nextClientPingAtMs Then Exit Sub
-
-    If m_ws_clientPingOutstanding Then
-        m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
-        Exit Sub
-    End If
 
     If WsHasPendingSend Then
         m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_BUSY_RETRY_MS
@@ -3409,6 +3756,7 @@ Private Sub WsMaybeQueueClientPing()
 
     m_ws_clientPingOutstanding = True
     m_ws_clientPingOutstandingSequence = m_ws_clientPingSequence
+    m_ws_clientPingSentAtMs = nowMs
     m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
 End Sub
 
@@ -3428,6 +3776,7 @@ Private Sub WsHandleClientPong()
 
     m_ws_clientPingOutstanding = False
     m_ws_clientPingOutstandingSequence = 0
+    m_ws_clientPingSentAtMs = 0
     m_ws_nextClientPingAtMs = nowMs + WS_CLIENT_PING_INTERVAL_MS
 End Sub
 
@@ -3527,7 +3876,7 @@ Private Function WsGenerateMaskKey(ByRef mask() As Byte) As Boolean
     If status <> WS_BCRYPT_STATUS_SUCCESS Then
         WsSetFailure 9220, _
                    "BCryptGenRandom failed. NTSTATUS=0x" & _
-                   Right$("00000000" & hex$(status), 8)
+                   Right$("00000000" & Hex$(status), 8)
         Exit Function
     End If
 
@@ -3753,8 +4102,7 @@ Private Sub WsResetRuntimeState()
     m_ws_lastErrorText = vbNullString
 
     Set m_ws_sendQueue = New Collection
-    Set m_ws_rawTextQueue = New Collection
-    Set m_ws_rawTextLengthQueue = New Collection
+    WsResetDeferredTextQueue
     Set m_ws_messageChunks = Nothing
 
     Erase m_ws_sendCurrent
@@ -3774,6 +4122,7 @@ Private Sub WsResetRuntimeState()
     m_ws_nextClientPingAtMs = 0
     m_ws_clientPingOutstanding = False
     m_ws_clientPingOutstandingSequence = 0
+    m_ws_clientPingSentAtMs = 0
     m_ws_handshakeClientKey = vbNullString
     m_ws_expectedHandshakeAccept = vbNullString
     m_ws_handshakeUserAgent = vbNullString

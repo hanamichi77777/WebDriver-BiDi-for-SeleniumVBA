@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebDriver BiDi New Context Probe</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 760px;
+      margin: 48px auto;
+      padding: 0 20px;
+      line-height: 1.5;
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin: 24px 0;
+    }
+
+    button {
+      padding: 12px 18px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    #status {
+      padding: 12px;
+      background: #f3f3f3;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h1>WebDriver BiDi New Context Probe</h1>
+
+  <p>
+    This page provides deterministic triggers for testing
+    <code>browsingContext.contextCreated</code>.
+  </p>
+
+  <div class="actions">
+    <button id="open-tab" type="button">Open New Tab</button>
+    <button id="open-window" type="button">Open New Window</button>
+  </div>
+
+  <p id="status">Ready.</p>
+
+  <script>
+    const status = document.getElementById('status');
+
+    function initializeChild(child, title, label) {
+      if (!child) {
+        status.textContent = label + ' was blocked.';
+        return;
+      }
+
+      child.document.open();
+      child.document.write(
+        '<!doctype html>' +
+        '<html><head><meta charset="utf-8">' +
+        '<title>' + title + '</title></head>' +
+        '<body><h1>' + title + '</h1>' +
+        '<p>Created by the WebDriver BiDi new-context probe.</p>' +
+        '</body></html>'
+      );
+      child.document.close();
+
+      status.textContent = label + ' was opened.';
+    }
+
+    document.getElementById('open-tab').addEventListener('click', () => {
+      const child = window.open('about:blank', '_blank');
+      initializeChild(child, 'BiDi New Tab Child', 'New tab');
+    });
+
+    document.getElementById('open-window').addEventListener('click', () => {
+      const child = window.open(
+        'about:blank',
+        '_blank',
+        'width=800,height=600'
+      );
+      initializeChild(child, 'BiDi New Window Child', 'New window');
+    });
+  </script>
+</body>
+</html>

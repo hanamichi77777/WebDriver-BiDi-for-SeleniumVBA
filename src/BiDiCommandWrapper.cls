@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "3.9"
+Private Const BIDI_WRAPPER_VERSION As String = "4.0"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -66,6 +66,10 @@ Private m_lastHudCtx As String        ' Context the last HUD was rendered into
 Private m_lastHudRetryTick As Currency ' Throttle timestamp for HUD send retries
 
 Private m_mainContextId As String
+Private m_lostMainContextId As String
+Private m_mainContextState As MainContextState
+Private m_contextLifecycleDroppedEventsBaseline As Long
+Private m_contextLifecycleNeedsReconcile As Boolean
 Private m_cdpSessionId As String
 Private m_cachedRealmIds As Dictionary ' Cached Execution Realm ID
 Private m_validatedContexts As Dictionary ' Context IDs confirmed present in the tree (skips repeat getTree)
@@ -78,18 +82,25 @@ Private m_blockingPatterns As Collection
 
 Private Const DEFAULT_IDLE_STABLE_MS As Long = 500
 Private Const DEFAULT_IDLE_TIMEOUT_MS As Long = 10000
+Private Const DEFAULT_COMMAND_TIMEOUT_MS As Long = 30000
+Private Const NAVIGATION_INTERACTIVE_TRANSPORT_FLOOR_MS As Long = 60000
+Private Const TRANSPORT_TIMEOUT_MARGIN_MS As Long = 5000
+Private Const MAX_TRANSPORT_TIMEOUT_MS As Long = 605000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
 Private Const SHORT_WAIT_MS As Long = 500
 ' Discovery Log ring-buffer limit.
 Private Const MAX_LOG_SIZE As Long = 5000
-Private Const MAX_MSG_SIZE As Long = 300000 ' Threshold to prevent VBA hanging
+Private Const MAX_SUPPRESSED_KEYS As Long = 2000
+Private Const MAX_SUPPRESSED_SUMMARY_LINES As Long = 25
+Private Const MAX_CONSOLE_LOG_TEXT_SIZE As Long = 2000
+Private Const MAX_PARSED_EVENT_SIZE As Long = 524288 ' 512 KiB cap for recorder event parsing
 Private Const MIN_MSG_SIZE As Long = 10     ' Ignore extremely short messages
 ' Reserved send-only ID; communicator discards its response.
 Private Const POST_SCRIPT_ID As Long = 2
 
-Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud"
+Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const SPA_PROBE_VERSION As Long = 36 ' Internal probe generation/quiet/filter-diagnostic contract
+Private Const SPA_PROBE_VERSION As Long = 38 ' Internal probe generation/quiet/filter-diagnostic contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
 Private m_idleFilterRevision As Long          ' increments whenever VBA-side ignore filters change
@@ -102,6 +113,7 @@ Private m_recorderStartTime As Double
 Private m_excludeResources As Boolean
 ' beforeRequestSent is recorder-only; no latency pairing is retained.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
+Private m_recSuppOverflowCount As Long      ' suppressed events not keyed after the key cap
 Private m_droppedHeadCount As Long          ' count of oldest timeline lines evicted by the MAX_LOG_SIZE ring buffer (0 = none)
 
 ' Completion arms gate SPA idle; a hit restarts the full stable window.
@@ -129,6 +141,28 @@ Private m_fileDlgSharedId As String
 Private m_fileDlgMultipleKnown As Boolean
 Private m_fileDlgMultiple As Boolean
 Private m_fileDlgContextMissWarned As Boolean
+Private m_fileDlgDroppedEventsAtArm As Long
+
+' New top-level context capture: baseline snapshot plus opener correlation.
+Private Const NEW_CONTEXT_CORRELATION_OPENER As String = "originalOpener"
+Private Const NEW_CONTEXT_CORRELATION_BASELINE As String = "baseline-diff"
+Private Const NEW_CONTEXT_SETTLE_MS As Long = 150
+Private m_newContextArmed As Boolean
+Private m_newContextSeen As Boolean
+Private m_newContextAmbiguous As Boolean
+Private m_newContextCandidateDestroyed As Boolean
+Private m_newContextOwnerDestroyed As Boolean
+Private m_newContextOwnerContextId As String
+Private m_newContextOwnerClientWindow As String
+Private m_newContextId As String
+Private m_newContextUrl As String
+Private m_newContextOriginalOpener As String
+Private m_newContextClientWindow As String
+Private m_newContextCorrelationMode As String
+Private m_newContextCandidateCount As Long
+Private m_newContextForeignIgnoredCount As Long
+Private m_newContextDroppedEventsAtArm As Long
+Private m_newContextBaseline As Dictionary
 
 ' Download transaction capture: one-shot owner-context arm, begin/end correlation,
 ' and exactly-one start detection. Correlation prefers the BiDi download id; context+navigation
@@ -159,11 +193,14 @@ Private m_downloadSecondNavigationId As String
 Private m_downloadSuggestedFilename As String
 Private m_downloadUrl As String
 Private m_downloadTerminalEligible As Boolean
+Private m_downloadUncorrelatableCount As Long
+Private m_downloadFirstUncorrelatableContext As String
 
 ' browser.setDownloadBehavior is browser-side state that may outlive this wrapper/WebSocket.
 ' Once this wrapper attempts to change it, Shutdown must best-effort clear the global behavior
 ' before transport teardown. v1 intentionally does not expose userContexts scoping.
 Private m_downloadBehaviorCleanupRequired As Boolean
+Private m_downloadBehaviorStateUnknown As Boolean
 
 ' Native file-chooser interception is target/session state outside the VBA object.
 ' "MayBeActive" is intentionally conservative: it is set BEFORE the enable command is sent
@@ -189,6 +226,16 @@ Private Const ERR_CONNECT_FAILED As Long = vbObjectError + 1011 ' WebSocket conn
 Private Const ERR_DOWNLOAD_START_TIMEOUT As Long = vbObjectError + 1020
 Private Const ERR_DOWNLOAD_COMPLETION_TIMEOUT As Long = vbObjectError + 1021
 Private Const ERR_DOWNLOAD_MULTIPLE_STARTED As Long = vbObjectError + 1022
+Private Const ERR_MAIN_CONTEXT_LOST As Long = vbObjectError + 1023
+Private Const ERR_NEW_CONTEXT_TIMEOUT As Long = vbObjectError + 1024
+Private Const ERR_NEW_CONTEXT_MULTIPLE As Long = vbObjectError + 1025
+Private Const ERR_NEW_CONTEXT_DESTROYED As Long = vbObjectError + 1026
+
+Private Enum MainContextState
+    MainContextUnbound = 0
+    MainContextPinned = 1
+    MainContextLost = 2
+End Enum
 
 Public Enum BiDiMatchBy
     MatchByUrl = 0
@@ -215,6 +262,8 @@ Private Sub Class_Initialize()
     Set m_probeFilterRevisions = New Dictionary
     Set m_reportedInvalidSelectors = New Dictionary
     Set m_blockingPatterns = New Collection
+    Set m_newContextBaseline = New Dictionary
+    m_mainContextState = MainContextUnbound
 
     ResetSignalState
     ResetLastSyncState
@@ -267,12 +316,21 @@ Public Sub ConnectTo(ByVal webSocketUrl As String, _
 
     m_shutdownCompleted = False
     
-    Me.ExecuteSessionSubscribe Array("log.entryAdded", "browsingContext.navigationStarted"), , True
+    Me.ExecuteSessionSubscribe Array( _
+        "log.entryAdded", _
+        "browsingContext.navigationStarted", _
+        "browsingContext.contextCreated", _
+        "browsingContext.contextDestroyed"), , True
+    m_contextLifecycleDroppedEventsBaseline = CurrentLifecycleRelevantLossCount()
 
     ' Hard-reset insurance: a previous VBA project may have died after enabling Chromium's
     ' file-chooser interceptor. Sweep current Chromium page sessions back to disabled.
     ' Unsupported browsers are ignored without failing ConnectTo.
     RecoverResidualFileChooserInterceptionOnConnectBestEffort
+
+    ' Hard-reset insurance for browser.setDownloadBehavior. Unsupported implementations are
+    ' accepted; an indeterminate clear leaves download execution blocked until a setter succeeds.
+    RecoverResidualDownloadBehaviorOnConnectBestEffort
 
     Dim shadowErrNum As Long
     Dim shadowErrSrc As String
@@ -386,6 +444,12 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
 
         Case "browsingContext.downloadEnd"
             Call HandleDownloadEndEvent(json)
+
+        Case "browsingContext.contextCreated"
+            Call HandleContextCreatedEvent(json)
+
+        Case "browsingContext.contextDestroyed"
+            Call HandleContextDestroyedEvent(json)
 
         Case "browsingContext.navigationStarted"
             m_navigationDetected = True
@@ -515,8 +579,285 @@ Private Sub HandleFileDialogOpenedEvent(ByVal json As Object)
                   " | multiple=" & IIf(m_fileDlgMultipleKnown, LCase$(CStr(m_fileDlgMultiple)), "unknown")
 End Sub
 
-' Diagnostic formatter preserves the distinction between a missing member and explicit JSON null;
-' neither marker is interpreted as a browser-side cause.
+Private Sub HandleContextCreatedEvent(ByVal json As Object)
+    Dim eventCtx As String
+    eventCtx = GetPathString(json, "params.context")
+    If Len(eventCtx) = 0 Then Exit Sub
+
+    If m_validatedContexts Is Nothing Then Set m_validatedContexts = New Dictionary
+    m_validatedContexts(eventCtx) = True
+
+    If Not m_newContextArmed Then Exit Sub
+
+    Dim parentId As String
+    parentId = GetPathString(json, "params.parent")
+    If Len(parentId) > 0 Then Exit Sub
+
+    If Not m_newContextBaseline Is Nothing Then
+        If m_newContextBaseline.Exists(eventCtx) Then Exit Sub
+    End If
+
+    Dim openerId As String
+    openerId = GetPathString(json, "params.originalOpener")
+
+    Dim correlationMode As String
+    If Len(openerId) > 0 Then
+        If StrComp(openerId, m_newContextOwnerContextId, vbBinaryCompare) <> 0 Then
+            m_newContextForeignIgnoredCount = m_newContextForeignIgnoredCount + 1
+            If m_debugMode Then
+                Debug.Print "BiDi: New context ignored; opener does not match owner. ctx=" & eventCtx
+            End If
+            Exit Sub
+        End If
+        correlationMode = NEW_CONTEXT_CORRELATION_OPENER
+    Else
+        correlationMode = NEW_CONTEXT_CORRELATION_BASELINE
+    End If
+
+    If Not m_newContextSeen Then
+        m_newContextSeen = True
+        m_newContextCandidateCount = 1
+        m_newContextId = eventCtx
+        m_newContextUrl = GetPathString(json, "params.url")
+        m_newContextOriginalOpener = openerId
+        m_newContextClientWindow = GetPathString(json, "params.clientWindow")
+        m_newContextCorrelationMode = correlationMode
+
+        If m_debugMode Then
+            Debug.Print "BiDi: New context captured. ctx=" & eventCtx & _
+                        " | correlation=" & correlationMode
+        End If
+        Exit Sub
+    End If
+
+    If StrComp(eventCtx, m_newContextId, vbBinaryCompare) = 0 Then Exit Sub
+
+    m_newContextCandidateCount = m_newContextCandidateCount + 1
+    m_newContextAmbiguous = True
+    m_newContextArmed = False
+End Sub
+
+Private Sub HandleContextDestroyedEvent(ByVal json As Object)
+    Dim eventCtx As String
+    eventCtx = GetPathString(json, "params.context")
+    If Len(eventCtx) = 0 Then Exit Sub
+
+    InvalidateContextState eventCtx, True
+
+    If m_newContextArmed Then
+        If StrComp(eventCtx, m_newContextOwnerContextId, vbBinaryCompare) = 0 Then
+            m_newContextOwnerDestroyed = True
+        End If
+    End If
+
+    If m_newContextSeen Then
+        If StrComp(eventCtx, m_newContextId, vbBinaryCompare) = 0 Then
+            m_newContextCandidateDestroyed = True
+            m_newContextArmed = False
+        End If
+    End If
+End Sub
+
+Private Sub InvalidateContextState(ByVal contextId As String, _
+                                   Optional ByVal markMainLost As Boolean = True)
+    If Len(contextId) = 0 Then Exit Sub
+
+    If Not m_cachedRealmIds Is Nothing Then
+        If m_cachedRealmIds.Exists(contextId) Then m_cachedRealmIds.Remove contextId
+    End If
+
+    If Not m_validatedContexts Is Nothing Then
+        If m_validatedContexts.Exists(contextId) Then m_validatedContexts.Remove contextId
+    End If
+
+    If Not m_probeFilterRevisions Is Nothing Then
+        If m_probeFilterRevisions.Exists(contextId) Then m_probeFilterRevisions.Remove contextId
+    End If
+
+    If StrComp(m_lastHudCtx, contextId, vbBinaryCompare) = 0 Then
+        m_lastHudCtx = ""
+        m_lastHudKey = ""
+        m_lastHudRetryTick = 0
+    End If
+
+    RemoveContextScopedSubscriptionRegistry contextId
+
+    If markMainLost Then MarkMainContextLost contextId
+End Sub
+
+Private Sub RemoveContextScopedSubscriptionRegistry(ByVal contextId As String)
+    ' Local registry only; context-scoped remote unsubscribe is not used by current callers.
+    If m_activeSubscriptions Is Nothing Then Exit Sub
+    If m_activeSubscriptions.count = 0 Then Exit Sub
+
+    Dim suffix As String
+    suffix = "|" & contextId
+
+    Dim keys As Variant
+    keys = m_activeSubscriptions.keys
+
+    Dim i As Long
+    For i = LBound(keys) To UBound(keys)
+        Dim key As String
+        key = CStr(keys(i))
+        If Len(key) >= Len(suffix) Then
+            If StrComp(Right$(key, Len(suffix)), suffix, vbBinaryCompare) = 0 Then
+                m_activeSubscriptions.Remove key
+            End If
+        End If
+    Next i
+End Sub
+
+Private Sub ResetNewContextCaptureState()
+    m_newContextArmed = False
+    m_newContextSeen = False
+    m_newContextAmbiguous = False
+    m_newContextCandidateDestroyed = False
+    m_newContextOwnerDestroyed = False
+    m_newContextOwnerContextId = ""
+    m_newContextOwnerClientWindow = ""
+    m_newContextId = ""
+    m_newContextUrl = ""
+    m_newContextOriginalOpener = ""
+    m_newContextClientWindow = ""
+    m_newContextCorrelationMode = ""
+    m_newContextCandidateCount = 0
+    m_newContextForeignIgnoredCount = 0
+    m_newContextDroppedEventsAtArm = 0
+    Set m_newContextBaseline = New Dictionary
+End Sub
+
+Private Sub ArmNewContextCapture(ByVal ownerContextId As String)
+    ResetNewContextCaptureState
+
+    Dim rawTree As String
+    rawTree = ExecuteBiDiCommand("browsingContext.getTree", New Dictionary, True)
+
+    Dim tree As Object
+    Set tree = ValidateProtocolResponse(rawTree, "browsingContext.getTree")
+
+    Dim contexts As Collection
+    Set contexts = GetPathObject(tree, "result.contexts")
+    If contexts Is Nothing Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ArmNewContextCapture", _
+                  "browsingContext.getTree returned no top-level context list."
+    End If
+
+    ReconcileContextTreeCache contexts
+
+    Dim ownerInfo As Dictionary
+    Set ownerInfo = FindContextInfoExactId(contexts, ownerContextId)
+    If ownerInfo Is Nothing Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ArmNewContextCapture", _
+                  "Owner context is no longer present: " & ownerContextId
+    End If
+
+    Dim ctx As Dictionary
+    For Each ctx In contexts
+        Dim existingId As String
+        existingId = GetPathString(ctx, "context")
+        If Len(existingId) > 0 Then m_newContextBaseline(existingId) = True
+    Next ctx
+
+    ' Drain events accumulated during getTree while the local capture arm is still down.
+    ' This narrows the stale baseline-diff window without adding a queue watermark.
+    ProcessRecorderQueue
+
+    m_newContextOwnerContextId = ownerContextId
+    m_newContextOwnerClientWindow = GetPathString(ownerInfo, "clientWindow")
+    m_newContextDroppedEventsAtArm = CurrentLifecycleRelevantLossCount()
+    m_newContextArmed = True
+End Sub
+
+Private Function NewContextDroppedEventsSinceArm() As Long
+    Dim delta As Long
+    delta = CurrentLifecycleRelevantLossCount() - m_newContextDroppedEventsAtArm
+    If delta < 0 Then delta = 0
+    NewContextDroppedEventsSinceArm = delta
+End Function
+
+Private Sub WaitForNewContextCapture(ByVal timeoutMs As Long, ByVal methodName As String)
+    Dim startTick As Currency
+    startTick = socket_.NowTicks()
+
+    Dim settleTick As Currency
+    Dim settleStarted As Boolean
+
+    Do
+        ProcessRecorderQueue
+
+        If NewContextDroppedEventsSinceArm() > 0 Then
+            m_newContextArmed = False
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
+                      "Async event loss occurred after the new-context arm boundary; " & _
+                      "exact context capture cannot be guaranteed."
+        End If
+
+        If m_newContextAmbiguous Then
+            Err.Raise ERR_NEW_CONTEXT_MULTIPLE, "BiDi:" & methodName, _
+                      "Multiple new top-level browsing contexts matched one trigger. " & _
+                      "The trigger is not replayed. CandidateCount=" & _
+                      CStr(m_newContextCandidateCount) & "."
+        End If
+
+        If m_newContextCandidateDestroyed Then
+            Err.Raise ERR_NEW_CONTEXT_DESTROYED, "BiDi:" & methodName, _
+                      "The captured browsing context was destroyed before capture completed."
+        End If
+
+        If m_newContextSeen Then
+            If Not settleStarted Then
+                settleTick = socket_.NowTicks()
+                settleStarted = True
+            ElseIf socket_.elapsedMs(settleTick) >= NEW_CONTEXT_SETTLE_MS Then
+                m_newContextArmed = False
+                Exit Sub
+            End If
+        ElseIf IsTimeout(startTick, CDbl(timeoutMs)) Then
+            m_newContextArmed = False
+
+            Dim ownerNote As String
+            If m_newContextOwnerDestroyed Then
+                ownerNote = " Owner context was destroyed during the wait."
+            End If
+
+            Err.Raise ERR_NEW_CONTEXT_TIMEOUT, "BiDi:" & methodName, _
+                      "No new top-level browsing context was captured within " & _
+                      CStr(timeoutMs) & "ms." & ownerNote & _
+                      " ForeignContextsIgnored=" & CStr(m_newContextForeignIgnoredCount) & "."
+        End If
+
+        WaitHeartbeat 50
+    Loop
+End Sub
+
+Private Function BuildNewContextResult() As Dictionary
+    Dim result As New Dictionary
+    result.Add "context", m_newContextId
+    result.Add "url", m_newContextUrl
+    result.Add "originalOpener", m_newContextOriginalOpener
+    result.Add "clientWindow", m_newContextClientWindow
+    result.Add "ownerContext", m_newContextOwnerContextId
+    result.Add "ownerClientWindow", m_newContextOwnerClientWindow
+    result.Add "correlation", m_newContextCorrelationMode
+    result.Add "candidateCount", m_newContextCandidateCount
+    result.Add "foreignIgnored", m_newContextForeignIgnoredCount
+
+    Dim kind As String
+    kind = "unknown"
+    If Len(m_newContextOwnerClientWindow) > 0 And Len(m_newContextClientWindow) > 0 Then
+        If StrComp(m_newContextOwnerClientWindow, m_newContextClientWindow, vbBinaryCompare) = 0 Then
+            kind = "tab"
+        Else
+            kind = "window"
+        End If
+    End If
+    result.Add "kind", kind
+
+    Set BuildNewContextResult = result
+End Function
+
+' Diagnostic formatter preserves missing and explicit JSON null separately.
 Private Function GetDownloadDiagnosticField(ByVal params As Object, ByVal key As String) As String
     If params Is Nothing Then
         GetDownloadDiagnosticField = "(missing)"
@@ -643,7 +984,12 @@ Private Sub HandleDownloadWillBeginEvent(ByVal json As Object)
         ' v1 cannot safely pair downloadEnd when both protocol identities are absent. Keep the
         ' one-shot arm available for a later correlatable owner-context start; the raw event remains
         ' visible in diagnostics and no browser-side cause is inferred.
-        LogSignalLine "[DOWNLOAD-WILL-BEGIN-IGNORED] reason=uncorrelatable | ctx=" & eventCtx
+        m_downloadUncorrelatableCount = m_downloadUncorrelatableCount + 1
+        If Len(m_downloadFirstUncorrelatableContext) = 0 Then
+            m_downloadFirstUncorrelatableContext = eventCtx
+        End If
+        LogSignalLine "[DOWNLOAD-WILL-BEGIN-IGNORED] reason=uncorrelatable | ctx=" & eventCtx & _
+                      " | count=" & CStr(m_downloadUncorrelatableCount)
         Exit Sub
     End If
 
@@ -776,12 +1122,14 @@ Private Sub ResetDownloadCaptureState()
     m_downloadSuggestedFilename = vbNullString
     m_downloadUrl = vbNullString
     m_downloadTerminalEligible = False
+    m_downloadUncorrelatableCount = 0
+    m_downloadFirstUncorrelatableContext = vbNullString
 End Sub
 
 Private Sub ArmDownloadCapture(ByVal contextId As String)
     ResetDownloadCaptureState
     m_downloadOwnerContextId = contextId
-    m_downloadDroppedEventsAtArm = socket_.DroppedEventsCount
+    m_downloadDroppedEventsAtArm = CurrentDownloadRelevantLossCount()
     m_downloadArmed = True
     LogSignalLine "[DOWNLOAD-ARM] ctx=" & contextId & _
                   " | droppedBase=" & CStr(m_downloadDroppedEventsAtArm)
@@ -789,7 +1137,7 @@ End Sub
 
 Private Function DownloadDroppedEventsSinceArm() As Long
     Dim delta As Long
-    delta = socket_.DroppedEventsCount - m_downloadDroppedEventsAtArm
+    delta = CurrentDownloadRelevantLossCount() - m_downloadDroppedEventsAtArm
     If delta < 0 Then delta = 0
     DownloadDroppedEventsSinceArm = delta
 End Function
@@ -806,8 +1154,7 @@ Private Sub RaiseDownloadMultipleStarted(ByVal methodName As String)
     Err.Raise ERR_DOWNLOAD_MULTIPLE_STARTED, "BiDi:" & methodName, _
               "MultipleDownloadsStarted: more than one download started in the owner context. " & _
               "The trigger is not replayed. FirstCorrelation=" & m_downloadCorrelationMode & _
-              "; SecondCorrelation=" & m_downloadSecondCorrelationMode & _
-              "; AsyncEventsDroppedSinceArm=" & CStr(DownloadDroppedEventsSinceArm()) & "."
+              "; SecondCorrelation=" & m_downloadSecondCorrelationMode & "."
 End Sub
 
 Private Sub WaitForDownloadTransaction(ByVal timeoutMs As Long, ByVal methodName As String)
@@ -820,6 +1167,18 @@ Private Sub WaitForDownloadTransaction(ByVal timeoutMs As Long, ByVal methodName
     Do
         ProcessRecorderQueue
 
+        If DownloadDroppedEventsSinceArm() > 0 Then
+            m_downloadArmed = False
+            m_downloadTerminalEligible = False
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
+                      "Async event loss occurred while waiting for download start; reliable " & _
+                      "download transaction capture cannot be determined. The trigger click has " & _
+                      "already been dispatched and is not replayed automatically. Do not blindly " & _
+                      "retry the whole download operation because a download may already have " & _
+                      "started. AsyncEventsDroppedSinceArm=" & _
+                      CStr(DownloadDroppedEventsSinceArm()) & "."
+        End If
+
         If m_downloadMultipleStarted Then RaiseDownloadMultipleStarted methodName
         If m_downloadStartedSeen Then Exit Do
 
@@ -828,7 +1187,9 @@ Private Sub WaitForDownloadTransaction(ByVal timeoutMs As Long, ByVal methodName
             Err.Raise ERR_DOWNLOAD_START_TIMEOUT, "BiDi:" & methodName, _
                       "DownloadStartTimeout: no correlatable browsingContext.downloadWillBegin " & _
                       "was accepted within " & CStr(timeoutMs) & "ms. The trigger is not replayed. " & _
-                      "AsyncEventsDroppedSinceArm=" & CStr(DownloadDroppedEventsSinceArm()) & _
+                      "UncorrelatableStarts=" & CStr(m_downloadUncorrelatableCount) & _
+                      "; FirstUncorrelatableContext=" & _
+                      IIf(Len(m_downloadFirstUncorrelatableContext) > 0, m_downloadFirstUncorrelatableContext, "(none)") & _
                       "; AsyncQueueDepthAtTimeout=" & CStr(DownloadEventQueueDepth()) & "."
         End If
         WaitHeartbeat 50
@@ -841,6 +1202,17 @@ Private Sub WaitForDownloadTransaction(ByVal timeoutMs As Long, ByVal methodName
     Do
         ProcessRecorderQueue
 
+        If DownloadDroppedEventsSinceArm() > 0 Then
+            m_downloadArmed = False
+            m_downloadTerminalEligible = False
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
+                      "Async event loss occurred while waiting for download completion; reliable " & _
+                      "download transaction capture cannot be determined. The trigger click has " & _
+                      "already been dispatched, and the download may already have completed or " & _
+                      "left a file on disk. Do not blindly retry the whole download operation. " & _
+                      "AsyncEventsDroppedSinceArm=" & CStr(DownloadDroppedEventsSinceArm()) & "."
+        End If
+
         If m_downloadMultipleStarted Then RaiseDownloadMultipleStarted methodName
         If m_downloadEndSeen Then Exit Sub
 
@@ -849,9 +1221,8 @@ Private Sub WaitForDownloadTransaction(ByVal timeoutMs As Long, ByVal methodName
             Err.Raise ERR_DOWNLOAD_COMPLETION_TIMEOUT, "BiDi:" & methodName, _
                       "DownloadCompletionTimeout: no matching browsingContext.downloadEnd was " & _
                       "accepted within " & CStr(timeoutMs) & "ms after the download start. " & _
-                      "The trigger is not replayed. AsyncEventsDroppedSinceArm=" & _
-                      CStr(DownloadDroppedEventsSinceArm()) & _
-                      "; AsyncQueueDepthAtTimeout=" & CStr(DownloadEventQueueDepth()) & "."
+                      "The trigger is not replayed. AsyncQueueDepthAtTimeout=" & _
+                      CStr(DownloadEventQueueDepth()) & "."
         End If
         WaitHeartbeat 50
     Loop
@@ -889,9 +1260,17 @@ Private Sub SetGlobalDownloadBehavior(ByVal behaviorType As String, _
         params.Add "downloadBehavior", behavior
     End If
 
-    ' Set conservatively before the command. If the transport outcome is ambiguous, Shutdown must
-    ' still attempt to clear possible browser-side residue rather than assume the command failed.
+    ' Set conservatively before dispatch. A definite protocol rejection restores the prior
+    ' state; only an ambiguous outcome keeps the browser-side state marked unknown.
+    Dim previousCleanupRequired As Boolean
+    Dim previousStateUnknown As Boolean
+    previousCleanupRequired = m_downloadBehaviorCleanupRequired
+    previousStateUnknown = m_downloadBehaviorStateUnknown
+
     m_downloadBehaviorCleanupRequired = True
+    m_downloadBehaviorStateUnknown = True
+
+    On Error GoTo Failed
 
     Dim strRes As String
     strRes = ExecuteBiDiCommand("browser.setDownloadBehavior", params, True, _
@@ -900,7 +1279,24 @@ Private Sub SetGlobalDownloadBehavior(ByVal behaviorType As String, _
     Dim parsed As Object
     Set parsed = ValidateProtocolResponse(strRes, "browser.setDownloadBehavior")
 
+    m_downloadBehaviorStateUnknown = False
     If clearBehavior Then m_downloadBehaviorCleanupRequired = False
+    Exit Sub
+
+Failed:
+    Dim savedErrNum As Long: savedErrNum = Err.Number
+    Dim savedErrSrc As String: savedErrSrc = Err.source
+    Dim savedErrDesc As String: savedErrDesc = Err.description
+
+    If IsUnsupportedDownloadBehaviorError(savedErrNum, savedErrSrc, savedErrDesc) Then
+        m_downloadBehaviorCleanupRequired = False
+        m_downloadBehaviorStateUnknown = False
+    ElseIf Not IsAmbiguousDispatchFailure(savedErrNum, savedErrSrc, savedErrDesc) Then
+        m_downloadBehaviorCleanupRequired = previousCleanupRequired
+        m_downloadBehaviorStateUnknown = previousStateUnknown
+    End If
+
+    Err.Raise savedErrNum, savedErrSrc, savedErrDesc
 End Sub
 
 ' Sets the global BiDi download destination for the current browser session. The folder is resolved
@@ -973,6 +1369,20 @@ Public Function ExecuteDownloadByXPath(ByVal triggerXPath As String, _
     Dim targetCtx As String
     targetCtx = ResolveTargetContext(contextId)
 
+    If m_downloadBehaviorStateUnknown Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & METHOD_NAME, _
+                  "DownloadBehaviorStateUnknown: browser.setDownloadBehavior cleanup could not " & _
+                  "be confirmed. Call SetDownloadFolder, SetDownloadDenied, or " & _
+                  "ClearDownloadBehavior before starting another download."
+    End If
+
+    Dim carryoverDiagnosticActive As Boolean
+    Dim carryDomSeenBefore As Boolean
+    Dim carryNetSeenBefore As Boolean
+    Dim carryVisSeenBefore As Boolean
+    carryoverDiagnosticActive = BeginSignalCarryoverDiagnostic( _
+        METHOD_NAME, targetCtx, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore)
+
     ' Lazy subscription keeps download traffic out of sessions that never use the feature. The
     ' registry makes repeated calls delta-only and therefore cheap.
     Me.ExecuteSessionSubscribe Array( _
@@ -1009,11 +1419,23 @@ Public Function ExecuteDownloadByXPath(ByVal triggerXPath As String, _
         ' propagating the original transport/protocol/action error.
         m_downloadArmed = False
         m_downloadTerminalEligible = False
+        EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
         Err.Raise clickErrNum, clickErrSrc, clickErrDesc
     End If
 
+    On Error GoTo DownloadWaitFailed
     WaitForDownloadTransaction vTimeout, METHOD_NAME
+    On Error GoTo 0
+    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
     Set ExecuteDownloadByXPath = BuildDownloadResult()
+    Exit Function
+
+DownloadWaitFailed:
+    Dim waitErrNum As Long: waitErrNum = Err.Number
+    Dim waitErrSrc As String: waitErrSrc = Err.source
+    Dim waitErrDesc As String: waitErrDesc = Err.description
+    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+    Err.Raise waitErrNum, waitErrSrc, waitErrDesc
 End Function
 
 Public Function GetIframeContextIdByUrl(ByVal partialUrl As String, Optional ByVal timeoutMs As Long = 5000) As String
@@ -1110,11 +1532,20 @@ Public Function ExecuteFindWindowContextId(ByVal matchType As BiDiMatchBy, _
                                            ByVal matchValue As String, _
                                            Optional ByVal timeoutMs As Long = 5000, _
                                            Optional ByVal waitForComplete As Boolean = True) As String
+    If matchType <> MatchByUrl And matchType <> MatchByTitle Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteFindWindowContextId", _
+                  "matchType must be MatchByUrl or MatchByTitle."
+    End If
+
     Dim vTimeout As Long: vTimeout = SanitizeMs(timeoutMs, "timeoutMs", 5000)
     Dim startTick As Currency: startTick = socket_.NowTicks()
-    Dim strRes As String, res As Variant
+    Dim strRes As String
     Dim jsonTree As Object, ctxList As Collection, ctx As Dictionary
     Dim pendingTransient As String, lastLoggedTransient As String
+    Dim candidateCtx As String
+    Dim candidateTitle As String
+    Dim readyState As String
+    Dim isMatch As Boolean
 
     Do
         strRes = ExecuteBiDiCommand("browsingContext.getTree", New Dictionary)
@@ -1124,27 +1555,40 @@ Public Function ExecuteFindWindowContextId(ByVal matchType As BiDiMatchBy, _
             Set ctxList = GetPathObject(jsonTree, "result.contexts")
             If Not ctxList Is Nothing Then
                 For Each ctx In ctxList
-                    Dim isMatch As Boolean
+                    isMatch = False
+                    candidateCtx = vbNullString
+
+                    If Not ctx.Exists("context") Then GoTo NextWindowContext
+                    candidateCtx = CStr(ctx("context"))
+                    If Len(candidateCtx) = 0 Then GoTo NextWindowContext
+
                     If matchType = MatchByUrl Then
-                        isMatch = (InStr(ctx("url"), matchValue) > 0)
-                    ElseIf matchType = MatchByTitle Then
-                        isMatch = (InStr(ExecuteGetTitleByContextId(ctx("context")), matchValue) > 0)
+                        If Not ctx.Exists("url") Then GoTo NextWindowContext
+                        isMatch = (InStr(CStr(ctx("url")), matchValue) > 0)
+                    Else
+                        candidateTitle = vbNullString
+                        If Not TryGetWindowContextTitle(candidateCtx, candidateTitle) Then
+                            GoTo NextWindowContext
+                        End If
+                        isMatch = (InStr(candidateTitle, matchValue) > 0)
                     End If
 
                     If isMatch Then
                         If Not waitForComplete Then
-                            ExecuteFindWindowContextId = ctx("context")
+                            ExecuteFindWindowContextId = candidateCtx
                             Exit Function
                         End If
 
-                        res = GetCleanResult(CallScript( _
-                            "return document.readyState;", , ctx("context"), _
-                            allowAmbiguousRetry:=True))
-                        If CStr(res) = "complete" Then
-                            ExecuteFindWindowContextId = ctx("context")
+                        readyState = vbNullString
+                        If Not TryGetWindowContextReadyState(candidateCtx, readyState) Then
+                            GoTo NextWindowContext
+                        End If
+                        If StrComp(readyState, "complete", vbBinaryCompare) = 0 Then
+                            ExecuteFindWindowContextId = candidateCtx
                             Exit Function
                         End If
                     End If
+NextWindowContext:
                 Next ctx
             End If
         End If
@@ -1157,6 +1601,153 @@ Public Function ExecuteFindWindowContextId(ByVal matchType As BiDiMatchBy, _
                       "ms (Match: " & matchValue & ")"
         End If
     Loop
+End Function
+
+Private Function TryGetWindowContextTitle(ByVal contextId As String, _
+                                          ByRef titleText As String) As Boolean
+    On Error GoTo Failed
+
+    titleText = ExecuteGetTitleByContextId(contextId)
+    TryGetWindowContextTitle = True
+    Exit Function
+
+Failed:
+    Dim errNum As Long: errNum = Err.Number
+    Dim errSrc As String: errSrc = Err.source
+    Dim errDesc As String: errDesc = Err.description
+    Err.Clear
+
+    If IsTransientWindowContextReadError(errNum, errSrc, errDesc) Then
+        If m_debugMode Then
+            Debug.Print "BiDi: Transient window-context read skipped | phase=title | ctx=" & _
+                        Left$(contextId, 16) & "..." & " | " & errDesc
+        End If
+        Exit Function
+    End If
+
+    Err.Raise errNum, errSrc, errDesc
+End Function
+
+Private Function TryGetWindowContextReadyState(ByVal contextId As String, _
+                                               ByRef readyState As String) As Boolean
+    On Error GoTo Failed
+
+    readyState = CStr(GetCleanResult(CallScript( _
+                    "return document.readyState;", , contextId, _
+                    allowAmbiguousRetry:=True)))
+    TryGetWindowContextReadyState = True
+    Exit Function
+
+Failed:
+    Dim errNum As Long: errNum = Err.Number
+    Dim errSrc As String: errSrc = Err.source
+    Dim errDesc As String: errDesc = Err.description
+    Err.Clear
+
+    If IsTransientWindowContextReadError(errNum, errSrc, errDesc) Then
+        If m_debugMode Then
+            Debug.Print "BiDi: Transient window-context read skipped | phase=readyState | ctx=" & _
+                        Left$(contextId, 16) & "..." & " | " & errDesc
+        End If
+        Exit Function
+    End If
+
+    Err.Raise errNum, errSrc, errDesc
+End Function
+
+Private Function IsTransientWindowContextReadError(ByVal errNum As Long, _
+                                                   ByVal errSrc As String, _
+                                                   ByVal errDesc As String) As Boolean
+    If errNum <> ERR_BIDI_PROTOCOL And _
+       errNum <> ERR_ACTION_FAILED And _
+       errNum <> ERR_JS_EXCEPTION Then Exit Function
+
+    Dim d As String: d = LCase$(errDesc)
+
+    If InStr(d, "inspected target navigated or closed") > 0 Or _
+       InStr(d, "execution context was destroyed") > 0 Or _
+       InStr(d, "document was unloaded") > 0 Or _
+       InStr(d, "target navigated") > 0 Or _
+       InStr(d, "[no such frame]") > 0 Or _
+       InStr(d, "[no such window]") > 0 Or _
+       InStr(d, "cannot find context") > 0 Then
+        IsTransientWindowContextReadError = True
+        Exit Function
+    End If
+
+    IsTransientWindowContextReadError = _
+        (InStr(d, "context") > 0) And _
+        ((InStr(d, "destroyed") > 0) Or _
+         (InStr(d, "gone") > 0) Or _
+         (InStr(d, "closed") > 0) Or _
+         (InStr(d, "not found") > 0))
+End Function
+
+Public Function ExecuteOpenNewContextByXPath(ByVal triggerXPath As String, _
+                                              Optional ByVal searchTimeoutMs As Long = 10000, _
+                                              Optional ByVal timeoutMs As Long = 10000, _
+                                              Optional ByVal ownerContextId As String = "") As Dictionary
+    Const METHOD_NAME As String = "ExecuteOpenNewContextByXPath"
+
+    Dim vTimeout As Long
+    vTimeout = SanitizeMs(timeoutMs, "timeoutMs", 10000, 1)
+
+    Dim ownerCtx As String
+    ownerCtx = ResolveTargetContext(ownerContextId)
+
+    Dim carryoverDiagnosticActive As Boolean
+    Dim carryDomSeenBefore As Boolean
+    Dim carryNetSeenBefore As Boolean
+    Dim carryVisSeenBefore As Boolean
+    carryoverDiagnosticActive = BeginSignalCarryoverDiagnostic( _
+        METHOD_NAME, ownerCtx, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore)
+
+    ' Resolve before arming so lookup cannot consume the capture boundary.
+    Dim triggerSharedId As String
+    triggerSharedId = ResolveXPathOrThrow(triggerXPath, ownerCtx, searchTimeoutMs, METHOD_NAME)
+
+    ProcessRecorderQueue
+    ArmNewContextCapture ownerCtx
+
+    Dim clickArgs As Collection
+    Set clickArgs = NewElementArgs(triggerSharedId)
+
+    Dim clickResult As String
+    Dim clickErrNum As Long
+    Dim clickErrSrc As String
+    Dim clickErrDesc As String
+
+    On Error Resume Next
+    clickResult = PerformTrustedClick(ownerCtx, clickArgs, vTimeout, False)
+    clickErrNum = Err.Number
+    clickErrSrc = Err.source
+    clickErrDesc = Err.description
+    On Error GoTo 0
+
+    If clickErrNum <> 0 Then
+        ResetNewContextCaptureState
+        EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+        Err.Raise clickErrNum, clickErrSrc, clickErrDesc
+    End If
+
+    On Error GoTo CaptureFailed
+    WaitForNewContextCapture vTimeout, METHOD_NAME
+    On Error GoTo 0
+
+    Dim result As Dictionary
+    Set result = BuildNewContextResult()
+    ResetNewContextCaptureState
+    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+    Set ExecuteOpenNewContextByXPath = result
+    Exit Function
+
+CaptureFailed:
+    Dim captureErrNum As Long: captureErrNum = Err.Number
+    Dim captureErrSrc As String: captureErrSrc = Err.source
+    Dim captureErrDesc As String: captureErrDesc = Err.description
+    ResetNewContextCaptureState
+    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+    Err.Raise captureErrNum, captureErrSrc, captureErrDesc
 End Function
 
 Public Function ExecuteCreateContext(Optional ByVal createType As BiDiContextType = ContextTypeTab) As String
@@ -1179,15 +1770,21 @@ Public Function ExecuteCreateContext(Optional ByVal createType As BiDiContextTyp
 End Function
 
 Public Function ExecuteCloseContext(ByVal contextId As String) As String
+    Dim wasMain As Boolean
+    wasMain = (m_mainContextState = MainContextPinned And _
+               StrComp(contextId, m_mainContextId, vbBinaryCompare) = 0)
+
     Dim params As New Dictionary
     params.Add "context", contextId
     Dim closeRes As String
     closeRes = ExecuteBiDiCommand("browsingContext.close", params, _
                                   allowAmbiguousRetry:=False, allowRecoveryRetry:=False)
-    ' Clear wrapper state only after the browser confirms close.
     ValidateProtocolResponse closeRes, "browsingContext.close"
+
+    InvalidateContextState contextId, Not wasMain
+    If wasMain Then SetMainContextUnbound
+
     ExecuteCloseContext = closeRes
-    If contextId = m_mainContextId Then ClearState
 End Function
 
 Public Function ExecuteGetTitleByContextId(ByVal contextId As String) As String
@@ -1263,6 +1860,9 @@ Public Function ExecuteIsUrlContains(ByVal partialUrl As String, _
     ExecuteIsUrlContains = isMatched
 End Function
 
+' The protocol transport uses a 60-second floor. Because the communicator hard deadline
+' is twice the command timeout, a silent live connection may block one navigate call
+' for about 120 seconds before the transport reports failure.
 Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
                                     Optional ByVal waitNetworkIdle As Boolean = True, _
                                     Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
@@ -1541,6 +2141,61 @@ Private Function NewElementArgs(ByVal sharedId As String, _
     Set NewElementArgs = args
 End Function
 
+' Rebuild element arguments with a fresh sharedId while preserving remaining values.
+Private Function ReplaceFirstElementReference(ByVal sourceArgs As Collection, _
+                                              ByVal sharedId As String) As Collection
+    Dim rebuilt As New Collection
+    Dim i As Long
+
+    rebuilt.Add NewElementReference(sharedId)
+
+    For i = 2 To sourceArgs.count
+        If IsObject(sourceArgs(i)) Then
+            Dim itemObject As Object
+            Set itemObject = sourceArgs(i)
+            rebuilt.Add itemObject
+        Else
+            rebuilt.Add sourceArgs(i)
+        End If
+    Next i
+
+    Set ReplaceFirstElementReference = rebuilt
+End Function
+
+' Only controlled sentinels or protocol-scoped stale errors may trigger re-resolution.
+Private Function IsStaleElementFailure(ByVal errNum As Long, _
+                                       ByVal errSrc As String, _
+                                       ByVal errDesc As String) As Boolean
+
+    If errNum = ERR_ACTION_FAILED Then
+        Dim isShellJsError As Boolean
+        isShellJsError = _
+            (Left$(errSrc, Len("BiDi:JSError:")) = "BiDi:JSError:") Or _
+            (Left$(errSrc, Len("BiDi:SafetyTimeout:")) = "BiDi:SafetyTimeout:")
+
+        If isShellJsError Then
+            If errDesc = "STALE_ELEMENT" Or _
+               errDesc = "STALE_ELEMENT_PRE_INPUT" Then
+                IsStaleElementFailure = True
+                Exit Function
+            End If
+        End If
+    End If
+
+    If errNum <> ERR_BIDI_PROTOCOL Then Exit Function
+    If Left$(errSrc, Len("BiDi:Protocol:")) <> "BiDi:Protocol:" Then Exit Function
+
+    Dim d As String
+    d = LCase$(errDesc)
+
+    If InStr(d, "stale element reference") > 0 Or _
+       InStr(d, "no such node") > 0 Or _
+       InStr(d, "node is detached from document") > 0 Or _
+       InStr(d, "element is no longer connected") > 0 Then
+        IsStaleElementFailure = True
+    End If
+End Function
+
 Private Function ReadElementValueByXPath(ByVal xpath As String, _
                                          ByVal actionKey As String, _
                                          ByVal searchTimeoutMs As Long, _
@@ -1560,7 +2215,8 @@ Private Function ReadElementValueByXPath(ByVal xpath As String, _
 
     ReadElementValueByXPath = GetCleanResult(ExecuteBaseAction( _
         targetCtx, actionKey, args, False, DEFAULT_IDLE_STABLE_MS, True, _
-        DEFAULT_STALE_RETRIES, DEFAULT_IDLE_TIMEOUT_MS))
+        DEFAULT_STALE_RETRIES, DEFAULT_IDLE_TIMEOUT_MS, False, xpath, _
+        searchTimeoutMs, callerName))
 End Function
 
 Private Sub ValidateDomMemberName(ByVal value As String, _
@@ -1664,20 +2320,26 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
             strRes = ExecuteBiDiCommand("session.subscribe", params, Silent, allowAmbiguousRetry:=False)
             lastRes = strRes
 
-            subId = GetPathString(ValidateProtocolResponse(strRes, "session.subscribe"), "result.subscription")
-            If subId <> "" Then
-                For i = 0 To UBound(finalArr)
-                    m_activeSubscriptions(finalArr(i) & ctxId) = subId
-                Next i
+            Dim subscribeJson As Object
+            Set subscribeJson = ValidateProtocolResponse(strRes, "session.subscribe")
+            subId = GetPathString(subscribeJson, "result.subscription")
+            If Len(subId) = 0 Then
+                Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:session.subscribe", _
+                          "Successful session.subscribe response omitted result.subscription."
             End If
+
+            For i = 0 To UBound(finalArr)
+                m_activeSubscriptions(finalArr(i) & ctxId) = subId
+            Next i
         End If
     Next tc
 
     ExecuteSessionSubscribe = lastRes
 End Function
 
-' browsingContext.navigate uses wait=none; requested completion is observed afterward
-' by bounded wrapper-side polling.
+' browsingContext.navigate waits to interactive at the protocol layer. waitMode controls
+' only the additional bounded wrapper-side settlement after the command returns. The transport
+' wait has an independent 60-second floor and grows beyond it when maxTimeoutMs requires more.
 Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
                                     Optional ByVal waitMode As String = "complete", _
                                     Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
@@ -1697,7 +2359,8 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
     Dim strRes As String
     strRes = ExecuteBiDiCommand("browsingContext.navigate", params, _
                                 allowAmbiguousRetry:=False, _
-                                allowContextRetarget:=allowRetarget)
+                                allowContextRetarget:=allowRetarget, _
+                                commandTimeoutMs:=ResolveNavigationTransportTimeout(maxTimeoutMs))
     Dim navJson As Object
     Set navJson = ValidateProtocolResponse(strRes, "browsingContext.navigate")
 
@@ -1765,7 +2428,8 @@ Public Function ExecuteClickByXPath(ByVal xpath As String, _
     Dim args As Collection: Set args = NewElementArgs(sharedId)
     ExecuteClickByXPath = ExecuteBaseAction(targetCtx, "click", args, waitNetworkIdle, _
                                             minStableMs, True, DEFAULT_STALE_RETRIES, _
-                                            maxTimeoutMs, checkUrl)
+                                            maxTimeoutMs, checkUrl, xpath, searchTimeoutMs, _
+                                            "ExecuteClickByXPath")
 End Function
 
 Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
@@ -1786,21 +2450,25 @@ Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
     If useNativeKeys Then
         Dim focusArgs As Collection: Set focusArgs = NewElementArgs(sharedId)
         Call ExecuteBaseAction(targetCtx, "click", focusArgs, False, minStableMs, _
-                               True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
+                               True, DEFAULT_STALE_RETRIES, maxTimeoutMs, False, _
+                               xpath, searchTimeoutMs, "ExecuteInputValueByXPath")
         ExecuteInputValueByXPath = PerformNativeKeyInput( _
             targetCtx, valueToSet, maxTimeoutMs, waitNetworkIdle, minStableMs)
         If m_debugMode Then Debug.Print "BiDi: Action 'native_keys' completed."
     ElseIf Not useKeyEvents Then
         ExecuteInputValueByXPath = ExecuteBaseAction( _
             targetCtx, "input", args, waitNetworkIdle, minStableMs, True, _
-            DEFAULT_STALE_RETRIES, maxTimeoutMs)
+            DEFAULT_STALE_RETRIES, maxTimeoutMs, False, xpath, searchTimeoutMs, _
+            "ExecuteInputValueByXPath")
     Else
         Dim keySafetyMs As Long: keySafetyMs = maxTimeoutMs
         If keySafetyMs < 20000 Then keySafetyMs = 20000
 
         Dim keyResult As String
-        keyResult = CallScript(GetActionJs("input_keys"), args, targetCtx, _
-                               False, False, keySafetyMs, allowAmbiguousRetry:=False)
+        keyResult = ExecuteBaseAction( _
+            targetCtx, "input_keys", args, False, minStableMs, False, _
+            DEFAULT_STALE_RETRIES, keySafetyMs, False, xpath, searchTimeoutMs, _
+            "ExecuteInputValueByXPath")
 
         Call TrySyncPhase(targetCtx, waitNetworkIdle, _
                           SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
@@ -1945,11 +2613,6 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     ' This deliberately remains a best-effort drain rather than introducing a queue watermark.
     ProcessRecorderQueue
 
-    ' DroppedEventsCount is session-cumulative (and survives recovery reconnects), so diagnostics
-    ' must compare against the value at this operation's arm boundary rather than report an absolute.
-    Dim droppedEventsAtArm As Long
-    droppedEventsAtArm = socket_.DroppedEventsCount
-
     ArmFileDialogCapture targetCtx
 
     Dim clickArgs As Collection
@@ -1958,17 +2621,12 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     ' File-picker triggers require real user activation. PerformTrustedClick uses BiDi
     ' input.performActions and does not replay an ambiguous click.
     Dim clickResult As String
-    clickResult = PerformTrustedClick(targetCtx, clickArgs, vMaxTimeout)
+    clickResult = PerformTrustedClick(targetCtx, clickArgs, vMaxTimeout, False)
 
     If Not WaitForFileDialogCapture(vDialogTimeout) Then
-        Dim droppedEventsDuringWait As Long
-        droppedEventsDuringWait = socket_.DroppedEventsCount - droppedEventsAtArm
-        If droppedEventsDuringWait < 0 Then droppedEventsDuringWait = 0
-
         Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
                   "FileDialogTimeout: input.fileDialogOpened was not observed within " & _
-                  vDialogTimeout & "ms. AsyncEventsDroppedSinceArm=" & _
-                  CStr(droppedEventsDuringWait) & "."
+                  vDialogTimeout & "ms."
     End If
 
     If Not m_fileDlgMultipleKnown Then
@@ -2119,9 +2777,18 @@ End Function
 Private Sub ArmFileDialogCapture(ByVal contextId As String)
     ResetFileDialogCaptureState
     m_fileDlgOwnerContextId = contextId
+    m_fileDlgDroppedEventsAtArm = CurrentFileDialogRelevantLossCount()
     m_fileDlgArmed = True
-    LogSignalLine "[FILE-DIALOG-ARM] ctx=" & contextId
+    LogSignalLine "[FILE-DIALOG-ARM] ctx=" & contextId & _
+                  " | droppedBase=" & CStr(m_fileDlgDroppedEventsAtArm)
 End Sub
+
+Private Function FileDialogDroppedEventsSinceArm() As Long
+    Dim delta As Long
+    delta = CurrentFileDialogRelevantLossCount() - m_fileDlgDroppedEventsAtArm
+    If delta < 0 Then delta = 0
+    FileDialogDroppedEventsSinceArm = delta
+End Function
 
 Private Function WaitForFileDialogCapture(ByVal timeoutMs As Long) As Boolean
     Dim startTick As Currency
@@ -2129,6 +2796,14 @@ Private Function WaitForFileDialogCapture(ByVal timeoutMs As Long) As Boolean
 
     Do
         ProcessRecorderQueue
+
+        If FileDialogDroppedEventsSinceArm() > 0 Then
+            m_fileDlgArmed = False
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
+                      "Async event loss occurred after the file-dialog arm boundary; reliable " & _
+                      "file-input capture cannot be determined. AsyncEventsDroppedSinceArm=" & _
+                      CStr(FileDialogDroppedEventsSinceArm()) & "."
+        End If
 
         If m_fileDlgSeen Then
             WaitForFileDialogCapture = True
@@ -2149,6 +2824,7 @@ Private Sub ResetFileDialogCaptureState()
     m_fileDlgMultipleKnown = False
     m_fileDlgMultiple = False
     m_fileDlgContextMissWarned = False
+    m_fileDlgDroppedEventsAtArm = 0
 End Sub
 
 Private Function GetCdpSessionIdForContext(ByVal contextId As String) As String
@@ -2377,6 +3053,73 @@ Done:
     Err.Clear
 End Sub
 
+Private Sub RecoverResidualDownloadBehaviorOnConnectBestEffort()
+    ' A fresh wrapper cannot know whether a previous VBA project left browser-global download
+    ' behavior behind. Clear once after ConnectTo. Unsupported implementations are harmless.
+    On Error GoTo Failed
+
+    Dim params As New Dictionary
+    params.Add "downloadBehavior", Null
+
+    m_downloadBehaviorCleanupRequired = True
+    m_downloadBehaviorStateUnknown = True
+
+    Dim failureDetail As String
+    Dim raw As String
+    raw = ExecuteBiDiCommand("browser.setDownloadBehavior", params, True, _
+                             allowAmbiguousRetry:=False, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False)
+
+    Dim json As Object
+    Set json = WebJsonConverter.ParseJson(raw)
+    If json Is Nothing Then GoTo Failed
+
+    If json.Exists("error") Then
+        Dim errType As String
+        errType = LCase$(CStr(json("error")))
+        If StrComp(errType, "unknown command", vbBinaryCompare) = 0 Or _
+           StrComp(errType, "unsupported operation", vbBinaryCompare) = 0 Then
+            m_downloadBehaviorCleanupRequired = False
+            m_downloadBehaviorStateUnknown = False
+            If m_debugMode Then Debug.Print "BiDi: browser.setDownloadBehavior is unsupported; residual sweep skipped."
+            GoTo Done
+        End If
+        failureDetail = "[" & errType & "] " & GetPathString(json, "message")
+        GoTo Failed
+    End If
+
+    m_downloadBehaviorCleanupRequired = False
+    m_downloadBehaviorStateUnknown = False
+    If m_debugMode Then Debug.Print "BiDi: Native download-behavior residual-state cleanup completed on ConnectTo."
+    GoTo Done
+
+Failed:
+    m_downloadBehaviorStateUnknown = True
+    If Len(failureDetail) = 0 Then
+        failureDetail = "Error #" & CStr(Err.Number) & ": " & Err.description
+    End If
+    If m_debugMode Then
+        Debug.Print "BiDi CRITICAL: browser.setDownloadBehavior residual cleanup could not be confirmed. " & _
+                    "Download execution is blocked until an explicit setter or clear succeeds. " & _
+                    failureDetail
+    End If
+
+Done:
+    Err.Clear
+End Sub
+
+Private Function IsUnsupportedDownloadBehaviorError(ByVal errNum As Long, _
+                                                    ByVal errSrc As String, _
+                                                    ByVal errDesc As String) As Boolean
+    If errNum <> ERR_BIDI_PROTOCOL Then Exit Function
+    If InStr(1, errSrc, "browser.setDownloadBehavior", vbTextCompare) = 0 Then Exit Function
+    IsUnsupportedDownloadBehaviorError = _
+        (InStr(1, errDesc, "[unknown command]", vbTextCompare) > 0 Or _
+         InStr(1, errDesc, "[unsupported operation]", vbTextCompare) > 0)
+End Function
+
+
 Private Function TryGetCdpSessionIdForCleanup(ByVal contextId As String) As String
     On Error GoTo Failed
     TryGetCdpSessionIdForCleanup = GetCdpSessionIdForContext(contextId)
@@ -2428,7 +3171,8 @@ Private Function PerformSetFiles(ByVal contextId As String, _
     Dim strRes As String
     strRes = ExecuteBiDiCommand("input.setFiles", params, _
                                 allowAmbiguousRetry:=False, _
-                                allowContextRetarget:=(contextId = m_mainContextId))
+                                allowContextRetarget:=(contextId = m_mainContextId), _
+                                commandTimeoutMs:=ResolveTransportTimeout(maxTimeoutMs))
     ValidateProtocolResponse strRes, "input.setFiles"
     If waitNetworkIdle Then RunRequiredSpaSync contextId, minStableMs, maxTimeoutMs
     PerformSetFiles = strRes
@@ -2484,7 +3228,9 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
 
     Dim strRes As String
     strRes = ExecuteBiDiCommand("input.performActions", params, _
-                                allowAmbiguousRetry:=False, allowContextRetarget:=(contextId = m_mainContextId))
+                                allowAmbiguousRetry:=False, _
+                                allowContextRetarget:=(contextId = m_mainContextId), _
+                                commandTimeoutMs:=ResolveTransportTimeout(maxTimeoutMs))
     ValidateProtocolResponse strRes, "input.performActions"
     If waitNetworkIdle Then RunRequiredSpaSync contextId, minStableMs, maxTimeoutMs
     PerformNativeKeyInput = strRes
@@ -2502,11 +3248,12 @@ Private Sub AppendKeyStroke(ByRef actions As Collection, ByVal value As String)
     actions.Add up
 End Sub
 
-' Trusted click is used only when the target is topmost at its center; otherwise the
-' fallback is a node-addressed synthetic click.
+' Trusted click is used only when the target is topmost at its center. Callers that require
+' real user activation can disable the node-addressed synthetic fallback.
 Private Function PerformTrustedClick(ByVal contextId As String, _
                                      ByVal args As Collection, _
-                                     ByVal TIMEOUT As Long) As String
+                                     ByVal TIMEOUT As Long, _
+                                     Optional ByVal allowSyntheticFallback As Boolean = True) As String
 
     Dim elemArg As Object: Set elemArg = args(1)
     Dim sharedId As String: sharedId = CStr(elemArg("sharedId"))
@@ -2537,7 +3284,9 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
         On Error Resume Next
         Err.Clear
         res = ExecuteBiDiCommand("input.performActions", params, _
-                                 allowAmbiguousRetry:=False, allowContextRetarget:=(contextId = m_mainContextId))
+                                 allowAmbiguousRetry:=False, _
+                                 allowContextRetarget:=(contextId = m_mainContextId), _
+                                 commandTimeoutMs:=ResolveTransportTimeout(TIMEOUT))
         tcErrNum = Err.Number: tcErrDesc = Err.description: tcErrSrc = Err.source
         trustedOk = (tcErrNum = 0)
         On Error GoTo 0
@@ -2550,10 +3299,15 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
         ' Timeout or connection loss after dispatch is ambiguous: the pointer click may already
         ' have fired, so never fall back to a second JS click.
         If IsAmbiguousDispatchFailure(tcErrNum, tcErrSrc, tcErrDesc) Then Err.Raise tcErrNum, tcErrSrc, tcErrDesc
+        If Not allowSyntheticFallback Then Err.Raise tcErrNum, tcErrSrc, tcErrDesc
         ' Fallback is safe only after a non-ambiguous pointer failure.
     Else
         ' A covered target must not receive a coordinate click because it would hit the front
         ' element; the default fallback addresses the intended node directly.
+        If Not allowSyntheticFallback Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:PerformTrustedClick", _
+                      "TrustedClickRequired: the target center is not topmost; synthetic fallback is disabled."
+        End If
         If m_debugMode Then Debug.Print "BiDi: not on-target; node click fallback."
     End If
 
@@ -2563,13 +3317,15 @@ End Function
 
 Private Function HitTestJs() As String
     Dim js As String
-    js = "const e=arguments[0]; e.scrollIntoView({block:'center',inline:'center'}); "
+    js = "const e=arguments[0]; e.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); "
     js = js & "if(window.__vbaIdleProbe) window.__vbaIdleProbe.lastMutationTs = performance.now(); "
     js = js & "const r=e.getBoundingClientRect(); if(!(r.width>0||r.height>0)) return 'hit=0'; "
     js = js & "const cx=Math.round(r.left+r.width/2), cy=Math.round(r.top+r.height/2); "
     js = js & "let top=document.elementFromPoint(cx,cy); "
     js = js & "let g=0; while(top&&top.shadowRoot&&g++<10){const d=top.shadowRoot.elementFromPoint(cx,cy); if(!d||d===top)break; top=d;} "
-    js = js & "return 'hit='+((top&&e.contains(top))?1:0);"
+    js = js & "const within=(n)=>{let x=n,h=0;while(x&&h++<20){if(x===e||e.contains(x))return true;"
+    js = js & "const r=x.getRootNode?x.getRootNode():null;if(r&&r.host){x=r.host;continue;}break;}return false;}; "
+    js = js & "return 'hit='+((top&&within(top))?1:0);"
     HitTestJs = js
 End Function
 
@@ -2622,10 +3378,13 @@ Public Function ExecuteSelectValueByXPath(ByVal xpath As String, _
         If selectByText Then jsKey = "select_text" Else jsKey = "select"
         ExecuteSelectValueByXPath = ExecuteBaseAction( _
             targetCtx, jsKey, NewElementArgs(sharedId, valueOrText), waitNetworkIdle, _
-            DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
+            DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs, _
+            False, xpath, searchTimeoutMs, "ExecuteSelectValueByXPath")
     Else
-        Call ExecuteBaseAction(targetCtx, "click", elementArgs, True, _
-                               DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
+        Call ExecuteBaseAction(targetCtx, "click", elementArgs, False, _
+                               DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, _
+                               maxTimeoutMs, False, xpath, searchTimeoutMs, _
+                               "ExecuteSelectValueByXPath")
         Dim optXPath As String
         optXPath = "//*[@role='option'][contains(., " & EscapeXPathString(valueOrText) & ")]"
         Dim optSharedId As String
@@ -2633,7 +3392,8 @@ Public Function ExecuteSelectValueByXPath(ByVal xpath As String, _
                                           "ExecuteSelectValueByXPath")
         ExecuteSelectValueByXPath = ExecuteBaseAction( _
             targetCtx, "click", NewElementArgs(optSharedId), waitNetworkIdle, _
-            DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
+            DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs, _
+            False, optXPath, searchTimeoutMs, "ExecuteSelectValueByXPath")
     End If
 End Function
 
@@ -2823,7 +3583,8 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                                      Optional ByVal Silent As Boolean = False, _
                                      Optional ByVal allowAmbiguousRetry As Boolean = True, _
                                      Optional ByVal allowRecoveryRetry As Boolean = True, _
-                                     Optional ByVal allowContextRetarget As Boolean = True) As String
+                                     Optional ByVal allowContextRetarget As Boolean = True, _
+                                     Optional ByVal commandTimeoutMs As Long = 0) As String
     
     If socket_ Is Nothing Then Err.Raise 91, "ExecuteBiDiCommand", "Socket object is not set."
 
@@ -2835,12 +3596,12 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
     Do While retryCount <= MAX_CONTEXT_RECOVERY_RETRIES
         
         On Error Resume Next
-        strRes = socket_.SendCommand(method, params, Silent)
+        strRes = socket_.SendCommand(method, params, Silent, commandTimeoutMs)
         localErrNum = Err.Number: localErrDesc = Err.description
         On Error GoTo 0
         
         If localErrNum = 0 Then
-            If IsContextLostError(strRes) Or (InStr(1, strRes, "chrome-error", vbTextCompare) > 0) Then
+            If IsContextLostError(strRes) Then
                 localErrNum = ERR_BIDI_PROTOCOL
                 localErrDesc = "Environment desync (Context Lost) detected in response."
                 Set m_validatedContexts = New Dictionary
@@ -3006,40 +3767,49 @@ ErrorHandler:
     UpdateContextAndRealm = False
 End Function
 
-Public Sub ClearState()
+Private Sub ResetVolatileContextState()
     m_cdpSessionId = ""
-    m_mainContextId = ""
-    
 
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
     Set m_probeFilterRevisions = New Dictionary
     Set m_reportedInvalidSelectors = New Dictionary
 
-    Set m_activeSubscriptions = New Dictionary
-    
-    Set m_blockingPatterns = New Collection
-    
-    ' Clear local completion flags because page/connection loss destroys browser observers.
     ResetSignalState
     ResetFileDialogCaptureState
     ResetDownloadCaptureState
+    ResetNewContextCaptureState
 
     m_lastHudKey = ""
     m_lastHudCtx = ""
     m_lastHudRetryTick = 0
+    m_contextLifecycleNeedsReconcile = True
 End Sub
 
-' Session-boundary reset. Deliberately separate from ClearState: ClearState is a cache reset
-' reachable from context loss and CDP panic, while this runs only when one session ends and
-' another may begin. Flags are dropped before their collections so no guarded append path can
-' observe a live flag with an already-released collection.
+Public Sub ClearState()
+    ResetVolatileContextState
+
+    SetMainContextUnbound
+    Set m_activeSubscriptions = New Dictionary
+    Set m_blockingPatterns = New Collection
+
+    If Not socket_ Is Nothing Then
+        m_contextLifecycleDroppedEventsBaseline = CurrentLifecycleRelevantLossCount()
+    Else
+        m_contextLifecycleDroppedEventsBaseline = 0
+    End If
+    m_contextLifecycleNeedsReconcile = False
+End Sub
+
+' Session-boundary reset runs only when one session ends and another may begin.
+' Flags are dropped before their collections so guarded append paths stay safe.
 Private Sub ResetSessionBoundaryState()
     m_isRecording = False
     m_isProcessingQueue = False
 
     Set m_recorderLogs = Nothing
     Set m_recSuppByKey = Nothing
+    m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
     m_recorderStartTime = 0
 
@@ -3053,7 +3823,9 @@ Private Sub ResetSessionBoundaryState()
     ResetLastSyncState
     ResetFileDialogCaptureState
     ResetDownloadCaptureState
+    ResetNewContextCaptureState
     m_downloadBehaviorCleanupRequired = False
+    m_downloadBehaviorStateUnknown = False
 
     m_unresolvedJsonThisWait = False
     m_unresolvedJsonFirstKeyThisWait = ""
@@ -3063,17 +3835,96 @@ Private Sub ResetSessionBoundaryState()
     m_carryoverNoteEmittedThisWait = False
 End Sub
 
-Public Function GetMainContextId() As String
-    If m_mainContextId = "" Then
-        GetMainContextId = UpdateMainContextId(True, True)
-    Else
-        GetMainContextId = m_mainContextId
+Private Sub SetMainContextUnbound()
+    m_mainContextId = ""
+    m_lostMainContextId = ""
+    m_mainContextState = MainContextUnbound
+End Sub
+
+Private Sub MarkMainContextLost(ByVal contextId As String)
+    If m_mainContextState <> MainContextPinned Then Exit Sub
+    If StrComp(contextId, m_mainContextId, vbBinaryCompare) <> 0 Then Exit Sub
+
+    m_lostMainContextId = m_mainContextId
+    m_mainContextId = ""
+    m_mainContextState = MainContextLost
+End Sub
+
+Private Sub RaiseMainContextLost()
+    Dim lostId As String
+    lostId = m_lostMainContextId
+    If Len(lostId) = 0 Then lostId = "(unknown)"
+
+    Err.Raise ERR_MAIN_CONTEXT_LOST, "BiDi:GetMainContextId", _
+              "The pinned main browsing context was destroyed: " & lostId & _
+              ". Call SetMainContextId with a surviving top-level context."
+End Sub
+
+Public Sub SetMainContextId(ByVal contextId As String)
+    If Len(Trim$(contextId)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:SetMainContextId", "contextId must not be empty."
     End If
+
+    DrainNonBlockingRecorderQueue
+    MarkLifecycleCacheStaleIfDrops
+
+    Dim jsonRes As String
+    jsonRes = ExecuteBiDiCommand("browsingContext.getTree", New Dictionary, True)
+
+    Dim jsonTree As Object
+    Set jsonTree = ValidateProtocolResponse(jsonRes, "browsingContext.getTree")
+
+    Dim contexts As Collection
+    Set contexts = GetPathObject(jsonTree, "result.contexts")
+    If contexts Is Nothing Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:SetMainContextId", _
+                  "No top-level browsing contexts are available."
+    End If
+
+    ReconcileContextTreeCache contexts
+
+    If Not TopLevelContextExistsExactId(contexts, contextId) Then
+        If ContextTreeContainsExactId(contexts, contextId) Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:SetMainContextId", _
+                      "contextId identifies a child browsing context. The main context must be top-level."
+        End If
+        Err.Raise ERR_ACTION_FAILED, "BiDi:SetMainContextId", _
+                  "Top-level context ID not found in browser tree: " & contextId
+    End If
+
+    m_mainContextId = contextId
+    m_lostMainContextId = ""
+    m_mainContextState = MainContextPinned
+    m_validatedContexts(contextId) = True
+End Sub
+
+Public Function GetMainContextId() As String
+    If Not m_isProcessingQueue Then DrainNonBlockingRecorderQueue
+    MarkLifecycleCacheStaleIfDrops
+
+    If m_mainContextState = MainContextLost Then RaiseMainContextLost
+
+    If m_mainContextState = MainContextPinned And _
+       Len(m_mainContextId) > 0 And _
+       Not m_contextLifecycleNeedsReconcile Then
+        GetMainContextId = m_mainContextId
+        Exit Function
+    End If
+
+    GetMainContextId = UpdateMainContextId(True, True)
 End Function
 
 Public Function UpdateMainContextId(Optional ByVal forceRefresh As Boolean = False, _
                                     Optional ByVal Silent As Boolean = False) As String
-    If Not forceRefresh And m_mainContextId <> "" Then
+    If Not m_isProcessingQueue Then DrainNonBlockingRecorderQueue
+    MarkLifecycleCacheStaleIfDrops
+
+    If m_mainContextState = MainContextLost Then RaiseMainContextLost
+
+    If m_mainContextState = MainContextPinned And _
+       Len(m_mainContextId) > 0 And _
+       Not forceRefresh And _
+       Not m_contextLifecycleNeedsReconcile Then
         UpdateMainContextId = m_mainContextId
         Exit Function
     End If
@@ -3084,35 +3935,88 @@ Public Function UpdateMainContextId(Optional ByVal forceRefresh As Boolean = Fal
     Dim jsonTree As Object
     Set jsonTree = ValidateProtocolResponse(jsonRes, "browsingContext.getTree")
 
-    Dim contextId As String
-    contextId = GetPathString(jsonTree, "result.contexts.0.context")
-
-    If contextId <> "" Then
-        m_mainContextId = contextId
-        UpdateMainContextId = contextId
-    Else
+    Dim contexts As Collection
+    Set contexts = GetPathObject(jsonTree, "result.contexts")
+    If contexts Is Nothing Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:UpdateMainContextId", _
-                  "Failed to identify any browsing context."
+                  "Failed to read the top-level browsing context list."
     End If
+
+    Dim pinnedId As String
+    pinnedId = m_mainContextId
+    ReconcileContextTreeCache contexts
+
+    If m_mainContextState = MainContextPinned Then
+        If TopLevelContextExistsExactId(contexts, pinnedId) Then
+            m_mainContextId = pinnedId
+            m_validatedContexts(pinnedId) = True
+            UpdateMainContextId = pinnedId
+            Exit Function
+        End If
+
+        MarkMainContextLost pinnedId
+        RaiseMainContextLost
+    End If
+
+    If m_mainContextState = MainContextLost Then RaiseMainContextLost
+
+    If contexts.count = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:UpdateMainContextId", _
+                  "No top-level browsing context is available."
+    End If
+
+    If contexts.count <> 1 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:UpdateMainContextId", _
+                  "Multiple top-level browsing contexts exist. Call SetMainContextId explicitly."
+    End If
+
+    Dim onlyContext As Dictionary
+    On Error Resume Next
+    Set onlyContext = contexts(1)
+    Dim onlyContextErr As Long: onlyContextErr = Err.Number
+    On Error GoTo 0
+    If onlyContextErr <> 0 Or onlyContext Is Nothing Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:UpdateMainContextId", _
+                  "The only top-level browsing context has an invalid structure."
+    End If
+
+    Dim contextId As String
+    contextId = GetPathString(onlyContext, "context")
+    If Len(contextId) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:UpdateMainContextId", _
+                  "The only top-level browsing context has no context ID."
+    End If
+
+    m_mainContextId = contextId
+    m_lostMainContextId = ""
+    m_mainContextState = MainContextPinned
+    m_validatedContexts(contextId) = True
+    UpdateMainContextId = contextId
 End Function
 
 Private Function ResolveTargetContext(ByVal contextId As String) As String
+    If Not m_isProcessingQueue Then DrainNonBlockingRecorderQueue
+    MarkLifecycleCacheStaleIfDrops
+
     If contextId = "" Then
         ResolveTargetContext = GetMainContextId()
         Exit Function
     End If
 
-    If contextId = m_mainContextId Then
-        ResolveTargetContext = contextId
-        Exit Function
+    If m_mainContextState = MainContextPinned Then
+        If StrComp(contextId, m_mainContextId, vbBinaryCompare) = 0 And _
+           Not m_contextLifecycleNeedsReconcile Then
+            ResolveTargetContext = contextId
+            Exit Function
+        End If
     End If
 
-    ' Validated-context cache entries are dropped on navigation, context loss, and ClearState;
-    ' only then is skipping getTree safe.
     If m_validatedContexts Is Nothing Then Set m_validatedContexts = New Dictionary
-    If m_validatedContexts.Exists(contextId) Then
-        ResolveTargetContext = contextId
-        Exit Function
+    If Not m_contextLifecycleNeedsReconcile Then
+        If m_validatedContexts.Exists(contextId) Then
+            ResolveTargetContext = contextId
+            Exit Function
+        End If
     End If
 
     Dim treeJson As String
@@ -3124,9 +4028,8 @@ Private Function ResolveTargetContext(ByVal contextId As String) As String
     Dim contexts As Collection
     Set contexts = GetPathObject(jsonTree, "result.contexts")
 
-    ' Context IDs are opaque, case-sensitive values. Inspect only the context fields
-    ' in the tree; raw JSON substring matching can accept URLs, titles or ID fragments.
     If Not contexts Is Nothing Then
+        ReconcileContextTreeCache contexts
         If ContextTreeContainsExactId(contexts, contextId) Then
             m_validatedContexts(contextId) = True
             ResolveTargetContext = contextId
@@ -3137,6 +4040,155 @@ Private Function ResolveTargetContext(ByVal contextId As String) As String
     Err.Raise ERR_ACTION_FAILED, "BiDi:ResolveTargetContext", _
               "Context ID not found in browser tree: " & contextId & _
               ". The tab/window may have been closed or the ID is invalid."
+End Function
+
+Private Function SaturatedLossSum(ByVal specificLoss As Long, _
+                                  ByVal unknownLoss As Long) As Long
+    Dim total As Double
+    total = CDbl(specificLoss) + CDbl(unknownLoss)
+
+    If total >= 2147483647# Then
+        SaturatedLossSum = 2147483647
+    Else
+        SaturatedLossSum = CLng(total)
+    End If
+End Function
+
+Private Function CurrentLifecycleRelevantLossCount() As Long
+    If socket_ Is Nothing Then Exit Function
+
+    CurrentLifecycleRelevantLossCount = SaturatedLossSum( _
+        socket_.LifecycleEventLossCount, _
+        socket_.UnknownCriticalEventLossCount)
+End Function
+
+Private Function CurrentDownloadRelevantLossCount() As Long
+    If socket_ Is Nothing Then Exit Function
+
+    CurrentDownloadRelevantLossCount = SaturatedLossSum( _
+        socket_.DownloadEventLossCount, _
+        socket_.UnknownCriticalEventLossCount)
+End Function
+
+Private Function CurrentFileDialogRelevantLossCount() As Long
+    If socket_ Is Nothing Then Exit Function
+
+    CurrentFileDialogRelevantLossCount = SaturatedLossSum( _
+        socket_.FileDialogEventLossCount, _
+        socket_.UnknownCriticalEventLossCount)
+End Function
+
+Private Sub MarkLifecycleCacheStaleIfDrops()
+    If socket_ Is Nothing Then Exit Sub
+
+    Dim currentDrops As Long
+    currentDrops = CurrentLifecycleRelevantLossCount()
+
+    If currentDrops <> m_contextLifecycleDroppedEventsBaseline Then
+        Set m_validatedContexts = New Dictionary
+        m_contextLifecycleNeedsReconcile = True
+        m_contextLifecycleDroppedEventsBaseline = currentDrops
+    End If
+End Sub
+
+Private Sub ReconcileContextTreeCache(ByVal contexts As Collection)
+    Set m_validatedContexts = New Dictionary
+    CacheContextTreeIds contexts
+
+    If m_mainContextState = MainContextPinned Then
+        If Not TopLevelContextExistsExactId(contexts, m_mainContextId) Then
+            MarkMainContextLost m_mainContextId
+        End If
+    End If
+
+    If Not socket_ Is Nothing Then
+        m_contextLifecycleDroppedEventsBaseline = CurrentLifecycleRelevantLossCount()
+    End If
+    m_contextLifecycleNeedsReconcile = False
+End Sub
+
+Private Sub CacheContextTreeIds(ByVal contextList As Collection, _
+                                Optional ByVal currentDepth As Long = 0)
+    Const MAX_RECURSION_DEPTH As Long = 20
+    On Error GoTo CacheError
+    If currentDepth > MAX_RECURSION_DEPTH Then Exit Sub
+
+    Dim ctx As Dictionary
+    For Each ctx In contextList
+        Dim contextId As String
+        contextId = GetPathString(ctx, "context")
+        If Len(contextId) > 0 Then m_validatedContexts(contextId) = True
+
+        If ctx.Exists("children") Then
+            If IsObject(ctx("children")) Then
+                If Not ctx("children") Is Nothing Then
+                    CacheContextTreeIds ctx("children"), currentDepth + 1
+                End If
+            End If
+        End If
+    Next ctx
+    Exit Sub
+
+CacheError:
+    If Err.Number = 28 Then
+        Debug.Print "BiDi Critical: Stack overflow detected in CacheContextTreeIds"
+    ElseIf m_debugMode Then
+        Debug.Print "BiDi Error in CacheContextTreeIds: " & Err.description
+    End If
+End Sub
+
+Private Function TopLevelContextExistsExactId(ByVal contextList As Collection, _
+                                              ByVal targetContextId As String) As Boolean
+    On Error GoTo SearchError
+
+    Dim ctx As Dictionary
+    For Each ctx In contextList
+        If StrComp(GetPathString(ctx, "context"), targetContextId, vbBinaryCompare) = 0 Then
+            TopLevelContextExistsExactId = True
+            Exit Function
+        End If
+    Next ctx
+    Exit Function
+
+SearchError:
+    If m_debugMode Then Debug.Print "BiDi Error in TopLevelContextExistsExactId: " & Err.description
+End Function
+
+Private Function FindContextInfoExactId(ByVal contextList As Collection, _
+                                        ByVal targetContextId As String, _
+                                        Optional ByVal currentDepth As Long = 0) As Dictionary
+    Const MAX_RECURSION_DEPTH As Long = 20
+    On Error GoTo SearchError
+    If currentDepth > MAX_RECURSION_DEPTH Then Exit Function
+
+    Dim ctx As Dictionary
+    For Each ctx In contextList
+        If StrComp(GetPathString(ctx, "context"), targetContextId, vbBinaryCompare) = 0 Then
+            Set FindContextInfoExactId = ctx
+            Exit Function
+        End If
+
+        If ctx.Exists("children") Then
+            If IsObject(ctx("children")) Then
+                If Not ctx("children") Is Nothing Then
+                    Dim childMatch As Dictionary
+                    Set childMatch = FindContextInfoExactId(ctx("children"), targetContextId, currentDepth + 1)
+                    If Not childMatch Is Nothing Then
+                        Set FindContextInfoExactId = childMatch
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next ctx
+    Exit Function
+
+SearchError:
+    If Err.Number = 28 Then
+        Debug.Print "BiDi Critical: Stack overflow detected in FindContextInfoExactId"
+    ElseIf m_debugMode Then
+        Debug.Print "BiDi Error in FindContextInfoExactId: " & Err.description
+    End If
 End Function
 
 Private Function ContextTreeContainsExactId(ByVal contextList As Collection, _
@@ -3356,6 +4408,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Set m_recSuppByKey = stagedSuppByKey
     m_recorderStartTime = stagedStartTime
     m_excludeResources = excludeImagesAndCss
+    m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
 
     ' A reused wrapper starts recording with all carryover diagnostics cleared.
@@ -3500,6 +4553,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
 
     Set m_recorderLogs = Nothing
     Set m_recSuppByKey = Nothing
+    m_recSuppOverflowCount = 0
 End Sub
 
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
@@ -3540,6 +4594,14 @@ ErrorHandler:
 End Sub
 
 Public Sub ProcessRecorderQueue()
+    ProcessRecorderQueueCore False
+End Sub
+
+Private Sub DrainNonBlockingRecorderQueue()
+    ProcessRecorderQueueCore True
+End Sub
+
+Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
     If m_isProcessingQueue Then Exit Sub
     
     m_isProcessingQueue = True
@@ -3558,7 +4620,7 @@ Public Sub ProcessRecorderQueue()
 
         Dim dropReason As String
         Dim messageConsumed As Boolean
-        messageConsumed = socket_.TryGetParsedEvent(json, dropReason, MIN_MSG_SIZE, MAX_MSG_SIZE)
+        messageConsumed = socket_.TryGetParsedEvent(json, dropReason, MIN_MSG_SIZE, MAX_PARSED_EVENT_SIZE, nonBlocking)
         If Not messageConsumed Then Exit Do
 
         ' Count valid and dropped messages alike so malformed traffic cannot bypass the batch cap.
@@ -3592,7 +4654,9 @@ Public Sub ProcessRecorderQueue()
             End If
         End If
 
-        If (processedCount Mod 100) = 0 Then socket_.PumpMessages 100
+        If Not nonBlocking Then
+            If (processedCount Mod 100) = 0 Then socket_.PumpMessages 100
+        End If
     Loop
 
     If m_debugMode And droppedCount > dropLogCount Then
@@ -3604,7 +4668,7 @@ Cleanup:
     m_isProcessingQueue = False
     
     If Err.Number <> 0 Then
-        Debug.Print "BiDi Critical Error in ProcessRecorderQueue: " & Err.description
+        Debug.Print "BiDi Critical Error in ProcessRecorderQueueCore: " & Err.description
     End If
 End Sub
 
@@ -3733,6 +4797,8 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             If CStr(params("level")) = "error" Then
                 Dim logText As String: logText = ""
                 If params.Exists("text") Then logText = CStr(params("text"))
+                If Len(logText) > MAX_CONSOLE_LOG_TEXT_SIZE Then _
+                    logText = Left$(logText, MAX_CONSOLE_LOG_TEXT_SIZE) & "...(truncated)"
                 LogLine = "[" & relTime & "] [CONSOLE-ERR] " & logText
             End If
     End Select
@@ -3751,22 +4817,34 @@ Private Sub PushTimelineLine(ByVal s As String)
     m_recorderLogs.Add s
 End Sub
 
-' Shared pattern semantics: no '*' means case-insensitive substring; '*' enables a
-' contains-style glob. Malformed globs do not match.
+' Shared pattern semantics follow the Discovery Log contract: no '*' means a
+' case-insensitive substring; '*' is the only wildcard and all other characters are literal.
 Private Function UrlMatchesPattern(ByVal url As String, ByVal pat As String) As Boolean
     If Len(pat) = 0 Then Exit Function
+
     Dim u As String: u = LCase$(url)
     Dim p As String: p = LCase$(pat)
     If InStr(p, "*") = 0 Then
-        UrlMatchesPattern = (InStr(1, u, p, vbTextCompare) > 0)
+        UrlMatchesPattern = (InStr(1, u, p, vbBinaryCompare) > 0)
         Exit Function
     End If
-    If Left$(p, 1) <> "*" Then p = "*" & p
-    If Right$(p, 1) <> "*" Then p = p & "*"
-    On Error Resume Next
-    UrlMatchesPattern = (u Like p)
-    If Err.Number <> 0 Then UrlMatchesPattern = False: Err.Clear
-    On Error GoTo 0
+
+    Dim parts() As String: parts = Split(p, "*")
+    Dim searchPos As Long: searchPos = 1
+    Dim i As Long
+    Dim token As String
+    Dim foundAt As Long
+
+    For i = LBound(parts) To UBound(parts)
+        token = parts(i)
+        If Len(token) > 0 Then
+            foundAt = InStr(searchPos, u, token, vbBinaryCompare)
+            If foundAt = 0 Then Exit Function
+            searchPos = foundAt + Len(token)
+        End If
+    Next i
+
+    UrlMatchesPattern = True
 End Function
 
 Private Function IsNoiseUrl(ByVal url As String) As Boolean
@@ -3785,12 +4863,15 @@ Private Function IsNoiseUrl(ByVal url As String) As Boolean
     If InStr(lUrl, "google-analytics") > 0 Or _
        InStr(lUrl, "googletagmanager") > 0 Or _
        InStr(lUrl, "doubleclick") > 0 Or _
-       InStr(lUrl, "pagead") > 0 Or _
-       InStr(lUrl, "conversion") > 0 Or _
-       InStr(lUrl, "/collect") > 0 Or _
-       InStr(lUrl, "/analytics") > 0 Or _
-       InStr(lUrl, "/pixel") > 0 Or _
-       InStr(lUrl, "/beacon") > 0 Then
+       InStr(lUrl, "pagead") > 0 Then
+        IsNoiseUrl = True
+        Exit Function
+    End If
+
+    ' Keep generic tracker endpoints segment-bound to avoid hiding business APIs.
+    If UrlPathHasExactSegment(lUrl, "collect") Or _
+       UrlPathHasExactSegment(lUrl, "pixel") Or _
+       UrlPathHasExactSegment(lUrl, "beacon") Then
         IsNoiseUrl = True
         Exit Function
     End If
@@ -3806,6 +4887,64 @@ Private Function IsNoiseUrl(ByVal url As String) As Boolean
     End If
 
     IsNoiseUrl = False
+End Function
+
+Private Function UrlPathHasExactSegment( _
+    ByVal url As String, _
+    ByVal segmentName As String) As Boolean
+
+    Dim lUrl As String
+    Dim lSegment As String
+    Dim schemePos As Long
+    Dim pathStart As Long
+    Dim pathEnd As Long
+    Dim queryPos As Long
+    Dim fragmentPos As Long
+    Dim pathText As String
+    Dim needle As String
+    Dim foundAt As Long
+    Dim afterPos As Long
+    Dim nextChar As String
+
+    lUrl = LCase$(url)
+    lSegment = LCase$(segmentName)
+    If Len(lSegment) = 0 Then Exit Function
+
+    schemePos = InStr(1, lUrl, "://", vbBinaryCompare)
+    If schemePos > 0 Then
+        pathStart = InStr(schemePos + 3, lUrl, "/")
+        If pathStart = 0 Then Exit Function
+    Else
+        pathStart = 1
+    End If
+
+    pathEnd = Len(lUrl) + 1
+
+    queryPos = InStr(pathStart, lUrl, "?")
+    If queryPos > 0 And queryPos < pathEnd Then pathEnd = queryPos
+
+    fragmentPos = InStr(pathStart, lUrl, "#")
+    If fragmentPos > 0 And fragmentPos < pathEnd Then pathEnd = fragmentPos
+
+    pathText = Mid$(lUrl, pathStart, pathEnd - pathStart)
+    needle = "/" & lSegment
+    foundAt = InStr(1, pathText, needle, vbBinaryCompare)
+
+    Do While foundAt > 0
+        afterPos = foundAt + Len(needle)
+        If afterPos > Len(pathText) Then
+            UrlPathHasExactSegment = True
+            Exit Function
+        End If
+
+        nextChar = Mid$(pathText, afterPos, 1)
+        If nextChar = "/" Or nextChar = ";" Then
+            UrlPathHasExactSegment = True
+            Exit Function
+        End If
+
+        foundAt = InStr(foundAt + 1, pathText, needle, vbBinaryCompare)
+    Loop
 End Function
 
 Private Function IsNoiseMime(ByVal mime As String) As Boolean
@@ -3885,10 +5024,13 @@ End Function
 Private Sub BumpSuppressed(ByVal keyStr As String)
     On Error Resume Next
     If m_recSuppByKey Is Nothing Then Exit Sub
+
     If m_recSuppByKey.Exists(keyStr) Then
         m_recSuppByKey.item(keyStr) = CLng(m_recSuppByKey.item(keyStr)) + 1
-    Else
+    ElseIf m_recSuppByKey.count < MAX_SUPPRESSED_KEYS Then
         m_recSuppByKey.Add keyStr, 1
+    Else
+        m_recSuppOverflowCount = m_recSuppOverflowCount + 1
     End If
     On Error GoTo 0
 End Sub
@@ -3896,37 +5038,61 @@ End Sub
 Private Sub AppendSuppressedSummary()
     On Error Resume Next
     If m_recorderLogs Is Nothing Or m_recSuppByKey Is Nothing Then Exit Sub
-    If m_recSuppByKey.count = 0 Then Exit Sub
-    Dim total As Long: total = 0
-    Dim k As Variant
-    For Each k In m_recSuppByKey.keys
-        total = total + CLng(m_recSuppByKey.item(k))
-    Next k
-    m_recorderLogs.Add "[end] [SUPPRESSED-TOTAL] " & total & " event(s) filtered, " & m_recSuppByKey.count & " distinct key(s) (excludeResources=" & m_excludeResources & ")"
+    If m_recSuppByKey.count = 0 And m_recSuppOverflowCount = 0 Then Exit Sub
 
-    Dim n As Long: n = m_recSuppByKey.count
-    Dim ks() As Variant: ReDim ks(0 To n - 1)
-    Dim cs() As Long: ReDim cs(0 To n - 1)
-    Dim idx As Long: idx = 0
+    Dim topKeys() As String
+    Dim topCounts() As Long
+    ReDim topKeys(0 To MAX_SUPPRESSED_SUMMARY_LINES - 1)
+    ReDim topCounts(0 To MAX_SUPPRESSED_SUMMARY_LINES - 1)
+
+    Dim total As Double: total = CDbl(m_recSuppOverflowCount)
+    Dim topUsed As Long: topUsed = 0
+    Dim k As Variant
+    Dim countVal As Long
+    Dim insertPos As Long
+    Dim i As Long
+
     For Each k In m_recSuppByKey.keys
-        ks(idx) = k: cs(idx) = CLng(m_recSuppByKey.item(k)): idx = idx + 1
-    Next k
-    Dim a As Long, b As Long, tc As Long, tk As Variant
-    For a = 0 To n - 2
-        For b = a + 1 To n - 1
-            If cs(b) > cs(a) Then
-                tc = cs(a): cs(a) = cs(b): cs(b) = tc
-                tk = ks(a): ks(a) = ks(b): ks(b) = tk
+        countVal = CLng(m_recSuppByKey.item(k))
+        total = total + CDbl(countVal)
+
+        insertPos = topUsed
+        For i = 0 To topUsed - 1
+            If countVal > topCounts(i) Then
+                insertPos = i
+                Exit For
             End If
-        Next b
-    Next a
-    Const MAX_SUPP_LINES As Long = 25
-    Dim lim As Long: lim = n: If lim > MAX_SUPP_LINES Then lim = MAX_SUPP_LINES
-    For a = 0 To lim - 1
-        m_recorderLogs.Add "[end] [SUPPRESSED] count=" & cs(a) & " | key=" & CStr(ks(a))
-    Next a
-    If n > MAX_SUPP_LINES Then
-        m_recorderLogs.Add "[end] [SUPPRESSED] ... and " & (n - MAX_SUPP_LINES) & " more distinct key(s)"
+        Next i
+
+        If insertPos < MAX_SUPPRESSED_SUMMARY_LINES Then
+            If topUsed < MAX_SUPPRESSED_SUMMARY_LINES Then topUsed = topUsed + 1
+            For i = topUsed - 1 To insertPos + 1 Step -1
+                topCounts(i) = topCounts(i - 1)
+                topKeys(i) = topKeys(i - 1)
+            Next i
+            topCounts(insertPos) = countVal
+            topKeys(insertPos) = CStr(k)
+        End If
+    Next k
+
+    Dim summaryLine As String
+    summaryLine = "[end] [SUPPRESSED-TOTAL] " & Format$(total, "0") & _
+                  " event(s) filtered, " & m_recSuppByKey.count & " distinct key(s)"
+    If m_recSuppOverflowCount > 0 Then
+        summaryLine = summaryLine & " (+" & m_recSuppOverflowCount & _
+                      " event(s) not recorded by key, key limit reached)"
+    End If
+    summaryLine = summaryLine & " (excludeResources=" & m_excludeResources & ")"
+    m_recorderLogs.Add summaryLine
+
+    For i = 0 To topUsed - 1
+        m_recorderLogs.Add "[end] [SUPPRESSED] count=" & topCounts(i) & " | key=" & topKeys(i)
+    Next i
+
+    If m_recSuppByKey.count > MAX_SUPPRESSED_SUMMARY_LINES Then
+        m_recorderLogs.Add "[end] [SUPPRESSED] ... and " & _
+                           (m_recSuppByKey.count - MAX_SUPPRESSED_SUMMARY_LINES) & _
+                           " more recorded distinct key(s)"
     End If
     On Error GoTo 0
 End Sub
@@ -4219,18 +5385,63 @@ Private Sub ClaimSignalOwner(ByVal targetCtx As String)
     If Len(m_signalOwnerContextId) = 0 Then m_signalOwnerContextId = targetCtx
 End Sub
 
-Private Sub ValidateSignalWaitContext(ByVal targetCtx As String)
+Private Sub ValidateSignalWaitContext(ByVal targetCtx As String, _
+                                      Optional ByVal callerName As String = "WaitForNetworkIdleSpa")
     If Not AnySignalArmed() Then Exit Sub
 
     If Len(m_signalOwnerContextId) = 0 Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:WaitForNetworkIdleSpa", _
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "Active completion signals have no owner context."
     End If
 
     If StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:WaitForNetworkIdleSpa", _
-            "The SPA wait context does not own the active completion signals." & vbCrLf & _
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+            "The requested context does not own the active completion signals." & vbCrLf & _
             "Owner: " & m_signalOwnerContextId & vbCrLf & "Requested: " & targetCtx
+    End If
+End Sub
+
+Private Function BeginSignalCarryoverDiagnostic(ByVal actionName As String, _
+                                                ByVal targetCtx As String, _
+                                                ByRef domSeenBefore As Boolean, _
+                                                ByRef netSeenBefore As Boolean, _
+                                                ByRef visSeenBefore As Boolean) As Boolean
+    If Not AnySignalArmed() Then Exit Function
+
+    ValidateSignalWaitContext targetCtx, actionName
+
+    domSeenBefore = m_sigDomSeen
+    netSeenBefore = m_sigNetSeen
+    visSeenBefore = m_sigVisSeen
+
+    LogSignalLine "[SPA-SIGNAL-CARRYOVER] action=" & actionName & _
+                  " | ownerCtx=" & m_signalOwnerContextId & _
+                  " | state=" & BuildSignalEndDesc()
+    BeginSignalCarryoverDiagnostic = True
+End Function
+
+Private Sub EndSignalCarryoverDiagnostic(ByVal actionName As String, _
+                                         ByVal diagnosticActive As Boolean, _
+                                         ByVal domSeenBefore As Boolean, _
+                                         ByVal netSeenBefore As Boolean, _
+                                         ByVal visSeenBefore As Boolean)
+    If Not diagnosticActive Then Exit Sub
+
+    Dim hitTypes As String
+    If m_sigDomArmed And Not domSeenBefore And m_sigDomSeen Then hitTypes = "dom"
+    If m_sigNetArmed And Not netSeenBefore And m_sigNetSeen Then
+        If Len(hitTypes) > 0 Then hitTypes = hitTypes & ","
+        hitTypes = hitTypes & "net"
+    End If
+    If m_sigVisArmed And Not visSeenBefore And m_sigVisSeen Then
+        If Len(hitTypes) > 0 Then hitTypes = hitTypes & ","
+        hitTypes = hitTypes & "vis"
+    End If
+
+    If Len(hitTypes) > 0 Then
+        LogSignalLine "[SPA-SIGNAL-CARRYOVER-HIT] action=" & actionName & _
+                      " | type=" & hitTypes & _
+                      " | state=" & BuildSignalEndDesc()
     End If
 End Sub
 
@@ -4570,7 +5781,22 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
         If Len(sessionIdOverride) > 0 Then
             sessionId = sessionIdOverride
         Else
+            Dim sessionErrNum As Long
+            Dim sessionErrDesc As String
+            On Error Resume Next
             sessionId = GetCdpSessionId()
+            sessionErrNum = Err.Number
+            sessionErrDesc = Err.description
+            On Error GoTo 0
+
+            If sessionErrNum <> 0 Then
+                If countFailure And sessionErrNum <> ERR_MAIN_CONTEXT_LOST Then
+                    m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
+                End If
+                res("Error") = "CDP session error: " & sessionErrDesc
+                Set ExecuteCDPCommand = res
+                Exit Function
+            End If
         End If
 
         If sessionId <> "" Then
@@ -4595,8 +5821,12 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
         Set ExecuteCDPCommand = res: Exit Function
     End If
 
-    If InStr(strRes, """error"":") > 0 Then
-        res("Error") = "CDP Error: " & strRes: res("Json") = strRes
+    Dim parsedCdpResponse As Object
+    Dim cdpResponseError As String
+
+    If Not IsCdpTransportResponseSuccess(strRes, parsedCdpResponse, cdpResponseError) Then
+        res("Error") = cdpResponseError
+        res("Json") = strRes
         If countFailure Then m_consecutiveCdpFailures = m_consecutiveCdpFailures + 1
         socket_.LogEvent "CDP Command FAILED: " & cdpMethod, strRes, "[CDP:ERR]"
     Else
@@ -4611,9 +5841,47 @@ Private Function ExecuteCDPCommand(ByVal cdpMethod As String, _
     Set ExecuteCDPCommand = res
 End Function
 
+Private Function IsCdpTransportResponseSuccess( _
+    ByVal jsonRaw As String, _
+    ByRef parsedJson As Object, _
+    ByRef errorText As String) As Boolean
+
+    Set parsedJson = Nothing
+    errorText = vbNullString
+
+    On Error Resume Next
+    Set parsedJson = WebJsonConverter.ParseJson(jsonRaw)
+    On Error GoTo 0
+
+    If parsedJson Is Nothing Then
+        errorText = "CDP Error: response is not valid JSON."
+        Exit Function
+    End If
+
+    If StrComp(TypeName(parsedJson), "Dictionary", vbBinaryCompare) <> 0 Then
+        errorText = "CDP Error: response root is not a JSON object."
+        Exit Function
+    End If
+
+    If parsedJson.Exists("error") Then
+        Dim errType As String
+        Dim errMsg As String
+
+        errType = GetPathString(parsedJson, "error")
+        errMsg = GetPathString(parsedJson, "message")
+
+        errorText = "CDP Error"
+        If Len(errType) > 0 Then errorText = errorText & ": [" & errType & "]"
+        If Len(errMsg) > 0 Then errorText = errorText & " " & errMsg
+        Exit Function
+    End If
+
+    IsCdpTransportResponseSuccess = True
+End Function
+
 Private Sub PerformFatalReset()
     Debug.Print "BiDi Critical: Performing Fatal Reset due to protocol instability."
-    ClearState
+    ResetVolatileContextState
     m_consecutiveCdpFailures = 0
 End Sub
 
@@ -4878,21 +6146,25 @@ Private Function GetActionJs(ByVal actionType As String) As String
     
     Select Case LCase(actionType)
         Case "click"
-            js = js & "try { const e=arguments[0]; e.scrollIntoView({block:'center'}); e.focus(); " & rp & "e.click(); return true; } catch(err) { throw err; }"
+            js = js & "try { const e=arguments[0]; if(!e||!e.isConnected)throw new Error('STALE_ELEMENT'); "
+            js = js & "e.scrollIntoView({block:'center'}); e.focus(); if(!e.isConnected)throw new Error('STALE_ELEMENT'); "
+            js = js & rp & "e.click(); return true; } catch(err) { throw err; }"
                  
         Case "input"
-            js = js & "try { const e=arguments[0],v=arguments[1]; e.scrollIntoView({block:'center',inline:'center'}); e.click(); e.focus(); " & rp & "e.select(); "
+            js = js & "try { const e=arguments[0],v=arguments[1]; if(!e||!e.isConnected)throw new Error('STALE_ELEMENT'); "
+            js = js & "e.scrollIntoView({block:'center',inline:'center'}); if(!e.isConnected)throw new Error('STALE_ELEMENT'); e.click(); e.focus(); " & rp & "e.select(); "
             js = js & "const s=document.execCommand('insertText',false,v); if(!s){e.value='';e.value=v;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));} "
             js = js & "e.blur(); return true;} catch(err){throw err;}"
                  
         Case "select"
-            js = js & "try { const s=arguments[0],v=arguments[1]; s.scrollIntoView({block:'center',inline:'center'}); s.focus(); " & rp & "s.value=v; "
+            js = js & "try { const s=arguments[0],v=arguments[1]; if(!s||!s.isConnected)throw new Error('STALE_ELEMENT'); "
+            js = js & "s.scrollIntoView({block:'center',inline:'center'}); s.focus(); if(!s.isConnected)throw new Error('STALE_ELEMENT'); " & rp & "const f=Array.from(s.options).some(o=>o.value===String(v)); if(!f)throw new Error('Option value not found: '+v); s.value=v; "
             js = js & "s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); s.blur(); return true;} catch(err){throw err;}"
 
         Case "select_text"
-            js = js & "try { const s=arguments[0],t=arguments[1],n=(str)=>str.replace(/[\s\u00A0]+/g,' ').trim(); let f=false; const target=n(t); "
+            js = js & "try { const s=arguments[0],t=arguments[1],n=(str)=>str.replace(/[\s\u00A0]+/g,' ').trim(); if(!s||!s.isConnected)throw new Error('STALE_ELEMENT'); let f=false; const target=n(t); "
             js = js & "for(let i=0;i<s.options.length;i++){if(n(s.options[i].text)===target){s.value=s.options[i].value;f=true;break;}} "
-            js = js & "if(!f)throw new Error('Option text not found: '+t); s.scrollIntoView({block:'center'}); s.focus(); " & rp
+            js = js & "if(!f)throw new Error('Option text not found: '+t); s.scrollIntoView({block:'center'}); s.focus(); if(!s.isConnected)throw new Error('STALE_ELEMENT'); " & rp
             js = js & "s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true})); s.blur(); return true;} catch(err){throw err;}"
 
         Case "get_text"
@@ -4918,30 +6190,33 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0));"
    
         Case "shadow_click"
-            js = js & "const sels=arguments[0],tout=arguments[1],start=Date.now(); "
+            js = js & "const sels=arguments[0],tout=arguments[1],start=Date.now(); let lastS=null; "
             js = js & "const fd=(r,s)=>{let n=r.querySelector(s);if(n)return n;for(let c of r.querySelectorAll('*')){if(c.shadowRoot&&(n=fd(c.shadowRoot,s)))return n;}return null;}; "
-            js = js & "while(Date.now()-start<tout){ hb(); let el=document,lastS=null; "
+            js = js & "while(Date.now()-start<tout){ hb(); let el=document; lastS=null; "
             js = js & "for(const s of sels){el=fd(el.shadowRoot||el,s);if(!el){lastS=s;break;}} "
             js = js & "if(el){el.scrollIntoView({block:'center'});el.focus();" & rp & "el.click();return true;} "
             js = js & "if(Date.now()-start+100>tout)throw new Error('ShadowSearchError: Failed at ['+lastS+'] within '+tout+'ms'); "
-            js = js & "await new Promise(r=>setTimeout(r,100));} "
+            js = js & "await new Promise(r=>setTimeout(r,100));} throw new Error('ShadowSearchError: Failed at ['+lastS+'] within '+tout+'ms'); "
             
       Case "input_keys"
 
-            js = js & "try{let e=arguments[0],v=arguments[1],o=e;e.scrollIntoView({block:'center',inline:'center'});e.click();e.focus();"
-            js = js & "let prev=null,stb=0;for(let t=Date.now();Date.now()-t<3000;){hb();let a=document.activeElement;"
-            js = js & "if(a&&a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type)&&typeof a.selectionStart==='number'){if(a===prev){stb++;if(stb>=2){e=a;break;}}else{prev=a;stb=1;}}else{prev=null;stb=0;}await new Promise(r=>setTimeout(r,15));}"
-            js = js & "(e.select?e.select():document.execCommand('selectAll'));await new Promise(r=>setTimeout(r,80));document.execCommand('delete');await new Promise(r=>setTimeout(r,80));"
-            js = js & "if(e.value){if(e.select)e.select();document.execCommand('forwardDelete');await new Promise(r=>setTimeout(r,80));}if(e.value){e.value='';e.dispatchEvent(new Event('input',{bubbles:true}));await new Promise(r=>setTimeout(r,80));}" & rp & "await new Promise(r=>setTimeout(r,40));"
-            js = js & "for(let c of v){hb();let s=(typeof e.selectionStart==='number'?e.selectionStart:0);document.execCommand('insertText',false,c);for(let k=0;k<80;k++){let a=document.activeElement;if(a&&a!==e&&a.tagName==='INPUT'&&(a.type==='text'||!a.type))e=a;if(document.activeElement===e&&typeof e.selectionStart==='number'&&e.selectionStart>=s+1)break;await new Promise(r=>setTimeout(r,10));}}"
-            js = js & "if(v.length>0&&(!e.value||e.value.length<v.length))throw new Error('Wiz Input Validation Failed: '+e.value);return true;}catch(err){throw err;}"
+            js = js & "try{let e=arguments[0],v=arguments[1];if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
+            js = js & "e.scrollIntoView({block:'center',inline:'center'});if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');e.click();e.focus();"
+            js = js & "if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');let prev=null,stb=0;for(let t=Date.now();Date.now()-t<3000;){hb();let a=document.activeElement;"
+            js = js & "if(a&&a.isConnected&&a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type)&&typeof a.selectionStart==='number'){if(a===prev){stb++;if(stb>=2){e=a;break;}}else{prev=a;stb=1;}}else{prev=null;stb=0;}await new Promise(r=>setTimeout(r,15));}"
+            js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');(e.select?e.select():document.execCommand('selectAll'));await new Promise(r=>setTimeout(r,80));document.execCommand('delete');await new Promise(r=>setTimeout(r,80));"
+            js = js & "if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(e.value){if(e.select)e.select();document.execCommand('forwardDelete');await new Promise(r=>setTimeout(r,80));}if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');"
+            js = js & "if(e.value){e.value='';e.dispatchEvent(new Event('input',{bubbles:true}));await new Promise(r=>setTimeout(r,80));}if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');" & rp & "await new Promise(r=>setTimeout(r,40));"
+            js = js & "for(let c of v){hb();if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');let s=(typeof e.selectionStart==='number'?e.selectionStart:0);document.execCommand('insertText',false,c);for(let k=0;k<80;k++){let a=document.activeElement;if(a&&a.isConnected&&a!==e&&a.tagName==='INPUT'&&(a.type==='text'||!a.type))e=a;if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(document.activeElement===e&&typeof e.selectionStart==='number'&&e.selectionStart>=s+1)break;await new Promise(r=>setTimeout(r,10));}}"
+            js = js & "if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(v.length>0&&(!e.value||e.value.length<v.length))throw new Error('Wiz Input Validation Failed: '+e.value);return true;}catch(err){throw err;}"
 
         Case "autoclicker"
-            js = js & "function(){const x={{XPATH}},t={{TIMEOUT}},s=Date.now();"
+            js = js & "function(){const x={{XPATH}},t={{TIMEOUT}};"
             js = js & "const f=()=>{const e=document.evaluate(x,document,null,9,null).singleNodeValue;"
             js = js & "if(e&&(e.offsetWidth>0||e.offsetHeight>0)){e.click();"
             js = js & "console.log('BiDi-AutoClicker: Target clicked');return 1}return 0};"
-            js = js & "if(f())return;const o=new MutationObserver(()=>{if(f()||(Date.now()-s>t))o.disconnect()});"
+            js = js & "if(f())return;const o=new MutationObserver(()=>{if(f()){clearTimeout(tm);o.disconnect()}});"
+            js = js & "const tm=setTimeout(()=>o.disconnect(),t);"
             js = js & "o.observe(document.body||document,{childList:1,subtree:1,attributes:1});}"
 
         Case "lazy_scroll"
@@ -5008,10 +6283,30 @@ Public Function CallScript(ByVal js As String, _
     params.Add "awaitPromise", True
     
     Dim rawRes As String: rawRes = ExecuteBiDiCommand("script.callFunction", params, Silent, allowAmbiguousRetry, _
-                                allowContextRetarget:=(resolvedCtx = m_mainContextId))
+                                allowContextRetarget:=(resolvedCtx = m_mainContextId), _
+                                commandTimeoutMs:=ResolveTransportTimeout(vSafetyTimeoutMs))
     Dim json As Object: Set json = ValidateProtocolResponse(rawRes, "script.callFunction")
     Dim procObj As Object: Set procObj = UnwrapSafetyShell(json, "script.callFunction")
     CallScript = WebJsonConverter.ConvertToJson(procObj)
+End Function
+
+Private Function ResolveTransportTimeout(ByVal operationTimeoutMs As Long) As Long
+    Dim candidate As Double
+    candidate = CDbl(operationTimeoutMs) + CDbl(TRANSPORT_TIMEOUT_MARGIN_MS)
+
+    If candidate < DEFAULT_COMMAND_TIMEOUT_MS Then candidate = DEFAULT_COMMAND_TIMEOUT_MS
+    If candidate > MAX_TRANSPORT_TIMEOUT_MS Then candidate = MAX_TRANSPORT_TIMEOUT_MS
+
+    ResolveTransportTimeout = CLng(candidate)
+End Function
+
+Private Function ResolveNavigationTransportTimeout(ByVal maxTimeoutMs As Long) As Long
+    Dim candidate As Long
+    candidate = ResolveTransportTimeout(maxTimeoutMs)
+    If candidate < NAVIGATION_INTERACTIVE_TRANSPORT_FLOOR_MS Then
+        candidate = NAVIGATION_INTERACTIVE_TRANSPORT_FLOOR_MS
+    End If
+    ResolveNavigationTransportTimeout = candidate
 End Function
 
 Private Function IsTimeout(ByVal startTicks As Currency, ByVal timeoutMs As Double) As Boolean
@@ -5057,14 +6352,14 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
             js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visXPath=x;p.visArmed=true;p.visSeen=false;return 0};"
             js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath=''};"
-            js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{if(e&&!/sizzle|signon_javascript|conversation_button/.test(e)){uT();if(p.changeList.indexOf(e)===-1&&p.changeList.length<50)p.changeList.push(e)}};p.touch=uT;p.logChange=lg;"
+            js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{if(e){uT();if(p.changeList.indexOf(e)===-1&&p.changeList.length<50)p.changeList.push(e)}};p.touch=uT;p.logChange=lg;"
             js = js & "var iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;if(!t)return 0;for(var i=0;i<s.length;i++){var x=s[i],k=String(x);if(p.invalidSelectors.has(k))continue;try{if(t.closest(x)!==null)return 1}catch(e){p.invalidSelectors.add(k)}}return 0};"
             js = js & "try{var d=getInputDesc();if(legacy&&!p.inputSetterWrapper&&d&&typeof d.set==='function'){p.inputSetterWrapper=d.set;p.inputGetterWrapper=d.get||null}else if(!(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&!p.inputOriginalSet)){var bS=(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&p.inputOriginalSet)?p.inputOriginalSet:(d&&d.set),bG=(p.inputGetterWrapper&&d&&d.get===p.inputGetterWrapper&&p.inputOrigi"
-            js = js & "nalGet)?p.inputOriginalGet:(d&&d.get);if(bS&&bG){var sW=function(v){lg('PROP:'+gX(this)+'[value]');return bS.call(this,v)},gW=function(){return bG.call(this)};Object.defineProperty(HTMLInputElement.prototype,'value',{set:sW,get:gW,configurable:true});p.inputOriginalSet=bS;p.inputOriginalGet=bG;p.inputSetterWrapper=sW;p.inputGetterWrapper=gW}}}catch(e){p.lastHealthError='input:'+String(e&&e.message||e)}"
+            js = js & "nalGet)?p.inputOriginalGet:(d&&d.get);if(bS&&bG){var sW=function(v){if(!iN(this,p.selectors||[]))lg('PROP:'+gX(this)+'[value]');return bS.call(this,v)},gW=function(){return bG.call(this)};Object.defineProperty(HTMLInputElement.prototype,'value',{set:sW,get:gW,configurable:true});p.inputOriginalSet=bS;p.inputOriginalGet=bG;p.inputSetterWrapper=sW;p.inputGetterWrapper=gW}}}catch(e){p.lastHealthError='input:'+String(e&&e.message||e)}"
             js = js & "try{if(p.baseObserver&&p.baseObserver.disconnect)p.baseObserver.disconnect()}catch(e){}p.baseObserver=null;"
-            js = js & "try{p.baseObserver=new MutationObserver((ms)=>{ms.forEach((m)=>{if(iN(m.target,p.selectors||[]))return;var t=(m.type==='characterData')?m.target.parentElement:m.target,path=gX(t),entry=(m.type==='attributes')?'ATTR:'+path+'['+m.attributeName+']':'DOM:'+path;if(entry.indexOf('sizzle')===-1)lg(entry)})});p.baseObserver.observe(document,{childList:true,characterData:true,subtree:true,attributes:true})}catch(e){p.baseObserver="
+            js = js & "try{p.baseObserver=new MutationObserver((ms)=>{ms.forEach((m)=>{if(iN(m.target,p.selectors||[]))return;var t=(m.type==='characterData')?m.target.parentElement:m.target,path=gX(t),entry=(m.type==='attributes')?'ATTR:'+path+'['+m.attributeName+']':'DOM:'+path;lg(entry)})});p.baseObserver.observe(document,{childList:true,characterData:true,subtree:true,attributes:true})}catch(e){p.baseObserver="
             js = js & "null;p.lastHealthError='observer:'+String(e&&e.message||e)}"
-            js = js & "var __vbaMatch=function(u,pat){if(pat.indexOf('*')<0)return u.indexOf(pat)!==-1;var re=pat.replace(/[.+^${}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*').replace(/\?/g,'.');try{return new RegExp(re).test(u)}catch(e){return u.indexOf(pat)!==-1}};"
+            js = js & "var __vbaMatch=function(u,pat){u=String(u||'').toLowerCase();pat=String(pat||'').toLowerCase();if(!pat)return false;if(pat.indexOf('*')<0)return u.indexOf(pat)!==-1;var a=pat.split('*'),pos=0;for(var i=0;i<a.length;i++){var q=a[i];if(!q)continue;var n=u.indexOf(q,pos);if(n<0)return false;pos=n+q.length}return true};"
             js = js & "if(typeof window.fetch==='function'){if(legacy&&!p.fetchWrapper&&window.fetch.__vbaWrapped){p.fetchWrapper=window.fetch}else if(!(p.fetchWrapper&&window.fetch===p.fetchWrapper&&!p.fetchOriginal)){var oF=(p.fetchWrapper&&window.fetch===p.fetchWrapper&&p.fetchOriginal)?p.fetchOriginal:window.fetch;p.fetchGen=(p.fetchGen||0)+1;var myFetchGen=p.fetchGen;var fW=function(u,o){if(myFetchGen!==p.fetchGen)return oF.apply(this,arguments);var r=(typeof u==='string')?u:(u&&u.url)||'';if((p.ignoreNetwork||[]).some((pat)=>__vbaMatch(r,pat)))return oF"
             js = js & ".apply(this,arguments);p.inflightFetchCount++;p.inflightUrlCounts.set(r,(p.inflightUrlCounts.get(r)||0)+1);var dec=()=>{p.inflightFetchCount=Math.max(0,p.inflightFetchCount-1);var n=(p.inflightUrlCounts.get(r)||0)-1;if(n<=0)p.inflightUrlCounts.delete(r);else p.inflightUrlCounts.set(r,n);uT()};try{return oF.apply(this,arguments).then((r2)=>{dec();return r2}).catch((e)=>{dec();throw e})}catch(e2){dec();throw e2}};fW.__"
             js = js & "vbaWrapped=true;fW.__vbaProbeVersion=V;fW.__vbaProbeGeneration=myFetchGen;p.fetchOriginal=oF;p.fetchWrapper=fW;window.fetch=fW}}else{p.fetchOriginal=null;p.fetchWrapper=null}"
@@ -5105,13 +6400,23 @@ Private Function BuildContextTarget(ByVal contextId As String, _
 End Function
 
 Public Property Let IgnoreSelectors(ByVal cssSelectors As String)
+    If Len(Trim$(cssSelectors)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:IgnoreSelectors", "cssSelectors is empty."
+    End If
+
     If m_userIgnoreSelectors Is Nothing Then Set m_userIgnoreSelectors = New Collection
     m_userIgnoreSelectors.Add cssSelectors
+    BumpIdleFilterRevision
 End Property
 
 Public Property Let IgnoreNetworkPatterns(ByVal urlPattern As String)
+    If Len(Trim$(urlPattern)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:IgnoreNetworkPatterns", "urlPattern is empty."
+    End If
+
     If m_userIgnoreNetworkPatterns Is Nothing Then Set m_userIgnoreNetworkPatterns = New Collection
     m_userIgnoreNetworkPatterns.Add urlPattern
+    BumpIdleFilterRevision
 End Property
 
 Private Function EnsureDictionary(ByVal dic As Dictionary) As Dictionary
@@ -5179,16 +6484,11 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
     Loop
 
 CleanExit:
-    If errNum <> 0 Then
-        m_waitStackDepth = 0
-    Else
-        m_waitStackDepth = m_waitStackDepth - 1
-        If m_waitStackDepth < 0 Then m_waitStackDepth = 0
-    End If
+    m_waitStackDepth = m_waitStackDepth - 1
+    If m_waitStackDepth < 0 Then m_waitStackDepth = 0
 
     On Error Resume Next
-    ' Keep the HUD while an outer nested wait is still active. Errors already reset the
-    ' depth to zero above, so one condition covers both normal and exceptional exits.
+    ' Keep the HUD while an outer nested wait is still active.
     If m_waitStackDepth = 0 Then
         Call Me.CallScript(GetHudJs("remove"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), _
                            False, False, 1000, Silent:=True, allowAmbiguousRetry:=True)
@@ -5407,7 +6707,10 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
                                     Optional ByVal awaitPromise As Boolean = True, _
                                     Optional ByVal maxRetries As Long = DEFAULT_STALE_RETRIES, _
                                     Optional ByVal maxTimeout As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                    Optional ByVal checkUrl As Boolean = False) As String
+                                    Optional ByVal checkUrl As Boolean = False, _
+                                    Optional ByVal retryXPath As String = "", _
+                                    Optional ByVal retrySearchTimeoutMs As Long = 10000, _
+                                    Optional ByVal retryCallerName As String = "") As String
     ResetLastSyncState
     Dim retryCount As Long
     Dim localErrNum As Long
@@ -5419,12 +6722,14 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim vStable As Long: vStable = SanitizeMs(minStable, "minStableMs", DEFAULT_IDLE_STABLE_MS)
     Dim vTimeout As Long: vTimeout = SanitizeMs(maxTimeout, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
+    Dim currentArgs As Collection
+    Set currentArgs = args
 
     Do While retryCount <= maxRetries
         status = TryPreparePhase(targetCtx, waitNetwork, (retryCount > 0), _
                                  localErrNum, localErrDesc, localErrSrc)
         If status = 0 Then
-            status = TryExecutePhase(targetCtx, jsKey, args, awaitPromise, vTimeout, _
+            status = TryExecutePhase(targetCtx, jsKey, currentArgs, awaitPromise, vTimeout, _
                                      callResult, localErrNum, localErrDesc, localErrSrc)
         End If
 
@@ -5433,7 +6738,10 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
             ExecuteBaseAction = callResult
             Exit Function
         End If
-        If status = ERR_ACTION_FAILED Then Exit Do
+        Dim staleFailure As Boolean
+        staleFailure = IsStaleElementFailure(status, localErrSrc, localErrDesc)
+
+        If status = ERR_ACTION_FAILED And Not staleFailure Then Exit Do
 
         ' Never replay an ambiguous action that could duplicate state or overlap.
         If IsUnsafeToRetryAfterAmbiguousOutcome(jsKey) And _
@@ -5445,7 +6753,25 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
                 Debug.Print "BiDi: Action '" & jsKey & "' failed (Status:" & status & "). " & _
                             "Attempting retry " & retryCount & "/" & maxRetries & "..."
             End If
+
             WaitHeartbeat 500
+
+            If staleFailure And Len(retryXPath) > 0 Then
+                Dim freshSharedId As String
+                Dim resolverName As String
+
+                resolverName = retryCallerName
+                If Len(resolverName) = 0 Then resolverName = "ExecuteBaseAction"
+
+                freshSharedId = ResolveXPathOrThrow( _
+                    retryXPath, targetCtx, retrySearchTimeoutMs, resolverName)
+
+                Set currentArgs = ReplaceFirstElementReference(currentArgs, freshSharedId)
+
+                If m_debugMode Then
+                    Debug.Print "BiDi: Stale element re-resolved from XPath: " & retryXPath
+                End If
+            End If
         End If
     Loop
 
@@ -5645,7 +6971,7 @@ Private Function ValidateProtocolResponse(ByVal jsonRaw As String, ByVal methodN
 
     If json.Exists("error") Then
         Dim errType As String: errType = json("error")
-        Dim errMsg As String: errMsg = json("message")
+        Dim errMsg As String: errMsg = GetPathString(json, "message")
         Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:" & methodName, "[" & errType & "] " & errMsg
     End If
 
@@ -5694,7 +7020,7 @@ Private Function UnwrapSafetyShell(ByVal json As Object, ByVal methodName As Str
                             Err.Raise 517, "BiDi:SafetyTimeout:" & methodName, _
                                 "Safety Shell timeout: the wrapper stopped waiting, but the browser-side task may still be running."
                         Else
-                            Err.Raise ERR_ACTION_FAILED, "BiDi:SafetyTimeout:" & methodName, shellMsg
+                            Err.Raise ERR_ACTION_FAILED, "BiDi:JSError:" & methodName, shellMsg
                         End If
                     End If
 
@@ -5866,14 +7192,14 @@ Private Function WrapInSafetyShell(ByVal jsBody As String, ByVal timeoutMs As Lo
     Dim js As String
     
     js = "async function(){ "
-    js = js & "const _t=" & timeoutMs & "; let _la=Date.now(); const hb=()=>{_la=Date.now()}; "
+    js = js & "const _t=" & timeoutMs & "; let _la=performance.now(); const hb=()=>{_la=performance.now()}; "
     
     ' _tk must remain an arrow function so jsBody arguments resolve to the outer BiDi
     ' function parameters; a regular function silently breaks all action arguments.
     js = js & "const _tk = async () => { " & jsBody & " }; "
     
-    ' The watchdog rejects with VBA_TIMEOUT when hb() silence exceeds its limit.
-    js = js & "let _wdTimer; const _wd = new Promise((_,r)=>{ _wdTimer=setInterval(()=>{if(Date.now()-_la>_t){clearInterval(_wdTimer);r(new Error('VBA_TIMEOUT'))}},100);}); "
+    ' The watchdog uses the monotonic browser clock and rejects when hb() silence exceeds its limit.
+    js = js & "let _wdTimer; const _wd = new Promise((_,r)=>{ _wdTimer=setInterval(()=>{if(performance.now()-_la>_t){clearInterval(_wdTimer);r(new Error('VBA_TIMEOUT'))}},100);}); "
     
     js = js & "try{ const res = await Promise.race([_tk(), _wd]); clearInterval(_wdTimer); return JSON.stringify({status:'ok', value:(typeof res === 'undefined' ? null : res)}); "
     js = js & "}catch(e){ clearInterval(_wdTimer); return JSON.stringify({status:'error', message:e.message}); } }"
@@ -6049,6 +7375,19 @@ End Function
 ' Returns the registered preload script ID. Raises on protocol or malformed-response
 ' failure; failure is no longer represented by an empty string.
 Public Function ExecuteEnableGlobalShadowUnlocker() As String
+    If m_shadowUnlockerRegistered And Len(m_shadowUnlockerScriptId) > 0 Then
+        ExecuteEnableGlobalShadowUnlocker = m_shadowUnlockerScriptId
+        If m_debugMode Then
+            Debug.Print "BiDi: Global Shadow DOM Unlocker already registered (ID: " & _
+                        m_shadowUnlockerScriptId & ")"
+        End If
+        Exit Function
+    End If
+
+    If m_shadowUnlockerRegistered Then
+        m_shadowUnlockerRegistered = False
+        m_shadowUnlockerScriptId = vbNullString
+    End If
     Dim params As New Dictionary, js As String
     
     ' The attachShadow hook forces mode:'open' while preserving other options; dropping
@@ -6393,7 +7732,7 @@ Public Sub ExecuteWizSelectDropdown(ByVal triggerXPath As String, _
                                     Optional ByVal contextId As String = "")
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     
-    Call Me.ExecuteClickByXPath(triggerXPath, searchTimeoutMs, True, , maxTimeoutMs, targetCtx)
+    Call Me.ExecuteClickByXPath(triggerXPath, searchTimeoutMs, False, , maxTimeoutMs, targetCtx)
     
     Dim optionXPath As String
     optionXPath = "//*[@role='option'][contains(., " & EscapeXPathString(optionText) & ")]"

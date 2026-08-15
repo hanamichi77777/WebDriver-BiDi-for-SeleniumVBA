@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v3.9
+# WebDriver BiDi for SeleniumVBA v4.0
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
@@ -189,5 +189,17 @@ This procedure demonstrates the WebDriver BiDi download path using a reproducibl
 * **Browser-reported filepath only:** `filePath` is displayed as reported by WebDriver BiDi. The sample does not treat that value as proof that the file currently exists on disk, has a particular size or hash, or will never be renamed by another process.
 * **Cleanup of browser-side download policy:** After the sample result is displayed, `ClearDownloadBehavior` explicitly restores the browser's default download behavior. `Shutdown` also contains a best-effort cleanup path if a wrapper-owned download override is still active.
 * **What to customize:** Replace the probe URL, trigger XPath, destination folder, and timeouts when adapting the sample. Keep the exactly-one-download assumption in mind; workflows that intentionally start multiple downloads from one trigger require a different application-level contract.
+
+### 13. Main13: Correlated New Tab / New Window Capture and Explicit Context Ownership
+This procedure demonstrates capturing a newly created top-level browsing context after one trigger click, identifying whether it is a tab or a separate window, and explicitly controlling which top-level context is treated as the wrapper's main context.
+
+* **HTTPS new-context fixture:** The sample uses the project's public GitHub Pages probe at `https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/new-context-probe/`. The page provides separate `#open-tab` and `#open-window` triggers so tab and window creation can be exercised deterministically.
+* **Resolve, arm, then click exactly once:** `ExecuteOpenNewContextByXPath` resolves the trigger element before arming capture, snapshots the current top-level context tree, then performs one trusted click and waits for `browsingContext.contextCreated`. A timeout or ambiguous outcome does not cause the trigger to be replayed.
+* **Owner correlation:** When `originalOpener` is present, a new top-level context is accepted only when its opener matches the owner context that was armed. Contexts opened by unrelated pages are ignored. If `originalOpener` is unavailable, the wrapper falls back to identifying a context that did not exist in the pre-click top-level baseline.
+* **Ambiguity is rejected rather than guessed:** If more than one new top-level context matches the single trigger, the operation fails instead of arbitrarily choosing one. Capture also fails if relevant lifecycle events are lost after the arm boundary or if the candidate context is destroyed before capture completes.
+* **Tab/window classification from `clientWindow`:** The returned `Dictionary` reports `kind` as `tab` when the captured context shares the owner's `clientWindow`, `window` when it has a different `clientWindow`, and `unknown` when the browser does not provide enough information. The result also exposes `context`, `url`, `originalOpener`, `clientWindow`, `ownerContext`, `ownerClientWindow`, `correlation`, `candidateCount`, and `foreignIgnored`.
+* **Captured does not mean silently retargeted:** Opening a new context does not automatically replace the wrapper's pinned main context. The sample closes the captured tab directly by context ID, reads the new window's title with `ExecuteGetTitleByContextId`, explicitly pins that window with `SetMainContextId`, then restores the original owner context before closing the window.
+* **What to customize:** Replace the probe URL, trigger XPaths, and timeouts when adapting the sample. Keep the one-trigger/one-new-top-level-context contract; if one action intentionally opens multiple tabs or windows, use an application-specific strategy rather than treating the result as a single captured context.
+
 
 ---

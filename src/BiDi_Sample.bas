@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 3.8 / MIT License / Copyright (c) hanamichi77777
+' Version 4.0 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -601,6 +601,89 @@ Public Sub Main12()
         ' Explicitly restore the browser/default download policy.
         ' Shutdown also performs best-effort cleanup if an override is still active.
         bidi.ClearDownloadBehavior
+
+        bidi.Shutdown: Set bidi = Nothing
+        .CloseBrowser: .Shutdown
+
+    End With
+
+End Sub
+
+' Main13 - New tab / new window capture through browsingContext.contextCreated
+' ExecuteOpenNewContextByXPath clicks the trigger exactly once and returns the
+' newly created top-level browsing context. originalOpener correlation excludes
+' foreign contexts, and multiple candidates fail instead of being guessed.
+Public Sub Main13()
+
+    Dim driver As New WebDriver
+    Dim caps As WebCapabilities
+    Dim bidi As BiDiCommandWrapper
+    Dim tabResult As Dictionary
+    Dim windowResult As Dictionary
+
+    Dim targetUrl As String
+    Dim ownerContext As String
+    Dim tabContext As String
+    Dim windowContext As String
+    Dim msgText As String
+    Dim msgCaption As String
+
+    targetUrl = "https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/new-context-probe/"
+
+    With driver
+        .StartEdge
+
+        Set caps = .CreateCapabilities
+        caps.AddArguments "--start-maximized"
+        caps.EnableBiDiMode
+        .OpenBrowser caps
+
+        Set bidi = New BiDiCommandWrapper
+        bidi.ConnectTo .GetWebSocketUrl
+
+        bidi.ExecuteNavigateAndGetStatus targetUrl
+        ownerContext = bidi.GetMainContextId()
+
+        Set tabResult = bidi.ExecuteOpenNewContextByXPath( _
+            "//*[@id='open-tab']", _
+            searchTimeoutMs:=5000, _
+            timeoutMs:=10000)
+
+        tabContext = CStr(tabResult("context"))
+
+        Debug.Print "New tab context: " & tabContext
+        Debug.Print "New tab kind: " & CStr(tabResult("kind"))
+        Debug.Print "New tab correlation: " & CStr(tabResult("correlation"))
+        Debug.Print "New tab originalOpener: " & CStr(tabResult("originalOpener"))
+
+        bidi.ExecuteCloseContext tabContext
+
+        Set windowResult = bidi.ExecuteOpenNewContextByXPath( _
+            "//*[@id='open-window']", _
+            searchTimeoutMs:=5000, _
+            timeoutMs:=10000)
+
+        windowContext = CStr(windowResult("context"))
+
+        Debug.Print "New window context: " & windowContext
+        Debug.Print "New window kind: " & CStr(windowResult("kind"))
+        Debug.Print "New window correlation: " & CStr(windowResult("correlation"))
+        Debug.Print "New window originalOpener: " & CStr(windowResult("originalOpener"))
+        Debug.Print "New window title: " & bidi.ExecuteGetTitleByContextId(windowContext)
+
+        ' Pin the new window explicitly, then return to the original owner.
+        bidi.SetMainContextId windowContext
+        Debug.Print "Pinned main context: " & bidi.GetMainContextId()
+
+        bidi.SetMainContextId ownerContext
+        bidi.ExecuteCloseContext windowContext
+
+        msgText = "New Tab: " & CStr(tabResult("kind")) & vbCrLf
+        msgText = msgText & "New Window: " & CStr(windowResult("kind")) & vbCrLf
+        msgText = msgText & "Correlation: " & CStr(windowResult("correlation"))
+        msgCaption = "BiDi New Context Capture"
+
+        MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
 
         bidi.Shutdown: Set bidi = Nothing
         .CloseBrowser: .Shutdown
