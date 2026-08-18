@@ -1,68 +1,108 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WebDriver BiDi Download Probe</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      max-width: 760px;
-      margin: 48px auto;
-      padding: 0 20px;
-      line-height: 1.6;
-    }
-    button {
-      font: inherit;
-      padding: 10px 18px;
-      cursor: pointer;
-    }
-    #status {
-      margin-top: 18px;
-    }
-    code {
-      background: #f3f3f3;
-      padding: 2px 5px;
-      border-radius: 4px;
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebDriver BiDi Parallel Download Probe</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.45; }
+  h1 { margin-bottom: .25rem; }
+  .row { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1.25rem 0; }
+  .download, button { display: inline-block; padding: .7rem 1rem; font-size: 1rem; cursor: pointer;
+                      border: 1px solid #777; border-radius: .35rem; background: #f7f7f7;
+                      color: #111; text-decoration: none; }
+  #log { white-space: pre-wrap; background: #f4f4f4; border: 1px solid #ddd; padding: 1rem; min-height: 8rem; }
+  code { background: #f4f4f4; padding: .1rem .3rem; }
+  .hidden { display: none; }
+</style>
 </head>
 <body>
-  <h1>WebDriver BiDi Download Probe</h1>
+<h1>WebDriver BiDi Parallel Download Probe</h1>
+<p>
+  Self-contained test page for <code>ExecuteDownloadsByXPath</code>.
+  Download payloads are generated in memory as <code>Blob</code> objects, so no external
+  <code>payload-*.bin</code> files are required.
+</p>
 
-  <p>
-    This page provides a deterministic download trigger for the
-    <code>Main12</code> SeleniumVBA sample.
-  </p>
+<div class="row">
+  <a class="download" id="download-a" href="#" download="bidi-batch-A.bin">Download A</a>
+  <a class="download" id="download-b" href="#" download="bidi-batch-B.bin">Download B</a>
+  <a class="download" id="download-c" href="#" download="bidi-batch-C.bin">Download C</a>
+</div>
 
-  <button id="download-single" type="button">Download sample file</button>
+<div class="row">
+  <button id="download-noop" type="button">NO-OP (no download)</button>
+  <button id="download-double" type="button">Start TWO downloads</button>
+</div>
 
-  <p id="status" role="status" aria-live="polite">Ready.</p>
+<a class="hidden" id="double-1" href="#" download="bidi-batch-double-1.bin">double 1</a>
+<a class="hidden" id="double-2" href="#" download="bidi-batch-double-2.bin">double 2</a>
 
-  <script>
-    document.getElementById("download-single").addEventListener("click", () => {
-      const content =
-        "WebDriver BiDi for SeleniumVBA\n" +
-        "Main12 download sample\n";
+<p>
+  This file can be opened directly with <code>file:///</code>. The normal test files are
+  generated as 8, 12 and 16 MiB Blobs to make overlapping download lifetimes easier to observe.
+</p>
 
-      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
+<div id="log" aria-live="polite"></div>
 
-      anchor.href = url;
-      anchor.download = "bidi-main12-sample.txt";
-      anchor.style.display = "none";
+<script>
+(() => {
+  const logEl = document.getElementById('log');
+  const urls = [];
 
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
+  function log(message) {
+    logEl.textContent += `${new Date().toISOString()}  ${message}\n`;
+  }
 
-      document.getElementById("status").textContent =
-        "Download was requested: bidi-main12-sample.txt";
+  function makePayloadUrl(sizeMiB, seed) {
+    const size = sizeMiB * 1024 * 1024;
+    const chunkSize = 64 * 1024;
+    const chunk = new Uint8Array(chunkSize);
+    for (let i = 0; i < chunk.length; i++) {
+      chunk[i] = (i * 31 + seed * 17) & 0xff;
+    }
 
-      // Revoke after the download request has been handed to the browser.
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    });
-  </script>
+    const parts = [];
+    let remaining = size;
+    while (remaining > 0) {
+      const take = Math.min(chunkSize, remaining);
+      parts.push(take === chunkSize ? chunk : chunk.slice(0, take));
+      remaining -= take;
+    }
+
+    const url = URL.createObjectURL(new Blob(parts, { type: 'application/octet-stream' }));
+    urls.push(url);
+    return url;
+  }
+
+  function prepareAnchor(id, sizeMiB, seed) {
+    const el = document.getElementById(id);
+    el.href = makePayloadUrl(sizeMiB, seed);
+    el.addEventListener('click', () => log(`${id} clicked (${sizeMiB} MiB)`));
+  }
+
+  prepareAnchor('download-a', 8, 1);
+  prepareAnchor('download-b', 12, 2);
+  prepareAnchor('download-c', 16, 3);
+  prepareAnchor('double-1', 4, 4);
+  prepareAnchor('double-2', 4, 5);
+
+  document.getElementById('download-noop').addEventListener('click', () => {
+    log('download-noop clicked: intentionally no download started');
+  });
+
+  document.getElementById('download-double').addEventListener('click', () => {
+    log('download-double clicked: dispatching two download links');
+    document.getElementById('double-1').click();
+    document.getElementById('double-2').click();
+  });
+
+  window.addEventListener('beforeunload', () => {
+    for (const url of urls) URL.revokeObjectURL(url);
+  });
+
+  log('probe ready - self-contained Blob payloads initialized');
+})();
+</script>
 </body>
 </html>
