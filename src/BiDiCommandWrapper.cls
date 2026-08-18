@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.1"
+Private Const BIDI_WRAPPER_VERSION As String = "4.2"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -217,41 +217,37 @@ Private m_newContextForeignIgnoredCount As Long
 Private m_newContextDroppedEventsAtArm As Long
 Private m_newContextBaseline As Dictionary
 
-' Download transaction capture: one-shot owner-context arm, begin/end correlation,
-' and exactly-one start detection. Correlation prefers the BiDi download id; context+navigation
-' is the measured Edge fallback. Multiple owner-context starts are latched as ambiguity and
-' are not followed as multiple transactions.
+' Unified download capture. One engine handles a String XPath, a one-item Array/Collection,
+' or multiple triggers. The outer Dictionary is keyed by a protocol correlation key and each
+' value is a Dictionary containing one download transaction. Correlation prefers the BiDi
+' download UUID; context+navigation is the measured Edge fallback.
 Private Const DOWNLOAD_CORRELATION_UUID As String = "download"
 Private Const DOWNLOAD_CORRELATION_CONTEXT_NAV As String = "context+navigation"
 Private Const DOWNLOAD_CORRELATION_UNCORRELATABLE As String = "uncorrelatable"
 Private Const DEFAULT_DOWNLOAD_TIMEOUT_MS As Long = 30000
 Private m_downloadArmed As Boolean
-Private m_downloadStartedSeen As Boolean
-Private m_downloadEndSeen As Boolean
 Private m_downloadOwnerContextId As String
-Private m_downloadAcceptedContextId As String
-Private m_downloadCorrelationMode As String
-Private m_downloadCorrelationDownloadId As String
-Private m_downloadCorrelationNavigationId As String
-Private m_downloadEndContextId As String
-Private m_downloadEndStatusDiagnostic As String
-Private m_downloadEndFilePathDiagnostic As String
 Private m_downloadContextMissWarned As Boolean
 Private m_downloadDroppedEventsAtArm As Long
 Private m_downloadStartedCount As Long
-Private m_downloadMultipleStarted As Boolean
-Private m_downloadSecondCorrelationMode As String
-Private m_downloadSecondDownloadId As String
-Private m_downloadSecondNavigationId As String
-Private m_downloadSuggestedFilename As String
-Private m_downloadUrl As String
-Private m_downloadTerminalEligible As Boolean
 Private m_downloadUncorrelatableCount As Long
 Private m_downloadFirstUncorrelatableContext As String
 
-' B1: durable structured snapshot of the most recent ExecuteDownloadByXPath failure.
-' It is independent of the live one-shot capture state and survives ResetDownloadCaptureState,
-' ClearState, and later successful operations until replaced by another failure or explicitly cleared.
+' The same transaction store is used whether expectedCount is 1 or greater.
+Private m_downloadBatchActive As Boolean
+Private m_downloadBatchExpectedCount As Long
+Private m_downloadBatchDispatchCount As Long
+Private m_downloadBatchOverStarted As Boolean
+Private m_downloadBatchFirstExtraCorrelationKey As String
+Private m_downloadBatchFilenameCollision As Boolean
+Private m_downloadBatchCollisionFilename As String
+Private m_downloadBatchCollisionFirstCorrelationKey As String
+Private m_downloadBatchCollisionSecondCorrelationKey As String
+Private m_downloadBatchTransactions As Dictionary
+
+' B1: durable structured snapshot of the most recent download execution failure.
+' It is owned by ExecuteDownloadsByXPath, independent of live capture
+' state, and survives ResetDownloadCaptureState/ClearState until replaced or explicitly cleared.
 Private m_lastDownloadFailureDiagnostic As Dictionary
 
 ' browser.setDownloadBehavior is browser-side state that may outlive this wrapper/WebSocket.
@@ -294,12 +290,13 @@ Private Const ERR_CONSENSUS_HALT As Long = vbObjectError + 1010  ' Consensus fai
 Private Const ERR_CONNECT_FAILED As Long = vbObjectError + 1011 ' WebSocket connection could not be established
 Private Const ERR_DOWNLOAD_START_TIMEOUT As Long = vbObjectError + 1020
 Private Const ERR_DOWNLOAD_COMPLETION_TIMEOUT As Long = vbObjectError + 1021
-Private Const ERR_DOWNLOAD_MULTIPLE_STARTED As Long = vbObjectError + 1022
 Private Const ERR_MAIN_CONTEXT_LOST As Long = vbObjectError + 1023
 Private Const ERR_NEW_CONTEXT_TIMEOUT As Long = vbObjectError + 1024
 Private Const ERR_NEW_CONTEXT_MULTIPLE As Long = vbObjectError + 1025
 Private Const ERR_NEW_CONTEXT_DESTROYED As Long = vbObjectError + 1026
 Private Const ERR_REENTRANT_CAPTURE As Long = vbObjectError + 1027
+Private Const ERR_DOWNLOAD_BATCH_COUNT_MISMATCH As Long = vbObjectError + 1028
+Private Const ERR_DOWNLOAD_BATCH_FILENAME_COLLISION As Long = vbObjectError + 1029
 
 Private Enum MainContextState
     MainContextUnbound = 0
@@ -324,7 +321,7 @@ End Enum
 ' Extension contracts: result JS uses the Safety Shell; long loops yield and call hb();
 ' public timeouts use shared validation; wrapper waits yield outside correlation only.
 
-' One-shot download / new-context / file-dialog / navigation-status capture uses class-level state.
+' Download / new-context / file-dialog / navigation-status capture uses class-level state.
 ' DoEvents inside WaitHeartbeat intentionally keeps Excel responsive, but it can re-enter VBA.
 ' These helpers make those composite transactions mutually exclusive without disabling the Office
 ' message pump, and let B4 defer Fatal Reset until the owning transaction has cleaned up.
@@ -1052,6 +1049,457 @@ Private Function TryGetDownloadCorrelationValue(ByVal p As Object, _
     TryGetDownloadCorrelationValue = (Len(value) > 0)
 End Function
 
+Private Function TryBuildDownloadBatchCorrelationKey(ByVal p As Object, _
+                                                     ByVal eventCtx As String, _
+                                                     ByRef correlationKey As String, _
+                                                     ByRef correlationMode As String, _
+                                                     ByRef downloadId As String, _
+                                                     ByRef navigationId As String) As Boolean
+    correlationKey = vbNullString
+    correlationMode = DOWNLOAD_CORRELATION_UNCORRELATABLE
+    downloadId = vbNullString
+    navigationId = vbNullString
+
+    If TryGetDownloadCorrelationValue(p, "download", downloadId) Then
+        correlationMode = DOWNLOAD_CORRELATION_UUID
+        correlationKey = "D|" & downloadId
+        TryBuildDownloadBatchCorrelationKey = True
+        Exit Function
+    End If
+
+    If TryGetDownloadCorrelationValue(p, "navigation", navigationId) Then
+        correlationMode = DOWNLOAD_CORRELATION_CONTEXT_NAV
+        correlationKey = "N|" & eventCtx & "|" & navigationId
+        TryBuildDownloadBatchCorrelationKey = True
+    End If
+End Function
+
+Private Function FindDownloadBatchCorrelationKeyBySuggestedFilename( _
+                    ByVal suggestedFilename As String) As String
+    If Len(suggestedFilename) = 0 Then Exit Function
+    If m_downloadBatchTransactions Is Nothing Then Exit Function
+
+    Dim key As Variant
+    Dim tx As Dictionary
+    Dim existingFilename As String
+
+    For Each key In m_downloadBatchTransactions.keys
+        Set tx = m_downloadBatchTransactions(key)
+        If tx.Exists("suggestedFilename") Then
+            existingFilename = CStr(tx("suggestedFilename"))
+            If Len(existingFilename) > 0 Then
+                ' Chromium download destinations are Windows paths in the supported SeleniumVBA
+                ' environment, so filename collision detection is intentionally case-insensitive.
+                If StrComp(existingFilename, suggestedFilename, vbTextCompare) = 0 Then
+                    FindDownloadBatchCorrelationKeyBySuggestedFilename = CStr(key)
+                    Exit Function
+                End If
+            End If
+        End If
+    Next key
+End Function
+
+Private Sub HandleDownloadBatchWillBeginEvent(ByVal json As Object, ByVal p As Object)
+    If Not m_downloadBatchActive Or Not m_downloadArmed Then Exit Sub
+
+    Dim eventCtx As String
+    eventCtx = GetPathString(json, "params.context")
+    If Len(eventCtx) = 0 Then
+        LogSignalLine "[DOWNLOAD-BATCH-WILL-BEGIN-IGNORED] reason=missing-context"
+        Exit Sub
+    End If
+
+    If StrComp(eventCtx, m_downloadOwnerContextId, vbBinaryCompare) <> 0 Then
+        If Not m_downloadContextMissWarned Then
+            m_downloadContextMissWarned = True
+            LogSignalLine "[DOWNLOAD-BATCH-CTX-MISS] expectedCtx=" & m_downloadOwnerContextId & _
+                          " | actualCtx=" & eventCtx
+        End If
+        Exit Sub
+    End If
+
+    Dim correlationKey As String
+    Dim correlationMode As String
+    Dim downloadId As String
+    Dim navigationId As String
+    If Not TryBuildDownloadBatchCorrelationKey(p, eventCtx, correlationKey, correlationMode, downloadId, navigationId) Then
+        m_downloadUncorrelatableCount = m_downloadUncorrelatableCount + 1
+        If Len(m_downloadFirstUncorrelatableContext) = 0 Then
+            m_downloadFirstUncorrelatableContext = eventCtx
+        End If
+        LogSignalLine "[DOWNLOAD-BATCH-WILL-BEGIN-IGNORED] reason=uncorrelatable | ctx=" & eventCtx & _
+                      " | count=" & CStr(m_downloadUncorrelatableCount)
+        Exit Sub
+    End If
+
+    If m_downloadBatchTransactions Is Nothing Then Set m_downloadBatchTransactions = New Dictionary
+
+    ' Duplicate delivery of the same protocol identity must not create another transaction.
+    If m_downloadBatchTransactions.Exists(correlationKey) Then
+        LogSignalLine "[DOWNLOAD-BATCH-WILL-BEGIN-IGNORED] reason=duplicate-correlation | key=" & correlationKey
+        Exit Sub
+    End If
+
+    Dim suggestedFilename As String
+    suggestedFilename = GetPathString(json, "params.suggestedFilename")
+
+    ' A second transaction with the same browser-suggested filename is unsafe when a global
+    ' destination folder is active: measured Edge behavior can report complete for both while
+    ' leaving only the last artifact at that path. Latch the first observed collision. The second
+    ' transaction is still registered because it has already started in the browser.
+    Dim collisionFirstKey As String
+    collisionFirstKey = FindDownloadBatchCorrelationKeyBySuggestedFilename(suggestedFilename)
+
+    Dim tx As New Dictionary
+    tx.Add "correlationKey", correlationKey
+    tx.Add "correlationMode", correlationMode
+    tx.Add "context", eventCtx
+    tx.Add "downloadId", downloadId
+    tx.Add "navigationId", navigationId
+    tx.Add "suggestedFilename", suggestedFilename
+    tx.Add "url", GetPathString(json, "params.url")
+    tx.Add "state", "started"
+    tx.Add "startedSeen", True
+    tx.Add "endSeen", False
+    tx.Add "status", vbNullString
+    tx.Add "filePath", vbNullString
+
+    m_downloadBatchTransactions.Add correlationKey, tx
+    m_downloadStartedCount = m_downloadBatchTransactions.count
+
+    If Len(collisionFirstKey) > 0 And Not m_downloadBatchFilenameCollision Then
+        m_downloadBatchFilenameCollision = True
+        m_downloadBatchCollisionFilename = suggestedFilename
+        m_downloadBatchCollisionFirstCorrelationKey = collisionFirstKey
+        m_downloadBatchCollisionSecondCorrelationKey = correlationKey
+
+        LogSignalLine "[DOWNLOAD-BATCH-FILENAME-COLLISION] filename=" & suggestedFilename & _
+                      " | firstKey=" & collisionFirstKey & _
+                      " | secondKey=" & correlationKey
+    End If
+
+    If m_downloadStartedCount > m_downloadBatchExpectedCount Then
+        m_downloadBatchOverStarted = True
+        If Len(m_downloadBatchFirstExtraCorrelationKey) = 0 Then
+            m_downloadBatchFirstExtraCorrelationKey = correlationKey
+        End If
+    End If
+
+    LogSignalLine "[DOWNLOAD-BATCH-START-ACCEPTED] key=" & correlationKey & _
+                  " | ctx=" & eventCtx & _
+                  " | correlation=" & correlationMode & _
+                  " | count=" & CStr(m_downloadStartedCount) & _
+                  " | expected=" & CStr(m_downloadBatchExpectedCount)
+End Sub
+
+Private Sub HandleDownloadBatchEndEvent(ByVal json As Object, ByVal p As Object)
+    If Not m_downloadBatchActive Then Exit Sub
+
+    Dim eventCtx As String
+    eventCtx = GetPathString(json, "params.context")
+    If Len(eventCtx) = 0 Then
+        LogSignalLine "[DOWNLOAD-BATCH-END-IGNORED] reason=missing-context"
+        Exit Sub
+    End If
+
+    If StrComp(eventCtx, m_downloadOwnerContextId, vbBinaryCompare) <> 0 Then
+        LogSignalLine "[DOWNLOAD-BATCH-END-CTX-MISS] expectedCtx=" & m_downloadOwnerContextId & _
+                      " | actualCtx=" & eventCtx
+        Exit Sub
+    End If
+
+    Dim correlationKey As String
+    Dim correlationMode As String
+    Dim downloadId As String
+    Dim navigationId As String
+    If Not TryBuildDownloadBatchCorrelationKey(p, eventCtx, correlationKey, correlationMode, downloadId, navigationId) Then
+        LogSignalLine "[DOWNLOAD-BATCH-END-IGNORED] reason=uncorrelatable | ctx=" & eventCtx
+        Exit Sub
+    End If
+
+    If m_downloadBatchTransactions Is Nothing Then Exit Sub
+    If Not m_downloadBatchTransactions.Exists(correlationKey) Then
+        LogSignalLine "[DOWNLOAD-BATCH-END-IGNORED] reason=unknown-correlation | key=" & correlationKey
+        Exit Sub
+    End If
+
+    Dim tx As Dictionary
+    Set tx = m_downloadBatchTransactions(correlationKey)
+    If CBool(tx("endSeen")) Then
+        LogSignalLine "[DOWNLOAD-BATCH-END-IGNORED] reason=duplicate-terminal | key=" & correlationKey
+        Exit Sub
+    End If
+
+    Dim terminalStatus As String
+    If Not TryGetDownloadCorrelationValue(p, "status", terminalStatus) Then
+        LogSignalLine "[DOWNLOAD-BATCH-END-IGNORED] reason=missing-status | key=" & correlationKey
+        Exit Sub
+    End If
+
+    Select Case LCase$(terminalStatus)
+        Case "complete", "canceled"
+        Case Else
+            LogSignalLine "[DOWNLOAD-BATCH-END-IGNORED] reason=unknown-status | key=" & correlationKey & _
+                          " | status=" & terminalStatus
+            Exit Sub
+    End Select
+
+    Dim filePath As String
+    Call TryGetDownloadCorrelationValue(p, "filepath", filePath)
+
+    tx("endSeen") = True
+    tx("status") = terminalStatus
+    tx("filePath") = filePath
+    tx("state") = LCase$(terminalStatus)
+
+    LogSignalLine "[DOWNLOAD-BATCH-END-MATCHED] key=" & correlationKey & _
+                  " | status=" & terminalStatus & _
+                  " | filepath=" & filePath
+End Sub
+
+Private Function DownloadBatchTerminalCount() As Long
+    If m_downloadBatchTransactions Is Nothing Then Exit Function
+
+    Dim key As Variant
+    Dim tx As Dictionary
+    For Each key In m_downloadBatchTransactions.keys
+        Set tx = m_downloadBatchTransactions(key)
+        If CBool(tx("endSeen")) Then DownloadBatchTerminalCount = DownloadBatchTerminalCount + 1
+    Next key
+End Function
+
+Private Function AllDownloadBatchTransactionsTerminal() As Boolean
+    If m_downloadBatchTransactions Is Nothing Then Exit Function
+    If m_downloadBatchTransactions.count <> m_downloadBatchExpectedCount Then Exit Function
+
+    Dim key As Variant
+    Dim tx As Dictionary
+    For Each key In m_downloadBatchTransactions.keys
+        Set tx = m_downloadBatchTransactions(key)
+        If Not CBool(tx("endSeen")) Then Exit Function
+    Next key
+
+    AllDownloadBatchTransactionsTerminal = True
+End Function
+
+Private Sub ResetDownloadBatchState()
+    m_downloadBatchActive = False
+    m_downloadBatchExpectedCount = 0
+    m_downloadBatchDispatchCount = 0
+    m_downloadBatchOverStarted = False
+    m_downloadBatchFirstExtraCorrelationKey = vbNullString
+    m_downloadBatchFilenameCollision = False
+    m_downloadBatchCollisionFilename = vbNullString
+    m_downloadBatchCollisionFirstCorrelationKey = vbNullString
+    m_downloadBatchCollisionSecondCorrelationKey = vbNullString
+    Set m_downloadBatchTransactions = Nothing
+End Sub
+
+Private Sub ArmDownloadBatch(ByVal contextId As String, ByVal expectedCount As Long)
+    ResetDownloadCaptureState
+    m_downloadOwnerContextId = contextId
+    m_downloadBatchExpectedCount = expectedCount
+    Set m_downloadBatchTransactions = New Dictionary
+    m_downloadDroppedEventsAtArm = CurrentDownloadRelevantLossCount()
+    m_downloadBatchActive = True
+    m_downloadArmed = True
+
+    LogSignalLine "[DOWNLOAD-BATCH-ARM] ctx=" & contextId & _
+                  " | expected=" & CStr(expectedCount) & _
+                  " | droppedBase=" & CStr(m_downloadDroppedEventsAtArm)
+End Sub
+
+Private Sub RaiseDownloadBatchCountMismatch(ByVal methodName As String)
+    m_downloadArmed = False
+    m_downloadBatchActive = False
+    Err.Raise ERR_DOWNLOAD_BATCH_COUNT_MISMATCH, "BiDi:" & methodName, _
+              "DownloadBatchCountMismatch: more correlatable downloads started than expected. " & _
+              "The trigger clicks are not replayed. Expected=" & CStr(m_downloadBatchExpectedCount) & _
+              "; Started=" & CStr(m_downloadStartedCount) & _
+              "; FirstExtraCorrelationKey=" & _
+              IIf(Len(m_downloadBatchFirstExtraCorrelationKey) > 0, m_downloadBatchFirstExtraCorrelationKey, "(none)") & "."
+End Sub
+
+Private Sub RaiseDownloadBatchFilenameCollision(ByVal methodName As String)
+    m_downloadArmed = False
+    m_downloadBatchActive = False
+    Err.Raise ERR_DOWNLOAD_BATCH_FILENAME_COLLISION, "BiDi:" & methodName, _
+              "DownloadBatchFilenameCollision: multiple downloads in the same batch reported the " & _
+              "same suggested filename. Concurrent downloads may target the same destination path " & _
+              "and overwrite an earlier artifact. The collision is already browser-observed, so " & _
+              "already-started downloads may have modified disk. Remaining trigger clicks are not " & _
+              "dispatched after the collision is observed. Filename=" & _
+              IIf(Len(m_downloadBatchCollisionFilename) > 0, m_downloadBatchCollisionFilename, "(missing)") & _
+              "; FirstCorrelationKey=" & _
+              IIf(Len(m_downloadBatchCollisionFirstCorrelationKey) > 0, m_downloadBatchCollisionFirstCorrelationKey, "(none)") & _
+              "; SecondCorrelationKey=" & _
+              IIf(Len(m_downloadBatchCollisionSecondCorrelationKey) > 0, m_downloadBatchCollisionSecondCorrelationKey, "(none)") & "."
+End Sub
+
+Private Sub WaitForDownloadBatch(ByVal timeoutMs As Long, ByVal methodName As String)
+    Dim stageTick As Currency
+    stageTick = socket_.NowTicks()
+
+    ' Stage 1: collect exactly the expected number of correlatable starts. All trigger clicks have
+    ' already been dispatched, but no download completion has been awaited, so transfers can overlap.
+    Do
+        ProcessRecorderQueue
+
+        Dim downloadLossStart As Long
+        downloadLossStart = DownloadDroppedEventsSinceArm()
+        If downloadLossStart > 0 Then
+            m_downloadArmed = False
+            m_downloadBatchActive = False
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
+                      "Async event loss occurred while waiting for download batch start; reliable " & _
+                      "batch correlation cannot be determined. The trigger clicks are not replayed. " & _
+                      "AsyncEventsDroppedSinceArm=" & CStr(downloadLossStart) & "."
+        End If
+
+        If m_downloadBatchFilenameCollision Then
+            RaiseDownloadBatchFilenameCollision methodName
+        End If
+
+        If m_downloadBatchOverStarted Or m_downloadStartedCount > m_downloadBatchExpectedCount Then
+            RaiseDownloadBatchCountMismatch methodName
+        End If
+
+        If m_downloadStartedCount = m_downloadBatchExpectedCount Then
+            ' Freeze the start set after draining the current recorder queue. Terminal events for
+            ' accepted transactions continue to be processed while the batch remains active.
+            m_downloadArmed = False
+            Exit Do
+        End If
+
+        If IsTimeout(stageTick, CDbl(timeoutMs)) Then
+            m_downloadArmed = False
+            m_downloadBatchActive = False
+            Err.Raise ERR_DOWNLOAD_START_TIMEOUT, "BiDi:" & methodName, _
+                      "DownloadBatchStartTimeout: expected " & CStr(m_downloadBatchExpectedCount) & _
+                      " correlatable downloads but accepted " & CStr(m_downloadStartedCount) & _
+                      " within " & CStr(timeoutMs) & "ms. The trigger clicks are not replayed. " & _
+                      "UncorrelatableStarts=" & CStr(m_downloadUncorrelatableCount) & _
+                      "; AsyncQueueDepthAtTimeout=" & CStr(DownloadEventQueueDepth()) & "."
+        End If
+        WaitHeartbeat 50
+    Loop
+
+    stageTick = socket_.NowTicks()
+
+    ' Stage 2: wait for every accepted transaction to reach a browser-authoritative terminal state.
+    Do
+        ProcessRecorderQueue
+
+        Dim downloadLossCompletion As Long
+        downloadLossCompletion = DownloadDroppedEventsSinceArm()
+        If downloadLossCompletion > 0 Then
+            m_downloadBatchActive = False
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
+                      "Async event loss occurred while waiting for download batch completion; reliable " & _
+                      "batch results cannot be determined. Downloads may already exist on disk. " & _
+                      "AsyncEventsDroppedSinceArm=" & CStr(downloadLossCompletion) & "."
+        End If
+
+        If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision methodName
+        If m_downloadBatchOverStarted Then RaiseDownloadBatchCountMismatch methodName
+        If AllDownloadBatchTransactionsTerminal() Then Exit Sub
+
+        If IsTimeout(stageTick, CDbl(timeoutMs)) Then
+            m_downloadBatchActive = False
+            Err.Raise ERR_DOWNLOAD_COMPLETION_TIMEOUT, "BiDi:" & methodName, _
+                      "DownloadBatchCompletionTimeout: only " & CStr(DownloadBatchTerminalCount()) & _
+                      " of " & CStr(m_downloadBatchExpectedCount) & _
+                      " downloads reached complete/canceled within " & CStr(timeoutMs) & "ms. " & _
+                      "The trigger clicks are not replayed. AsyncQueueDepthAtTimeout=" & _
+                      CStr(DownloadEventQueueDepth()) & "."
+        End If
+        WaitHeartbeat 50
+    Loop
+End Sub
+
+Private Function BuildDownloadBatchResult() As Dictionary
+    Dim result As New Dictionary
+    Dim downloads As New Dictionary
+    Dim completeCount As Long
+    Dim canceledCount As Long
+
+    If Not m_downloadBatchTransactions Is Nothing Then
+        Dim key As Variant
+        Dim tx As Dictionary
+        Dim snapshot As Dictionary
+
+        For Each key In m_downloadBatchTransactions.keys
+            Set tx = m_downloadBatchTransactions(key)
+            Set snapshot = CloneFlatDictionary(tx)
+            downloads.Add CStr(key), snapshot
+
+            Select Case LCase$(CStr(tx("status")))
+                Case "complete": completeCount = completeCount + 1
+                Case "canceled": canceledCount = canceledCount + 1
+            End Select
+        Next key
+    End If
+
+    If completeCount = m_downloadBatchExpectedCount And canceledCount = 0 Then
+        result.Add "status", "complete"
+    Else
+        result.Add "status", "failed"
+    End If
+
+    result.Add "expectedCount", m_downloadBatchExpectedCount
+    result.Add "dispatchCount", m_downloadBatchDispatchCount
+    result.Add "startedCount", m_downloadStartedCount
+    result.Add "terminalCount", DownloadBatchTerminalCount()
+    result.Add "completeCount", completeCount
+    result.Add "canceledCount", canceledCount
+    result.Add "context", m_downloadOwnerContextId
+    result.Add "asyncEventsDroppedSinceArm", DownloadDroppedEventsSinceArm()
+    result.Add "downloads", downloads
+
+    Set BuildDownloadBatchResult = result
+End Function
+
+Private Function NormalizeDownloadTriggerXpaths(ByVal triggerXpaths As Variant, _
+                                                ByVal methodName As String) As Collection
+    Dim result As New Collection
+    Dim item As Variant
+    Dim s As String
+
+    On Error GoTo InvalidInput
+
+    If IsObject(triggerXpaths) Then
+        If TypeName(triggerXpaths) <> "Collection" Then GoTo InvalidInput
+        For Each item In triggerXpaths
+            If IsObject(item) Or IsNull(item) Then GoTo InvalidInput
+            s = Trim$(CStr(item))
+            If Len(s) = 0 Then GoTo InvalidInput
+            result.Add s
+        Next item
+    ElseIf IsArray(triggerXpaths) Then
+        Dim i As Long
+        For i = LBound(triggerXpaths) To UBound(triggerXpaths)
+            item = triggerXpaths(i)
+            If IsObject(item) Or IsNull(item) Then GoTo InvalidInput
+            s = Trim$(CStr(item))
+            If Len(s) = 0 Then GoTo InvalidInput
+            result.Add s
+        Next i
+    Else
+        If IsNull(triggerXpaths) Then GoTo InvalidInput
+        s = Trim$(CStr(triggerXpaths))
+        If Len(s) = 0 Then GoTo InvalidInput
+        result.Add s
+    End If
+
+    If result.count = 0 Then GoTo InvalidInput
+    Set NormalizeDownloadTriggerXpaths = result
+    Exit Function
+
+InvalidInput:
+    Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
+              "triggerXpaths must be a non-empty String, Variant array, or Collection of non-empty XPath strings."
+End Function
+
 Private Sub HandleDownloadWillBeginEvent(ByVal json As Object)
     Dim p As Object
     Set p = GetPathObject(json, "params")
@@ -1066,107 +1514,7 @@ Private Sub HandleDownloadWillBeginEvent(ByVal json As Object)
                   " | filename=" & GetDownloadDiagnosticField(p, "suggestedFilename") & _
                   " | url=" & GetDownloadDiagnosticField(p, "url")
 
-    Dim eventCtx As String
-    eventCtx = GetPathString(json, "params.context")
-
-    If Len(eventCtx) = 0 Then
-        If m_downloadArmed Or m_downloadStartedSeen Then
-            LogSignalLine "[DOWNLOAD-WILL-BEGIN-IGNORED] reason=missing-context"
-        End If
-        Exit Sub
-    End If
-
-    ' Once the first owner-context start has been accepted, another owner-context start means
-    ' the exactly-one operation is ambiguous. Foreign contexts remain diagnostic only and never
-    ' multiply the owner transaction. Do not attempt to track both downloads after this point.
-    If m_downloadStartedSeen Then
-        If StrComp(eventCtx, m_downloadAcceptedContextId, vbBinaryCompare) <> 0 Then
-            If Not m_downloadContextMissWarned Then
-                m_downloadContextMissWarned = True
-                LogSignalLine "[DOWNLOAD-CTX-MISS] expectedCtx=" & m_downloadAcceptedContextId & _
-                              " | actualCtx=" & eventCtx
-            End If
-            Exit Sub
-        End If
-
-        m_downloadStartedCount = m_downloadStartedCount + 1
-        m_downloadMultipleStarted = True
-        m_downloadTerminalEligible = False
-        m_downloadArmed = False
-
-        Dim secondDownloadId As String
-        Dim secondNavigationId As String
-        m_downloadSecondCorrelationMode = DOWNLOAD_CORRELATION_UNCORRELATABLE
-        m_downloadSecondDownloadId = vbNullString
-        m_downloadSecondNavigationId = vbNullString
-
-        If TryGetDownloadCorrelationValue(p, "download", secondDownloadId) Then
-            m_downloadSecondCorrelationMode = DOWNLOAD_CORRELATION_UUID
-            m_downloadSecondDownloadId = secondDownloadId
-        ElseIf TryGetDownloadCorrelationValue(p, "navigation", secondNavigationId) Then
-            m_downloadSecondCorrelationMode = DOWNLOAD_CORRELATION_CONTEXT_NAV
-            m_downloadSecondNavigationId = secondNavigationId
-        End If
-
-        LogSignalLine "[DOWNLOAD-MULTIPLE-STARTED] ctx=" & eventCtx & _
-                      " | count=" & CStr(m_downloadStartedCount) & _
-                      " | secondCorrelation=" & m_downloadSecondCorrelationMode & _
-                      " | secondDownload=" & IIf(Len(m_downloadSecondDownloadId) > 0, m_downloadSecondDownloadId, "(none)") & _
-                      " | secondNavigation=" & IIf(Len(m_downloadSecondNavigationId) > 0, m_downloadSecondNavigationId, "(none)")
-        Exit Sub
-    End If
-
-    If Not m_downloadArmed Then Exit Sub
-
-    If StrComp(eventCtx, m_downloadOwnerContextId, vbBinaryCompare) <> 0 Then
-        If Not m_downloadContextMissWarned Then
-            m_downloadContextMissWarned = True
-            LogSignalLine "[DOWNLOAD-CTX-MISS] expectedCtx=" & m_downloadOwnerContextId & _
-                          " | actualCtx=" & eventCtx
-        End If
-        Exit Sub
-    End If
-
-    Dim downloadId As String
-    Dim navigationId As String
-
-    m_downloadCorrelationMode = DOWNLOAD_CORRELATION_UNCORRELATABLE
-    m_downloadCorrelationDownloadId = vbNullString
-    m_downloadCorrelationNavigationId = vbNullString
-
-    ' Spec-preferred identity. Tested Edge currently omits this field, so the second branch is
-    ' operationally important. No inference is made when both identities are unavailable.
-    If TryGetDownloadCorrelationValue(p, "download", downloadId) Then
-        m_downloadCorrelationMode = DOWNLOAD_CORRELATION_UUID
-        m_downloadCorrelationDownloadId = downloadId
-    ElseIf TryGetDownloadCorrelationValue(p, "navigation", navigationId) Then
-        m_downloadCorrelationMode = DOWNLOAD_CORRELATION_CONTEXT_NAV
-        m_downloadCorrelationNavigationId = navigationId
-    Else
-        ' v1 cannot safely pair downloadEnd when both protocol identities are absent. Keep the
-        ' one-shot arm available for a later correlatable owner-context start; the raw event remains
-        ' visible in diagnostics and no browser-side cause is inferred.
-        m_downloadUncorrelatableCount = m_downloadUncorrelatableCount + 1
-        If Len(m_downloadFirstUncorrelatableContext) = 0 Then
-            m_downloadFirstUncorrelatableContext = eventCtx
-        End If
-        LogSignalLine "[DOWNLOAD-WILL-BEGIN-IGNORED] reason=uncorrelatable | ctx=" & eventCtx & _
-                      " | count=" & CStr(m_downloadUncorrelatableCount)
-        Exit Sub
-    End If
-
-    m_downloadAcceptedContextId = eventCtx
-    m_downloadSuggestedFilename = GetPathString(json, "params.suggestedFilename")
-    m_downloadUrl = GetPathString(json, "params.url")
-    m_downloadStartedSeen = True
-    m_downloadStartedCount = 1
-    m_downloadTerminalEligible = True
-    m_downloadArmed = False
-
-    LogSignalLine "[DOWNLOAD-START-ACCEPTED] ctx=" & eventCtx & _
-                  " | correlation=" & m_downloadCorrelationMode & _
-                  " | download=" & IIf(Len(m_downloadCorrelationDownloadId) > 0, m_downloadCorrelationDownloadId, "(none)") & _
-                  " | navigation=" & IIf(Len(m_downloadCorrelationNavigationId) > 0, m_downloadCorrelationNavigationId, "(none)")
+    HandleDownloadBatchWillBeginEvent json, p
 End Sub
 
 Private Sub HandleDownloadEndEvent(ByVal json As Object)
@@ -1183,118 +1531,18 @@ Private Sub HandleDownloadEndEvent(ByVal json As Object)
                   " | status=" & GetDownloadDiagnosticField(p, "status") & _
                   " | filepath=" & GetDownloadDiagnosticField(p, "filepath")
 
-    ' MultipleDownloadsStarted is an operation-level ambiguity. The measured lifecycle after
-    ' multiplicity is intentionally not modeled; raw end events remain visible but cannot restore
-    ' a single successful transaction.
-    If m_downloadMultipleStarted Then
-        LogSignalLine "[DOWNLOAD-END-IGNORED] reason=multiple-starts"
-        Exit Sub
-    End If
-
-    ' Raw end events remain diagnostic even when no accepted start exists. They must not satisfy
-    ' a future transaction merely because they were delivered after the local arm boundary.
-    If Not m_downloadStartedSeen Or Not m_downloadTerminalEligible Or m_downloadEndSeen Then Exit Sub
-
-    Dim eventCtx As String
-    eventCtx = GetPathString(json, "params.context")
-    If Len(eventCtx) = 0 Then
-        LogSignalLine "[DOWNLOAD-END-IGNORED] reason=missing-context"
-        Exit Sub
-    End If
-
-    If StrComp(eventCtx, m_downloadAcceptedContextId, vbBinaryCompare) <> 0 Then
-        LogSignalLine "[DOWNLOAD-END-CTX-MISS] expectedCtx=" & m_downloadAcceptedContextId & _
-                      " | actualCtx=" & eventCtx
-        Exit Sub
-    End If
-
-    Dim actualId As String
-    Select Case m_downloadCorrelationMode
-        Case DOWNLOAD_CORRELATION_UUID
-            If Not TryGetDownloadCorrelationValue(p, "download", actualId) Then
-                LogSignalLine "[DOWNLOAD-END-CORRELATION-MISS] mode=download | reason=missing-download-id"
-                Exit Sub
-            End If
-            If StrComp(actualId, m_downloadCorrelationDownloadId, vbBinaryCompare) <> 0 Then
-                LogSignalLine "[DOWNLOAD-END-CORRELATION-MISS] mode=download | expected=" & _
-                              m_downloadCorrelationDownloadId & " | actual=" & actualId
-                Exit Sub
-            End If
-
-        Case DOWNLOAD_CORRELATION_CONTEXT_NAV
-            If Not TryGetDownloadCorrelationValue(p, "navigation", actualId) Then
-                LogSignalLine "[DOWNLOAD-END-CORRELATION-MISS] mode=context+navigation | reason=missing-navigation"
-                Exit Sub
-            End If
-            If StrComp(actualId, m_downloadCorrelationNavigationId, vbBinaryCompare) <> 0 Then
-                LogSignalLine "[DOWNLOAD-END-CORRELATION-MISS] mode=context+navigation | expected=" & _
-                              m_downloadCorrelationNavigationId & " | actual=" & actualId
-                Exit Sub
-            End If
-
-        Case Else
-            LogSignalLine "[DOWNLOAD-END-IGNORED] reason=uncorrelatable-start"
-            Exit Sub
-    End Select
-
-    Dim terminalStatus As String
-    If Not TryGetDownloadCorrelationValue(p, "status", terminalStatus) Then
-        LogSignalLine "[DOWNLOAD-END-IGNORED] reason=missing-status"
-        Exit Sub
-    End If
-    Select Case LCase$(terminalStatus)
-        Case "complete", "canceled"
-        Case Else
-            LogSignalLine "[DOWNLOAD-END-IGNORED] reason=unknown-status | status=" & terminalStatus
-            Exit Sub
-    End Select
-
-    m_downloadEndSeen = True
-    m_downloadTerminalEligible = False
-    m_downloadEndContextId = eventCtx
-    m_downloadEndStatusDiagnostic = terminalStatus
-    m_downloadEndFilePathDiagnostic = vbNullString
-    Call TryGetDownloadCorrelationValue(p, "filepath", m_downloadEndFilePathDiagnostic)
-
-    LogSignalLine "[DOWNLOAD-END-MATCHED] ctx=" & eventCtx & _
-                  " | correlation=" & m_downloadCorrelationMode & _
-                  " | status=" & m_downloadEndStatusDiagnostic & _
-                  " | filepath=" & m_downloadEndFilePathDiagnostic
+    HandleDownloadBatchEndEvent json, p
 End Sub
 
 Private Sub ResetDownloadCaptureState()
+    ResetDownloadBatchState
     m_downloadArmed = False
-    m_downloadStartedSeen = False
-    m_downloadEndSeen = False
     m_downloadOwnerContextId = vbNullString
-    m_downloadAcceptedContextId = vbNullString
-    m_downloadCorrelationMode = vbNullString
-    m_downloadCorrelationDownloadId = vbNullString
-    m_downloadCorrelationNavigationId = vbNullString
-    m_downloadEndContextId = vbNullString
-    m_downloadEndStatusDiagnostic = vbNullString
-    m_downloadEndFilePathDiagnostic = vbNullString
     m_downloadContextMissWarned = False
     m_downloadDroppedEventsAtArm = 0
     m_downloadStartedCount = 0
-    m_downloadMultipleStarted = False
-    m_downloadSecondCorrelationMode = vbNullString
-    m_downloadSecondDownloadId = vbNullString
-    m_downloadSecondNavigationId = vbNullString
-    m_downloadSuggestedFilename = vbNullString
-    m_downloadUrl = vbNullString
-    m_downloadTerminalEligible = False
     m_downloadUncorrelatableCount = 0
     m_downloadFirstUncorrelatableContext = vbNullString
-End Sub
-
-Private Sub ArmDownloadCapture(ByVal contextId As String)
-    ResetDownloadCaptureState
-    m_downloadOwnerContextId = contextId
-    m_downloadDroppedEventsAtArm = CurrentDownloadRelevantLossCount()
-    m_downloadArmed = True
-    LogSignalLine "[DOWNLOAD-ARM] ctx=" & contextId & _
-                  " | droppedBase=" & CStr(m_downloadDroppedEventsAtArm)
 End Sub
 
 Private Function DownloadDroppedEventsSinceArm() As Long
@@ -1310,115 +1558,6 @@ Private Function DownloadEventQueueDepth() As Long
     DownloadEventQueueDepth = socket_.EventQueueDepth
 End Function
 
-Private Sub RaiseDownloadMultipleStarted(ByVal methodName As String)
-    m_downloadTerminalEligible = False
-    m_downloadArmed = False
-    Err.Raise ERR_DOWNLOAD_MULTIPLE_STARTED, "BiDi:" & methodName, _
-              "MultipleDownloadsStarted: more than one download started in the owner context. " & _
-              "The trigger is not replayed. FirstCorrelation=" & m_downloadCorrelationMode & _
-              "; SecondCorrelation=" & m_downloadSecondCorrelationMode & "."
-End Sub
-
-Private Sub WaitForDownloadTransaction(ByVal timeoutMs As Long, ByVal methodName As String)
-    Dim stageTick As Currency
-    stageTick = socket_.NowTicks()
-
-    ' Stage 1: wait for one correlatable owner-context start. The same public timeout value is
-    ' deliberately reused for both stages so the API has one timeout knob while diagnostics retain
-    ' distinct StartTimeout and CompletionTimeout outcomes.
-    Do
-        ProcessRecorderQueue
-
-        Dim downloadLossStart As Long
-        downloadLossStart = DownloadDroppedEventsSinceArm()
-        If downloadLossStart > 0 Then
-            LogSignalLine "[DOWNLOAD-LOSS] stage=start | ctx=" & m_downloadOwnerContextId & _
-                          " | droppedSinceArm=" & CStr(downloadLossStart)
-            m_downloadArmed = False
-            m_downloadTerminalEligible = False
-            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
-                      "Async event loss occurred while waiting for download start; reliable " & _
-                      "download transaction capture cannot be determined. The trigger click has " & _
-                      "already been dispatched and is not replayed automatically. Do not blindly " & _
-                      "retry the whole download operation because a download may already have " & _
-                      "started. AsyncEventsDroppedSinceArm=" & _
-                      CStr(downloadLossStart) & "."
-        End If
-
-        If m_downloadMultipleStarted Then RaiseDownloadMultipleStarted methodName
-        If m_downloadStartedSeen Then Exit Do
-
-        If IsTimeout(stageTick, CDbl(timeoutMs)) Then
-            LogSignalLine "[DOWNLOAD-START-TIMEOUT] ctx=" & m_downloadOwnerContextId & _
-                          " | timeoutMs=" & CStr(timeoutMs) & _
-                          " | uncorrelatableStarts=" & CStr(m_downloadUncorrelatableCount) & _
-                          " | queueDepth=" & CStr(DownloadEventQueueDepth())
-            m_downloadArmed = False
-            Err.Raise ERR_DOWNLOAD_START_TIMEOUT, "BiDi:" & methodName, _
-                      "DownloadStartTimeout: no correlatable browsingContext.downloadWillBegin " & _
-                      "was accepted within " & CStr(timeoutMs) & "ms. The trigger is not replayed. " & _
-                      "UncorrelatableStarts=" & CStr(m_downloadUncorrelatableCount) & _
-                      "; FirstUncorrelatableContext=" & _
-                      IIf(Len(m_downloadFirstUncorrelatableContext) > 0, m_downloadFirstUncorrelatableContext, "(none)") & _
-                      "; AsyncQueueDepthAtTimeout=" & CStr(DownloadEventQueueDepth()) & "."
-        End If
-        WaitHeartbeat 50
-    Loop
-
-    stageTick = socket_.NowTicks()
-
-    ' Stage 2: wait only for the terminal event correlated to the accepted begin. A second owner
-    ' start is an ambiguity and terminates the operation immediately rather than tracking both.
-    Do
-        ProcessRecorderQueue
-
-        Dim downloadLossCompletion As Long
-        downloadLossCompletion = DownloadDroppedEventsSinceArm()
-        If downloadLossCompletion > 0 Then
-            LogSignalLine "[DOWNLOAD-LOSS] stage=completion | ctx=" & m_downloadOwnerContextId & _
-                          " | droppedSinceArm=" & CStr(downloadLossCompletion)
-            m_downloadArmed = False
-            m_downloadTerminalEligible = False
-            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
-                      "Async event loss occurred while waiting for download completion; reliable " & _
-                      "download transaction capture cannot be determined. The trigger click has " & _
-                      "already been dispatched, and the download may already have completed or " & _
-                      "left a file on disk. Do not blindly retry the whole download operation. " & _
-                      "AsyncEventsDroppedSinceArm=" & CStr(downloadLossCompletion) & "."
-        End If
-
-        If m_downloadMultipleStarted Then RaiseDownloadMultipleStarted methodName
-        If m_downloadEndSeen Then Exit Sub
-
-        If IsTimeout(stageTick, CDbl(timeoutMs)) Then
-            LogSignalLine "[DOWNLOAD-COMPLETION-TIMEOUT] ctx=" & m_downloadOwnerContextId & _
-                          " | timeoutMs=" & CStr(timeoutMs) & _
-                          " | queueDepth=" & CStr(DownloadEventQueueDepth())
-            m_downloadTerminalEligible = False
-            Err.Raise ERR_DOWNLOAD_COMPLETION_TIMEOUT, "BiDi:" & methodName, _
-                      "DownloadCompletionTimeout: no matching browsingContext.downloadEnd was " & _
-                      "accepted within " & CStr(timeoutMs) & "ms after the download start. " & _
-                      "The trigger is not replayed. AsyncQueueDepthAtTimeout=" & _
-                      CStr(DownloadEventQueueDepth()) & "."
-        End If
-        WaitHeartbeat 50
-    Loop
-End Sub
-
-Private Function BuildDownloadResult() As Dictionary
-    Dim result As New Dictionary
-    result.Add "status", m_downloadEndStatusDiagnostic
-    result.Add "filePath", m_downloadEndFilePathDiagnostic
-    result.Add "suggestedFilename", m_downloadSuggestedFilename
-    result.Add "url", m_downloadUrl
-    result.Add "context", m_downloadAcceptedContextId
-    result.Add "correlationMode", m_downloadCorrelationMode
-    result.Add "downloadId", m_downloadCorrelationDownloadId
-    result.Add "navigationId", m_downloadCorrelationNavigationId
-    result.Add "asyncEventsDroppedSinceArm", DownloadDroppedEventsSinceArm()
-    Set BuildDownloadResult = result
-End Function
-
 Private Function ClassifyDownloadFailureKind(ByVal errNum As Long, _
                                              ByVal errDesc As String, _
                                              ByVal captureInitialized As Boolean) As String
@@ -1429,14 +1568,17 @@ Private Function ClassifyDownloadFailureKind(ByVal errNum As Long, _
         Case ERR_DOWNLOAD_COMPLETION_TIMEOUT
             ClassifyDownloadFailureKind = "completion-timeout"
             Exit Function
-        Case ERR_DOWNLOAD_MULTIPLE_STARTED
-            ClassifyDownloadFailureKind = "multiple-starts"
+        Case ERR_DOWNLOAD_BATCH_COUNT_MISMATCH
+            ClassifyDownloadFailureKind = "batch-count-mismatch"
+            Exit Function
+        Case ERR_DOWNLOAD_BATCH_FILENAME_COLLISION
+            ClassifyDownloadFailureKind = "batch-filename-collision"
             Exit Function
     End Select
 
-    If InStr(1, errDesc, "Async event loss occurred while waiting for download start", vbTextCompare) > 0 Then
+    If InStr(1, errDesc, "Async event loss occurred while waiting for download batch start", vbTextCompare) > 0 Then
         ClassifyDownloadFailureKind = "event-loss-start"
-    ElseIf InStr(1, errDesc, "Async event loss occurred while waiting for download completion", vbTextCompare) > 0 Then
+    ElseIf InStr(1, errDesc, "Async event loss occurred while waiting for download batch completion", vbTextCompare) > 0 Then
         ClassifyDownloadFailureKind = "event-loss-completion"
     ElseIf captureInitialized Then
         ClassifyDownloadFailureKind = "post-arm-failure"
@@ -1479,27 +1621,26 @@ Private Sub CaptureLastDownloadFailureDiagnostic(ByVal errNum As Long, _
     d.Add "failureKind", ClassifyDownloadFailureKind(errNum, errDesc, captureInitialized)
     d.Add "captureInitialized", captureInitialized
     d.Add "ownerContext", m_downloadOwnerContextId
-    d.Add "acceptedContext", m_downloadAcceptedContextId
-    d.Add "startedSeen", m_downloadStartedSeen
-    d.Add "endSeen", m_downloadEndSeen
-    d.Add "startedCount", m_downloadStartedCount
-    d.Add "multipleStarted", m_downloadMultipleStarted
-    d.Add "correlationMode", m_downloadCorrelationMode
-    d.Add "downloadId", m_downloadCorrelationDownloadId
-    d.Add "navigationId", m_downloadCorrelationNavigationId
-    d.Add "secondCorrelationMode", m_downloadSecondCorrelationMode
-    d.Add "secondDownloadId", m_downloadSecondDownloadId
-    d.Add "secondNavigationId", m_downloadSecondNavigationId
-    d.Add "suggestedFilename", m_downloadSuggestedFilename
-    d.Add "url", m_downloadUrl
-    d.Add "endContext", m_downloadEndContextId
-    d.Add "endStatus", m_downloadEndStatusDiagnostic
-    d.Add "endFilePath", m_downloadEndFilePathDiagnostic
-    d.Add "terminalEligible", m_downloadTerminalEligible
     d.Add "uncorrelatableStarts", m_downloadUncorrelatableCount
     d.Add "firstUncorrelatableContext", m_downloadFirstUncorrelatableContext
     d.Add "asyncEventsDroppedSinceArm", droppedSinceArm
     d.Add "eventQueueDepthAtFailure", queueDepth
+    d.Add "batchActive", m_downloadBatchActive
+    d.Add "batchExpectedCount", m_downloadBatchExpectedCount
+    d.Add "batchDispatchCount", m_downloadBatchDispatchCount
+    If m_downloadBatchTransactions Is Nothing Then
+        d.Add "batchStartedCount", 0
+        d.Add "batchTerminalCount", 0
+    Else
+        d.Add "batchStartedCount", m_downloadBatchTransactions.count
+        d.Add "batchTerminalCount", DownloadBatchTerminalCount()
+    End If
+    d.Add "batchOverStarted", m_downloadBatchOverStarted
+    d.Add "batchFirstExtraCorrelationKey", m_downloadBatchFirstExtraCorrelationKey
+    d.Add "batchFilenameCollision", m_downloadBatchFilenameCollision
+    d.Add "batchCollisionFilename", m_downloadBatchCollisionFilename
+    d.Add "batchCollisionFirstCorrelationKey", m_downloadBatchCollisionFirstCorrelationKey
+    d.Add "batchCollisionSecondCorrelationKey", m_downloadBatchCollisionSecondCorrelationKey
 
     Set m_lastDownloadFailureDiagnostic = d
     Err.Clear
@@ -1518,7 +1659,7 @@ Private Function CloneFlatDictionary(ByVal source As Dictionary) As Dictionary
     Set CloneFlatDictionary = snapshot
 End Function
 
-' Returns a detached structured snapshot of the most recent ExecuteDownloadByXPath failure.
+' Returns a detached structured snapshot of the most recent download execution failure.
 ' Nothing means no failure has been captured since construction or the last explicit clear.
 Public Function GetLastDownloadFailureDiagnostic() As Dictionary
     If m_lastDownloadFailureDiagnostic Is Nothing Then Exit Function
@@ -1603,8 +1744,8 @@ Public Sub SetDownloadFolder(ByVal folderPath As String)
     If m_debugMode Then Debug.Print "BiDi: Download behavior set to allowed. Destination=" & resolvedFolder
 End Sub
 
-' Denies downloads globally for the current browser session. A resulting canceled download is still
-' reported by ExecuteDownloadByXPath as the browser-authoritative terminal status "canceled".
+' Denies downloads globally for the current browser session. A resulting canceled transaction is
+' aggregated by ExecuteDownloadsByXPath into the returned batch result.
 Public Sub SetDownloadDenied()
     SetGlobalDownloadBehavior "denied"
     If m_debugMode Then Debug.Print "BiDi: Download behavior set to denied."
@@ -1642,29 +1783,32 @@ Private Function ClearDownloadBehaviorBestEffort(Optional ByVal emitWarning As B
     End If
 End Function
 
-' Executes exactly one trigger click and observes exactly one correlatable owner-context download.
-' complete/canceled are browser-reported terminal outcomes returned in result("status"). filePath is
-' browser-reported only; this method does not assert filesystem existence, size, hash or rename stability.
-Public Function ExecuteDownloadByXPath(ByVal triggerXPath As String, _
-                                       Optional ByVal searchTimeoutMs As Long = 10000, _
-                                       Optional ByVal timeoutMs As Long = DEFAULT_DOWNLOAD_TIMEOUT_MS, _
-                                       Optional ByVal contextId As String = "") As Dictionary
-    Const METHOD_NAME As String = "ExecuteDownloadByXPath"
+' Executes one or more download trigger clicks through the same transaction engine. triggerXpaths
+' accepts one String XPath, a Variant array, or a Collection. The clicks themselves remain
+' synchronous/trusted so existing dispatch safety is preserved; after
+' each click returns, the next trigger is dispatched while earlier downloads may still be running.
+' The return value always has the same batch Dictionary shape, including for one trigger.
+' result("status") is "complete" only when every accepted
+' download ends as complete; one or more browser-reported canceled outcomes make it "failed".
+' Structural failures (event loss, missing starts, count mismatch, filename collision,
+' completion timeout, click error) raise an error and preserve GetLastDownloadFailureDiagnostic().
+' Batch scope is one owner browsing context. Foreign-context download events are ignored.
+' Same non-empty suggestedFilename values are rejected because measured Edge behavior can overwrite
+' an earlier artifact while reporting multiple protocol transactions as complete.
+Public Function ExecuteDownloadsByXPath(ByVal triggerXpaths As Variant, _
+                                        Optional ByVal searchTimeoutMs As Long = 10000, _
+                                        Optional ByVal timeoutMs As Long = DEFAULT_DOWNLOAD_TIMEOUT_MS, _
+                                        Optional ByVal contextId As String = "") As Dictionary
+    Const METHOD_NAME As String = "ExecuteDownloadsByXPath"
 
-    ' Acquire before any shared carryover/capture state is touched. If this is a DoEvents-driven
-    ' nested call, EnterExclusiveCaptureOperation raises immediately and this invocation never
-    ' installs a local handler that could accidentally clean up the OUTER transaction.
     Dim exclusiveCaptureEntered As Boolean
     EnterExclusiveCaptureOperation METHOD_NAME
     exclusiveCaptureEntered = True
     On Error GoTo Failed
 
-    ' A new invocation owns a fresh live transaction state. The B1 durable failure snapshot is
-    ' independent and is not cleared here.
     ResetDownloadCaptureState
 
     Dim downloadCaptureInitialized As Boolean
-
     Dim vTimeout As Long
     vTimeout = SanitizeMs(timeoutMs, "timeoutMs", DEFAULT_DOWNLOAD_TIMEOUT_MS, 1)
 
@@ -1678,6 +1822,9 @@ Public Function ExecuteDownloadByXPath(ByVal triggerXPath As String, _
                   "ClearDownloadBehavior before starting another download."
     End If
 
+    Dim triggers As Collection
+    Set triggers = NormalizeDownloadTriggerXpaths(triggerXpaths, METHOD_NAME)
+
     Dim carryoverDiagnosticActive As Boolean
     Dim carryDomSeenBefore As Boolean
     Dim carryNetSeenBefore As Boolean
@@ -1685,63 +1832,76 @@ Public Function ExecuteDownloadByXPath(ByVal triggerXPath As String, _
     carryoverDiagnosticActive = BeginSignalCarryoverDiagnostic( _
         METHOD_NAME, targetCtx, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore)
 
-    ' Lazy subscription keeps download traffic out of sessions that never use the feature. The
-    ' registry makes repeated calls delta-only and therefore cheap.
     Me.ExecuteSessionSubscribe Array( _
         "browsingContext.downloadWillBegin", _
         "browsingContext.downloadEnd"), , True
 
-    ' Resolve the trigger before the local arm so element lookup cannot let an unrelated buffered
-    ' owner-context event satisfy this operation.
-    Dim triggerSharedId As String
-    triggerSharedId = ResolveXPathOrThrow(triggerXPath, targetCtx, searchTimeoutMs, METHOD_NAME)
+    ' Resolve every XPath before arming. A lookup failure therefore causes no download side effect.
+    Dim resolvedTriggerIds As New Collection
+    Dim trigger As Variant
+    For Each trigger In triggers
+        resolvedTriggerIds.Add ResolveXPathOrThrow(CStr(trigger), targetCtx, searchTimeoutMs, METHOD_NAME)
+    Next trigger
 
-    ' Best-effort stale boundary shared with the hardened file-dialog path: drain first, snapshot
-    ' cumulative drops in ArmDownloadCapture, then issue the side-effecting trigger exactly once.
     ProcessRecorderQueue
-    ArmDownloadCapture targetCtx
+    ArmDownloadBatch targetCtx, resolvedTriggerIds.count
     downloadCaptureInitialized = True
 
+    Dim triggerSharedId As Variant
     Dim clickArgs As Collection
-    Set clickArgs = NewElementArgs(triggerSharedId)
-
     Dim clickResult As String
     Dim clickErrNum As Long
     Dim clickErrSrc As String
     Dim clickErrDesc As String
 
-    ' Download triggers intentionally keep PerformTrustedClick's synthetic fallback enabled.
-    ' If the center is visually occluded, the fallback directly clicks the resolved node and can
-    ' therefore bypass visual occlusion. v4.0 keeps this compatibility behavior and does not add a
-    ' public strict/compatibility switch; activation-hard flows use allowSyntheticFallback:=False.
-    On Error Resume Next
-    clickResult = PerformTrustedClick(targetCtx, clickArgs, vTimeout)
-    clickErrNum = Err.Number
-    clickErrSrc = Err.source
-    clickErrDesc = Err.description
-    On Error GoTo Failed
+    For Each triggerSharedId In resolvedTriggerIds
+        ' Drain immediately before dispatch as well. If a collision from the previous trigger has
+        ' arrived since the last drain, do not dispatch another side effect.
+        ProcessRecorderQueue
+        If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision METHOD_NAME
 
-    If clickErrNum <> 0 Then
-        ' The dispatch outcome may be ambiguous, so never re-click. Close the local arm before
-        ' propagating the original transport/protocol/action error.
-        m_downloadArmed = False
-        m_downloadTerminalEligible = False
-        Err.Raise clickErrNum, clickErrSrc, clickErrDesc
-    End If
+        Set clickArgs = NewElementArgs(CStr(triggerSharedId))
 
-    WaitForDownloadTransaction vTimeout, METHOD_NAME
+        On Error Resume Next
+        Err.Clear
+        clickResult = PerformTrustedClick(targetCtx, clickArgs, vTimeout)
+        clickErrNum = Err.Number
+        clickErrSrc = Err.source
+        clickErrDesc = Err.description
+        Err.Clear
+        On Error GoTo Failed
+
+        If clickErrNum <> 0 Then
+            ' Do not continue dispatching later triggers after an ambiguous/failed side effect.
+            ' Already-started downloads may continue in the browser, so the whole batch is failed
+            ' through the original action/protocol error and must never be blindly replayed.
+            ProcessRecorderQueue
+            m_downloadArmed = False
+            m_downloadBatchActive = False
+            Err.Raise clickErrNum, clickErrSrc, clickErrDesc
+        End If
+
+        m_downloadBatchDispatchCount = m_downloadBatchDispatchCount + 1
+
+        ' Drain between clicks so fast begin/end events cannot accumulate behind later dispatches.
+        ' This does not wait for any transfer to complete. Once a same-filename collision is observed,
+        ' stop before dispatching any remaining trigger.
+        ProcessRecorderQueue
+        If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision METHOD_NAME
+    Next triggerSharedId
+
+    WaitForDownloadBatch vTimeout, METHOD_NAME
 
     EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
 
-    ' Copy the transaction result while this invocation still owns the capture state. Only then
-    ' release ownership, so a DoEvents callback can never replace the data BuildDownloadResult reads.
     Dim result As Dictionary
-    Set result = BuildDownloadResult()
+    Set result = BuildDownloadBatchResult()
 
+    m_downloadBatchActive = False
     LeaveExclusiveCaptureOperation METHOD_NAME
     exclusiveCaptureEntered = False
 
-    Set ExecuteDownloadByXPath = result
+    Set ExecuteDownloadsByXPath = result
     Exit Function
 
 Failed:
@@ -1751,9 +1911,9 @@ Failed:
 
     CaptureLastDownloadFailureDiagnostic savedErrNum, savedErrSrc, savedErrDesc, downloadCaptureInitialized
 
-    ' Cleanup must not replace the primary failure. The live capture state remains available until
-    ' the next download invocation, while B1 preserves a durable public snapshot independently.
     On Error Resume Next
+    m_downloadArmed = False
+    m_downloadBatchActive = False
     EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
     If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation METHOD_NAME
     On Error GoTo 0
@@ -7464,7 +7624,7 @@ Private Function BuildFatalResetDroppedArmsDesc() As String
 
     If m_downloadArmed Then
         s = s & IIf(Len(s) > 0, ",", "") & "download:armed"
-    ElseIf m_downloadStartedSeen Then
+    ElseIf m_downloadBatchActive And m_downloadStartedCount > 0 Then
         s = s & IIf(Len(s) > 0, ",", "") & "download:started"
     End If
 

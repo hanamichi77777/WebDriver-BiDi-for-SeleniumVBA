@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 4.1 / MIT License / Copyright (c) hanamichi77777
+' Version 4.2 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -318,11 +318,6 @@ Public Sub Main08()
         Dim url As String: url = "https://www.google.com/travel/flights"
         bidi.ExecuteNavigateAndGetStatus url
         
-        ' The specific trigger XPath is retained as a reference; the executable call uses
-        ' the simpler first-combobox XPath.
-        Dim ticketTypeTrigger As String
-        ticketTypeTrigger = "(//div[@role='combobox' and @aria-haspopup='listbox'])[1]"
-        
         bidi.ExecuteSelectValueByXPath "(//div[@role='combobox'])[1]", "One way"
                 
         Dim depXPath As String
@@ -523,15 +518,17 @@ Public Sub Main11()
 
 End Sub
 
-' Main12 - Browser download lifecycle and destination-folder sample
-' The trigger is clicked exactly once. ExecuteDownloadByXPath observes one
-' correlatable owner-context download through downloadWillBegin/downloadEnd.
+' Main12 - Unified multiple-download lifecycle and destination-folder sample
+' ExecuteDownloadsByXPath uses the same engine for one or many trigger XPaths.
+' This sample dispatches three independent download triggers and waits until all
+' accepted transactions reach complete/canceled.
 '
-' StartDiscoveryLog preserves the download signal chain even when DebugMode is
-' disabled, including the accepted correlation mode and any context mismatch.
+' A single String XPath is also valid:
+'   Set result = bidi.ExecuteDownloadsByXPath("//*[@id='download-a']")
 '
-' status is the browser-reported terminal result. filePath is browser-reported
-' only; this sample does not assert filesystem existence, size or hash.
+' StartDiscoveryLog preserves the full download signal chain even when DebugMode
+' is disabled. filePath is browser-reported only; this sample does not assert
+' filesystem existence, size, hash, or rename stability.
 
 Public Sub Main12()
 
@@ -539,6 +536,9 @@ Public Sub Main12()
     Dim caps As WebCapabilities
     Dim bidi As BiDiCommandWrapper
     Dim result As Dictionary
+    Dim downloads As Dictionary
+    Dim tx As Dictionary
+    Dim key As Variant
     Dim fso As New FileSystemObject
 
     Dim targetUrl As String
@@ -546,13 +546,15 @@ Public Sub Main12()
     Dim msgText As String
     Dim msgCaption As String
 
+    ' The published download-probe page should contain the same three triggers as
+    '   download-a -> bidi-batch-A.bin
+    '   download-b -> bidi-batch-B.bin
+    '   download-c -> bidi-batch-C.bin
     targetUrl = "https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/download-probe/"
 
     With driver
         .StartEdge
 
-        ' Resolve the sample folder through WebDriver, as in Main11.
-        ' The folder does not exist yet, so targetExists=False is intentional.
         downloadFolder = .ResolvePath(".\download-sample", False)
         If Not fso.FolderExists(downloadFolder) Then fso.CreateFolder downloadFolder
 
@@ -565,41 +567,56 @@ Public Sub Main12()
         Set bidi = New BiDiCommandWrapper
         bidi.ConnectTo .GetWebSocketUrl
 
-        ' SetDownloadFolder performs its own API-boundary path normalization and
-        ' existence check even though downloadFolder is already absolute here.
         bidi.SetDownloadFolder downloadFolder
-
-        ' Preserve the complete download signal chain in discovery_log.txt.
         bidi.StartDiscoveryLog
 
         bidi.ExecuteNavigateAndGetStatus targetUrl
 
-        Set result = bidi.ExecuteDownloadByXPath( _
-                        "//*[@id='download-single']", _
+        Set result = bidi.ExecuteDownloadsByXPath( _
+                        Array( _
+                            "//*[@id='download-a']", _
+                            "//*[@id='download-b']", _
+                            "//*[@id='download-c']"), _
                         searchTimeoutMs:=5000, _
                         timeoutMs:=30000)
 
-        Debug.Print "Download status: " & CStr(result("status"))
-        Debug.Print "Suggested filename: " & CStr(result("suggestedFilename"))
-        Debug.Print "Correlation: " & CStr(result("correlationMode"))
-        Debug.Print "Browser-reported filepath: " & CStr(result("filePath"))
+        Set downloads = result("downloads")
 
-        ' Saves discovery_log.txt in the same folder as the current VBA host file.
-        ' The log contains DOWNLOAD-ARM / DOWNLOAD-START-ACCEPTED /
-        ' DOWNLOAD-END-MATCHED and any context-mismatch diagnostics.
+        Debug.Print "Batch status: " & CStr(result("status"))
+        Debug.Print "Expected: " & CStr(result("expectedCount"))
+        Debug.Print "Dispatched: " & CStr(result("dispatchCount"))
+        Debug.Print "Started: " & CStr(result("startedCount"))
+        Debug.Print "Terminal: " & CStr(result("terminalCount"))
+        Debug.Print "Complete: " & CStr(result("completeCount"))
+        Debug.Print "Canceled: " & CStr(result("canceledCount"))
+
+        Debug.Print String$(72, "-")
+
+        For Each key In downloads.keys
+            Set tx = downloads(key)
+
+            Debug.Print "Correlation key: " & CStr(key)
+            Debug.Print "  Status: " & CStr(tx("status"))
+            Debug.Print "  Suggested filename: " & CStr(tx("suggestedFilename"))
+            Debug.Print "  Correlation: " & CStr(tx("correlationMode"))
+            Debug.Print "  Browser-reported filepath: " & CStr(tx("filePath"))
+        Next key
+
+        ' The log contains DOWNLOAD-BATCH-ARM / DOWNLOAD-BATCH-START-ACCEPTED /
+        ' DOWNLOAD-BATCH-END-MATCHED and any structural diagnostics.
         bidi.StopAndSaveDiscoveryLog
 
-        msgText = "Status: " & CStr(result("status")) & vbCrLf & _
-                  "Suggested filename: " & CStr(result("suggestedFilename")) & vbCrLf & _
-                  "Correlation: " & CStr(result("correlationMode")) & vbCrLf & _
-                  "Browser-reported filepath:" & vbCrLf & CStr(result("filePath"))
+        msgText = "Batch status: " & CStr(result("status")) & vbCrLf & _
+                  "Expected: " & CStr(result("expectedCount")) & vbCrLf & _
+                  "Dispatched: " & CStr(result("dispatchCount")) & vbCrLf & _
+                  "Started: " & CStr(result("startedCount")) & vbCrLf & _
+                  "Terminal: " & CStr(result("terminalCount")) & vbCrLf & _
+                  "Complete: " & CStr(result("completeCount")) & vbCrLf & _
+                  "Canceled: " & CStr(result("canceledCount"))
 
-        ' Do not label a canceled terminal result as "Complete".
-        msgCaption = "BiDi Download - " & CStr(result("status"))
+        msgCaption = "BiDi Downloads - " & CStr(result("status"))
         MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
 
-        ' Explicitly restore the browser/default download policy.
-        ' Shutdown also performs best-effort cleanup if an override is still active.
         bidi.ClearDownloadBehavior
 
         bidi.Shutdown: Set bidi = Nothing

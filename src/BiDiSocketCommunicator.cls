@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "4.1"
+Private Const BIDI_SOCKET_VERSION As String = "4.2"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
