@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v4.2
+# WebDriver BiDi for SeleniumVBA v4.3
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
@@ -17,16 +17,15 @@ Since this project assumes concurrent use of classic SeleniumVBA methods and BiD
 
 ![What You Do with BiDi](image/pr_image_workflow.png)
 
-The Discovery Log is designed for third-party SPA sites where the automation code cannot access an internal “ready” or “completed” flag.
+The Discovery Log is designed for third-party SPA sites where automation code cannot access an internal “ready” or “completed” flag.
 
-It records network responses, DOM mutation bursts, suppressed background noise, and stability margins such as slackMs.
+It records network requests and responses, DOM mutation bursts, suppressed background noise, and stability margins such as slackMs. During manual browser exploration, DOM activity is captured on the same timeline as network activity, making it possible to observe how a site changes around API calls and other asynchronous operations.
 
-This makes it easier to determine which requests should be tracked, which requests should be ignored, which resources may be safely blocked, and whether the current wait thresholds are appropriate for the target site.
+This makes it easier to determine which requests are relevant to an action, which background requests should be ignored for SPA-idle detection, which resources may be safely blocked, and whether the current wait thresholds are appropriate for the target site.
 
-The structured log can also be provided to an AI assistant for analysis. By examining the sequence and timing of network activity, DOM updates, and stability decisions, the AI can help identify likely completion signals, recommend suitable network or content signals to arm, suggest noise-filtering or resource-blocking rules, and propose adjustments to the wait strategy.
+The structured log can also be provided to an AI assistant for analysis. By examining the sequence and timing of network activity, DOM updates, and stability decisions, the AI can help identify candidate completion signals, recommend suitable network, DOM, or visibility signals to arm, suggest noise-filtering or resource-blocking rules, and propose adjustments to the wait strategy.
 
-In other words, the Discovery Log is not just an execution log.
-It is a diagnostic tool for discovering what should be waited for—and for helping AI devise practical synchronization solutions—when automating unknown third-party SPAs.
+The Discovery Log is therefore more than an execution log. It is a diagnostic and discovery tool for investigating how an unfamiliar third-party SPA behaves—and for discovering what should actually be waited for before reliable automation can be built.
 
 ## Validation Benchmarks
 

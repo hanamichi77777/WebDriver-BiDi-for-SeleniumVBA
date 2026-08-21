@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.2"
+Private Const BIDI_WRAPPER_VERSION As String = "4.3"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -135,6 +135,11 @@ Private Const DEFAULT_STALE_RETRIES As Long = 3
 Private Const SHORT_WAIT_MS As Long = 500
 ' Discovery Log ring-buffer limit.
 Private Const MAX_LOG_SIZE As Long = 5000
+' Manual Discovery DOM sampling uses the existing SPA probe. Keep the normal cadence aligned
+' with the probe/recorder's ~100ms granularity, but back off after a failed probe recovery so
+' navigation/realm churn cannot become a tight script.evaluate retry loop.
+Private Const DISCOVERY_DOM_POLL_MS As Long = 100
+Private Const DISCOVERY_PROBE_RETRY_MS As Long = 500
 ' Bounded critical-incident ring independent of Discovery Log recording.
 Private Const MAX_FORENSIC_INCIDENT_LOG_SIZE As Long = 512
 Private Const MAX_FORENSIC_INCIDENT_LINE_CHARS As Long = 2048
@@ -158,6 +163,10 @@ Private m_recorderLogs As Collection
 Private m_isRecording As Boolean
 Private m_recorderStartTime As Double
 Private m_excludeResources As Boolean
+Private m_discoveryDomCaptureEnabled As Boolean ' manual Discovery: poll SPA probe into [SPA-ACT]
+Private m_discoveryManualPumpActive As Boolean  ' True only inside RecordEventsForSeconds
+Private m_discoveryDomContextId As String       ' current top-level context used by manual DOM sampling
+Private m_nextDiscoveryDomPollMs As Double      ' nowMs deadline; 0 = sample on next recorder pump
 ' beforeRequestSent is recorder-only; no latency pairing is retained.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_recSuppOverflowCount As Long      ' suppressed events not keyed after the key cap
@@ -5209,6 +5218,10 @@ Private Sub ResetSessionBoundaryState()
     m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
     m_recorderStartTime = 0
+    m_discoveryDomCaptureEnabled = False
+    m_discoveryManualPumpActive = False
+    m_discoveryDomContextId = vbNullString
+    m_nextDiscoveryDomPollMs = 0#
 
     m_navigationDetected = False
     m_navigationContextId = ""
@@ -6248,7 +6261,8 @@ Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dict
     Set BuildShadowSelectorArg = arg
 End Function
 
-Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = True)
+Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = True, _
+                             Optional ByVal captureDomActivity As Boolean = True)
     ' Stage all recorder-owned objects and scalars locally. No live recorder state is changed
     ' until session.subscribe succeeds, so a failed start leaves an existing recorder intact
     ' and never creates a half-enabled new recorder.
@@ -6281,6 +6295,10 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_excludeResources = excludeImagesAndCss
     m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
+    m_discoveryDomCaptureEnabled = captureDomActivity
+    m_discoveryManualPumpActive = False
+    m_discoveryDomContextId = vbNullString
+    m_nextDiscoveryDomPollMs = 0#
 
     ' A reused wrapper starts recording with all carryover diagnostics cleared.
     m_unresolvedJsonThisWait = False
@@ -6291,7 +6309,19 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_carryoverNoteEmittedThisWait = False
 
     m_isRecording = True
-    Debug.Print "BiDi Recorder: Started. (Filter Resources: " & excludeImagesAndCss & ")"
+
+    ' Prime manual DOM capture before control returns to the caller. Querying first drains any
+    ' stale pre-recording changeList entries; if no healthy probe exists, the same call injects
+    ' one. This is best-effort: network/lifecycle recording remains useful even if a page realm
+    ' temporarily refuses the probe.
+    If m_discoveryDomCaptureEnabled Then
+        Dim probeReady As Boolean
+        probeReady = CaptureDiscoverySpaActivity(m_discoveryDomContextId, discardChanges:=True)
+        ScheduleNextDiscoveryDomPoll probeReady
+    End If
+
+    Debug.Print "BiDi Recorder: Started. (Filter Resources: " & excludeImagesAndCss & _
+                ", DOM Activity: " & captureDomActivity & ")"
     Exit Sub
 
 StartFailed:
@@ -6304,12 +6334,19 @@ End Sub
 
 Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discovery_log.txt")
     ' Drain the queue before setting m_isRecording=False because event dispatch records only
-    ' while that flag is True.
+    ' while that flag is True. RecordEventsForSeconds owns the final manual DOM sample; Stop does
+    ' not consume the SPA probe outside that explicit manual recording window.
     Call ProcessRecorderQueue
 
     m_isRecording = False
 
-    If m_recorderLogs Is Nothing Then Exit Sub
+    If m_recorderLogs Is Nothing Then
+        m_discoveryDomCaptureEnabled = False
+        m_discoveryManualPumpActive = False
+        m_discoveryDomContextId = vbNullString
+        m_nextDiscoveryDomPollMs = 0#
+        Exit Sub
+    End If
 
     AppendSuppressedSummary
     
@@ -6328,7 +6365,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.WriteText "Timestamp | Type | Method/Status | MIME | URL/Detail" & vbCrLf
         stm.WriteText "CONFIG | minStableMs(default)=" & DEFAULT_IDLE_STABLE_MS & _
                       " | maxTimeoutMs(default)=" & DEFAULT_IDLE_TIMEOUT_MS & _
-                      " | excludeResources=" & m_excludeResources & vbCrLf
+                      " | excludeResources=" & m_excludeResources & _
+                      " | manualDomCapture=" & m_discoveryDomCaptureEnabled & vbCrLf
         ' Ring-buffer head eviction is reported so a truncated timeline is never mistaken for
         ' a complete capture.
         If m_droppedHeadCount > 0 Then
@@ -6338,7 +6376,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         End If
         stm.WriteText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
         stm.WriteText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). [REQ] pairs with [RES] on the shared id. Per-request latency (dur=) is not computed." & vbCrLf
-        stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
+        stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst (manual RecordEventsForSeconds samples this by default)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
         stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
         stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HITs are event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag. dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
         stm.WriteText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
@@ -6425,6 +6463,10 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     Set m_recorderLogs = Nothing
     Set m_recSuppByKey = Nothing
     m_recSuppOverflowCount = 0
+    m_discoveryDomCaptureEnabled = False
+    m_discoveryManualPumpActive = False
+    m_discoveryDomContextId = vbNullString
+    m_nextDiscoveryDomPollMs = 0#
 End Sub
 
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
@@ -6440,6 +6482,11 @@ Public Sub RecordEventsForSeconds(ByVal seconds As Long)
     Dim startMs As Double: startMs = socket_.nowMs()
     Dim durationMs As Double: durationMs = CDbl(seconds) * 1000#
 
+    ' Only this explicit manual pump is allowed to drain the SPA probe for Discovery DOM logs.
+    ' Other ProcessRecorderQueue callers (download/navigation/file-dialog/etc.) therefore retain
+    ' the pre-existing SPA diagnostic behavior even while Discovery recording is enabled.
+    m_discoveryManualPumpActive = (m_isRecording And m_discoveryDomCaptureEnabled)
+
     Do While (socket_.nowMs() - startMs) < durationMs
         ProcessRecorderQueue
 
@@ -6452,6 +6499,16 @@ Public Sub RecordEventsForSeconds(ByVal seconds As Long)
     Loop
 
 Cleanup:
+    ' Capture the tail while the manual-pump guard is still active, then release it even on an
+    ' error. These calls are best-effort and must not replace the original recorder error.
+    On Error Resume Next
+    If m_discoveryManualPumpActive Then
+        ProcessRecorderQueueCore False
+        PollDiscoverySpaActivityIfDue forceSample:=True
+    End If
+    m_discoveryManualPumpActive = False
+    On Error GoTo 0
+
     ' RecordEventsForSeconds does not own m_isProcessingQueue.
     ' ProcessRecorderQueueCore is the sole normal owner and releases the lock in its own Cleanup.
     Exit Sub
@@ -6465,10 +6522,134 @@ End Sub
 
 Public Sub ProcessRecorderQueue()
     ProcessRecorderQueueCore False
+
+    ' Manual Discovery DOM sampling is intentionally outside ProcessRecorderQueueCore and is
+    ' gated to RecordEventsForSeconds. Querying the SPA probe calls back through
+    ' CallScript/ResolveTargetContext, which may non-blockingly drain transport events; keeping
+    ' the probe poll outside m_isProcessingQueue avoids recursion and preserves one queue owner.
+    PollDiscoverySpaActivityIfDue
 End Sub
 
 Private Sub DrainNonBlockingRecorderQueue()
+    ' Internal drains must remain transport-only. In particular, QuerySpaProbe -> CallScript ->
+    ' ResolveTargetContext can enter here; polling Discovery DOM again would recurse.
     ProcessRecorderQueueCore True
+End Sub
+
+Private Sub ScheduleNextDiscoveryDomPoll(ByVal probeAvailable As Boolean)
+    If socket_ Is Nothing Then
+        m_nextDiscoveryDomPollMs = 0#
+        Exit Sub
+    End If
+
+    If probeAvailable Then
+        m_nextDiscoveryDomPollMs = socket_.nowMs() + DISCOVERY_DOM_POLL_MS
+    Else
+        m_nextDiscoveryDomPollMs = socket_.nowMs() + DISCOVERY_PROBE_RETRY_MS
+    End If
+End Sub
+
+Private Sub PollDiscoverySpaActivityIfDue(Optional ByVal forceSample As Boolean = False)
+    If Not m_isRecording Then Exit Sub
+    If Not m_discoveryDomCaptureEnabled Then Exit Sub
+    If Not m_discoveryManualPumpActive Then Exit Sub
+
+    ' Never drain the shared SPA probe changeList while MasterWaitEngine owns a wait. The normal
+    ' SPA-wait path must remain the sole consumer in that case so consensus/render diagnostics
+    ' are bit-for-bit unaffected by enabling Discovery recording.
+    If m_waitStackDepth > 0 Then Exit Sub
+    If socket_ Is Nothing Then Exit Sub
+
+    Dim nowMs As Double: nowMs = socket_.nowMs()
+    If Not forceSample Then
+        If m_nextDiscoveryDomPollMs > 0# And nowMs < m_nextDiscoveryDomPollMs Then Exit Sub
+    End If
+
+    Dim probeReady As Boolean
+    probeReady = CaptureDiscoverySpaActivity(m_discoveryDomContextId)
+    ScheduleNextDiscoveryDomPoll probeReady
+End Sub
+
+' Poll the existing SPA probe for manual Discovery recording. QuerySpaProbe drains changeList
+' even from an unhealthy probe, so changes are consumed before recovery. discardChanges is used
+' only when StartDiscoveryLog establishes the baseline; it prevents pre-recording mutations from
+' being attributed to the first manual action. This routine never evaluates SPA consensus.
+Private Function CaptureDiscoverySpaActivity(ByRef targetCtx As String, _
+                                             Optional ByVal discardChanges As Boolean = False) As Boolean
+    On Error GoTo ProbeUnavailable
+
+    If Len(targetCtx) = 0 Then targetCtx = ResolveTargetContext(vbNullString)
+    If Len(targetCtx) = 0 Then GoTo ProbeUnavailable
+
+    Dim probe As Dictionary
+    Set probe = QuerySpaProbe(targetCtx)
+
+    If Not discardChanges Then ProcessDiscoverySpaProbeChanges probe
+    LogInvalidProbeSelectors probe, targetCtx
+
+    If IsSpaProbeReady(probe) Then
+        If Not IsProbeFilterCurrent(targetCtx) Then
+            If Not PushIdleFiltersToProbe(targetCtx) Then
+                If Not StartSpaIdleProbe(targetCtx) Then GoTo ProbeUnavailable
+            End If
+        End If
+
+        CaptureDiscoverySpaActivity = True
+        Exit Function
+    End If
+
+    ' Full navigation destroys the page-world observer. Re-inject against the same browsing
+    ' context. If the context itself disappeared, the error path clears targetCtx so the next
+    ' recorder pump resolves the current main context instead.
+    If StartSpaIdleProbe(targetCtx) Then
+        CaptureDiscoverySpaActivity = True
+        Exit Function
+    End If
+
+ProbeUnavailable:
+    If Err.Number <> 0 Then
+        If m_debugMode Then
+            Debug.Print "BiDi Discovery: SPA probe unavailable: " & Err.Number & " " & Err.description
+        End If
+        Err.Clear
+    End If
+    targetCtx = vbNullString
+    CaptureDiscoverySpaActivity = False
+End Function
+
+' Manual Discovery has different semantics from ProcessSpaProbeChangesForDiagnostics: this is a
+' pure recorder sink. It MUST NOT clear unresolved-json/carryover state or influence consensus
+' merely because the user opened a manual recording window.
+Private Sub ProcessDiscoverySpaProbeChanges(ByVal probe As Dictionary)
+    On Error GoTo Done
+    If Not m_isRecording Then Exit Sub
+    If probe Is Nothing Then Exit Sub
+    If Not probe.Exists("version") Then Exit Sub
+    If CLng(probe("version")) <> SPA_PROBE_VERSION Then Exit Sub
+    If Not probe.Exists("changes") Then Exit Sub
+    If Not IsObject(probe("changes")) Then Exit Sub
+
+    Dim changes As Collection
+    Set changes = probe("changes")
+    If changes Is Nothing Then Exit Sub
+    If changes.count = 0 Then Exit Sub
+
+    Dim v As Variant
+    Dim logSummary As String
+    For Each v In changes
+        logSummary = logSummary & v & " "
+    Next v
+    logSummary = Trim$(logSummary)
+
+    If Len(logSummary) > 500 Then logSummary = Left$(logSummary, 497) & "..."
+    If m_debugMode Then Debug.Print "[BiDi Discovery SPA Activity] " & logSummary
+
+    Dim relTime As String
+    relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
+    PushTimelineLine "[" & relTime & "] [SPA-ACT] " & logSummary
+
+Done:
+    Err.Clear
 End Sub
 
 Private Sub IncrementDispatchLossCounter(ByRef counter As Long)
