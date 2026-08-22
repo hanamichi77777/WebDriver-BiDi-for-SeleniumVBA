@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 4.3 / MIT License / Copyright (c) hanamichi77777
+' Version 4.4 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -269,6 +269,7 @@ Public Sub Main07()
     bidi.ExecuteNavigateAndGetStatus targetUrl
         
     bidi.ArmNetworkSignal "metadata/application"
+    ' Shadow DOM paths use CSS selectors; XPath does not cross ShadowRoot boundaries
     bidi.ExecuteShadowClick "#utility-sign-in button"
             
     ' Use a non-sensitive test value when adapting this sample.

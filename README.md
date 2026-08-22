@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v4.3
+# WebDriver BiDi for SeleniumVBA v4.4
 
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 

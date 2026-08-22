@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.3"
+Private Const BIDI_WRAPPER_VERSION As String = "4.4"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -40,14 +40,19 @@ Private m_useTrustedClick As Boolean        ' default False -> synthetic JS clic
 Private m_debugMode As Boolean              ' Backing field for the DebugMode property. Default On; set in Class_Initialize.
 
 ' Session-scoped preload registration; it is not retroactive for existing closed roots.
+' The generation guard also lets a later inert preload contain an addPreloadScript whose
+' response was lost, so an orphaned unlocker cannot affect future realms indefinitely.
 Private m_shadowUnlockerRegistered As Boolean
 Private m_shadowUnlockerScriptId As String
+Private m_shadowUnlockerSuppressorScriptId As String
+Private m_shadowUnlockerContainmentRisk As Boolean
+Private m_lastShadowUnlockerGuardGeneration As Double
 
-' AutoClicker preload scripts are session-scoped browser state. Track them by exact XPath so
-' duplicate registration cannot create multiple independent observers/clicks in future realms.
+' AutoClicker preload scripts are session-scoped browser state. Track them by canonical locator key so
+' duplicate XPath or Shadow registrations cannot create multiple observers/clicks in future realms.
 Private m_autoClickerScriptIds As Dictionary
 Private m_autoClickerTimeouts As Dictionary
-' A7: every AutoClicker preload participates in a per-realm generation guard keyed by exact XPath.
+' A7: every AutoClicker preload participates in a per-realm generation guard keyed by locator.
 ' A later generation supersedes older/unknown duplicate preload scripts without allowing duplicate clicks.
 Private m_autoClickerGenerations As Dictionary
 ' A suppressor is an inert higher-generation preload intentionally left session-scoped after unregister.
@@ -112,6 +117,14 @@ Private m_cdpSessionId As String
 Private m_cachedRealmIds As Dictionary ' Cached Execution Realm ID
 Private m_validatedContexts As Dictionary ' Context IDs confirmed present in the tree (skips repeat getTree)
 Private m_activeSubscriptions As Dictionary ' Event Management (Aggregation)
+' Context destruction removes event/context keys from the active delta registry, but the server-
+' issued subscription ID remains ours until session.unsubscribe confirms release.
+Private m_retiredSubscriptionIds As Dictionary
+' If transport teardown prevents a confirmed session.unsubscribe, retain the issued IDs plus
+' the BiDi session identity. A same-session reconnect must discharge them before subscribing again.
+Private m_pendingSubscriptionCleanupIds As Dictionary
+Private m_pendingSubscriptionCleanupSessionIdentity As String
+Private m_currentSessionIdentity As String
 Private m_isProcessingQueue As Boolean
 
 ' Events can be successfully received and parsed, then fail inside DispatchGlobalEvents.
@@ -152,7 +165,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const SPA_PROBE_VERSION As Long = 39 ' Internal probe generation/quiet/filter/health-diagnostic contract
+Private Const SPA_PROBE_VERSION As Long = 41 ' Internal probe generation/quiet/filter/health-diagnostic contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
 Private m_idleFilterRevision As Long          ' increments whenever VBA-side ignore filters change
@@ -255,7 +268,7 @@ Private m_downloadBatchCollisionSecondCorrelationKey As String
 Private m_downloadBatchTransactions As Dictionary
 
 ' B1: durable structured snapshot of the most recent download execution failure.
-' It is owned by ExecuteDownloadsByXPath, independent of live capture
+' It is owned by the download batch APIs, independent of live capture
 ' state, and survives ResetDownloadCaptureState/ClearState until replaced or explicitly cleared.
 Private m_lastDownloadFailureDiagnostic As Dictionary
 
@@ -321,6 +334,25 @@ End Enum
 Public Enum BiDiContextType
     ContextTypeTab = 0
     ContextTypeWindow = 1
+End Enum
+
+Public Enum BiDiElementAction
+    ElementActionClick = 0
+    ElementActionInput = 1
+    ElementActionInputKeys = 2
+    ElementActionSelect = 3
+    ElementActionSelectText = 4
+    ElementActionGetText = 5
+    ElementActionGetAttribute = 6
+    ElementActionGetProperty = 7
+    ElementActionGetOuterHtml = 8
+    ElementActionVisibilityCheck = 9
+End Enum
+
+Private Enum ElementLocatorKind
+    ElementLocatorNone = 0
+    ElementLocatorXPath = 1
+    ElementLocatorShadowPath = 2
 End Enum
 
 Private Enum waitMode
@@ -393,6 +425,8 @@ End Sub
 Private Sub Class_Initialize()
     Set socket_ = New BiDiSocketCommunicator
     Set m_activeSubscriptions = New Dictionary
+    Set m_retiredSubscriptionIds = New Dictionary
+    Set m_pendingSubscriptionCleanupIds = New Dictionary
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
     Set m_probeFilterRevisions = New Dictionary
@@ -438,8 +472,15 @@ Public Sub ConnectTo(ByVal webSocketUrl As String, _
     ' best-effort by default, or part of the atomic initialization when explicitly required.
     On Error GoTo InitializationFailed
 
+    ' A previously disconnected transport can still belong to a live BiDi session. Preserve any
+    ' subscription IDs whose remote cleanup was not confirmed before dropping local session state.
+    CaptureTrackedSubscriptionsForDeferredCleanup
+
     ResetSessionBoundaryState
-    Me.ClearState
+    ClearStateCore False
+
+    Dim requestedSessionIdentity As String
+    requestedSessionIdentity = GetBiDiSessionIdentity(webSocketUrl)
 
     Dim attempt As Long
     Dim connected As Boolean
@@ -458,6 +499,11 @@ Public Sub ConnectTo(ByVal webSocketUrl As String, _
     End If
 
     m_shutdownCompleted = False
+    m_currentSessionIdentity = requestedSessionIdentity
+
+    ' A normal Shutdown can lose only the acknowledgement, not necessarily the unsubscribe itself.
+    ' Reconcile those issued IDs before creating any new subscriptions in the same BiDi session.
+    RecoverPendingSubscriptionCleanupOnConnect requestedSessionIdentity
     
     Me.ExecuteSessionSubscribe Array( _
         "log.entryAdded", _
@@ -497,9 +543,18 @@ InitializationFailed:
     Dim initErrSrc As String: initErrSrc = Err.source
 
     On Error Resume Next
+
+    ' Initialization may already have created session-side state before a later mandatory step
+    ' failed. Contain/restore Shadow DOM hooks and release subscriptions while the socket is live.
+    Call ReleaseGlobalShadowUnlockerBestEffort
+    If Not ReleaseTrackedSubscriptionsBeforeClearBestEffort(2000) Then
+        CaptureTrackedSubscriptionsForDeferredCleanup
+    End If
+
     socket_.ForceClose
     ResetSessionBoundaryState
-    Me.ClearState
+    ClearStateCore False
+    m_currentSessionIdentity = vbNullString
     m_shutdownCompleted = True
     On Error GoTo 0
 
@@ -556,6 +611,7 @@ Public Property Set SetSocket(ByVal socket As BiDiSocketCommunicator)
     ResetSessionBoundaryState
     ClearState
     Set socket_ = socket
+    m_currentSessionIdentity = vbNullString
     m_shutdownCompleted = True
 End Property
 
@@ -839,7 +895,8 @@ Private Sub InvalidateContextState(ByVal contextId As String, _
 End Sub
 
 Private Sub RemoveContextScopedSubscriptionRegistry(ByVal contextId As String)
-    ' Local registry only; context-scoped remote unsubscribe is not used by current callers.
+    ' Remove dead-context keys from the active delta registry, but retain their server-issued
+    ' subscription IDs for the next ClearState/Shutdown unsubscribe.
     If m_activeSubscriptions Is Nothing Then Exit Sub
     If m_activeSubscriptions.count = 0 Then Exit Sub
 
@@ -855,6 +912,13 @@ Private Sub RemoveContextScopedSubscriptionRegistry(ByVal contextId As String)
         key = CStr(keys(i))
         If Len(key) >= Len(suffix) Then
             If StrComp(Right$(key, Len(suffix)), suffix, vbBinaryCompare) = 0 Then
+                Dim retiredId As String
+                retiredId = CStr(m_activeSubscriptions(key))
+                EnsureRetiredSubscriptionRegistry
+                If Len(retiredId) > 0 Then
+                    If Not m_retiredSubscriptionIds.Exists(retiredId) Then _
+                        m_retiredSubscriptionIds.Add retiredId, True
+                End If
                 m_activeSubscriptions.Remove key
             End If
         End If
@@ -1509,6 +1573,63 @@ InvalidInput:
               "triggerXpaths must be a non-empty String, Variant array, or Collection of non-empty XPath strings."
 End Function
 
+Private Function NormalizeShadowDownloadTriggerPaths(ByVal triggerSelectorPaths As Variant, _
+                                                     ByVal methodName As String) As Collection
+    Dim result As New Collection
+    Dim item As Variant
+
+    On Error GoTo InvalidInput
+
+    If IsObject(triggerSelectorPaths) Then
+        If TypeName(triggerSelectorPaths) <> "Collection" Then GoTo InvalidInput
+        For Each item In triggerSelectorPaths
+            ValidateShadowDownloadTriggerPath item, methodName
+            result.Add item
+        Next item
+    Else
+        ValidateShadowDownloadTriggerPath triggerSelectorPaths, methodName
+        result.Add triggerSelectorPaths
+    End If
+
+    If result.count = 0 Then GoTo InvalidInput
+    Set NormalizeShadowDownloadTriggerPaths = result
+    Exit Function
+
+InvalidInput:
+    Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
+              "triggerSelectorPaths must be one non-empty Shadow selector path, or a " & _
+              "Collection of non-empty Shadow selector paths."
+End Function
+
+Private Sub ValidateShadowDownloadTriggerPath(ByVal selectorPath As Variant, _
+                                              ByVal methodName As String)
+    Dim item As Variant
+    Dim i As Long
+    Dim s As String
+
+    If IsObject(selectorPath) Or IsNull(selectorPath) Then GoTo InvalidInput
+
+    If IsArray(selectorPath) Then
+        If LBound(selectorPath) > UBound(selectorPath) Then GoTo InvalidInput
+        For i = LBound(selectorPath) To UBound(selectorPath)
+            item = selectorPath(i)
+            If IsObject(item) Or IsNull(item) Then GoTo InvalidInput
+            s = Trim$(CStr(item))
+            If Len(s) = 0 Then GoTo InvalidInput
+        Next i
+    Else
+        s = Trim$(CStr(selectorPath))
+        If Len(s) = 0 Then GoTo InvalidInput
+    End If
+    Exit Sub
+
+InvalidInput:
+    Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
+              "Each Shadow download trigger must be a non-empty String or Variant array " & _
+              "of non-empty selector strings."
+End Sub
+
+
 Private Sub HandleDownloadWillBeginEvent(ByVal json As Object)
     Dim p As Object
     Set p = GetPathObject(json, "params")
@@ -1754,7 +1875,7 @@ Public Sub SetDownloadFolder(ByVal folderPath As String)
 End Sub
 
 ' Denies downloads globally for the current browser session. A resulting canceled transaction is
-' aggregated by ExecuteDownloadsByXPath into the returned batch result.
+' aggregated by the download batch transaction into the returned result.
 Public Sub SetDownloadDenied()
     SetGlobalDownloadBehavior "denied"
     If m_debugMode Then Debug.Print "BiDi: Download behavior set to denied."
@@ -1792,26 +1913,60 @@ Private Function ClearDownloadBehaviorBestEffort(Optional ByVal emitWarning As B
     End If
 End Function
 
-' Executes one or more download trigger clicks through the same transaction engine. triggerXpaths
-' accepts one String XPath, a Variant array, or a Collection. The clicks themselves remain
-' synchronous/trusted so existing dispatch safety is preserved; after
-' each click returns, the next trigger is dispatched while earlier downloads may still be running.
-' The return value always has the same batch Dictionary shape, including for one trigger.
-' result("status") is "complete" only when every accepted
-' download ends as complete; one or more browser-reported canceled outcomes make it "failed".
-' Structural failures (event loss, missing starts, count mismatch, filename collision,
-' completion timeout, click error) raise an error and preserve GetLastDownloadFailureDiagnostic().
-' Batch scope is one owner browsing context. Foreign-context download events are ignored.
-' Same non-empty suggestedFilename values are rejected because measured Edge behavior can overwrite
-' an earlier artifact while reporting multiple protocol transactions as complete.
+' Executes one or more XPath download triggers through the shared transaction engine.
+' triggerXpaths accepts one String XPath, a Variant array, or a Collection of XPath strings.
 Public Function ExecuteDownloadsByXPath(ByVal triggerXpaths As Variant, _
                                         Optional ByVal searchTimeoutMs As Long = 10000, _
                                         Optional ByVal timeoutMs As Long = DEFAULT_DOWNLOAD_TIMEOUT_MS, _
                                         Optional ByVal contextId As String = "") As Dictionary
-    Const METHOD_NAME As String = "ExecuteDownloadsByXPath"
+    Dim triggers As Collection
+    Set triggers = NormalizeDownloadTriggerXpaths(triggerXpaths, "ExecuteDownloadsByXPath")
+
+    Set ExecuteDownloadsByXPath = ExecuteDownloadsCore( _
+        ElementLocatorXPath, triggers, searchTimeoutMs, timeoutMs, contextId, _
+        "ExecuteDownloadsByXPath")
+End Function
+
+' Executes one or more Shadow DOM download triggers through the same transaction engine.
+' A String or Variant array represents one Shadow selector path. For multiple triggers, pass a
+' Collection whose items are individual String or Variant-array selector paths.
+Public Function ExecuteShadowDownloads(ByVal triggerSelectorPaths As Variant, _
+                                       Optional ByVal searchTimeoutMs As Long = 10000, _
+                                       Optional ByVal timeoutMs As Long = DEFAULT_DOWNLOAD_TIMEOUT_MS, _
+                                       Optional ByVal contextId As String = "", _
+                                       Optional ByVal requireUnlocker As Boolean = False) As Dictionary
+    On Error GoTo Failed
+    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteShadowDownloads"
+
+    Dim triggers As Collection
+    Set triggers = NormalizeShadowDownloadTriggerPaths( _
+        triggerSelectorPaths, "ExecuteShadowDownloads")
+
+    Set ExecuteShadowDownloads = ExecuteDownloadsCore( _
+        ElementLocatorShadowPath, triggers, searchTimeoutMs, timeoutMs, contextId, _
+        "ExecuteShadowDownloads")
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, _
+                             "ExecuteShadowDownloads"
+End Function
+
+' Runs the download batch transaction for either XPath or Shadow trigger locators.
+Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocatorKind, _
+                                      ByVal triggers As Collection, _
+                                      ByVal searchTimeoutMs As Long, _
+                                      ByVal timeoutMs As Long, _
+                                      ByVal contextId As String, _
+                                      ByVal callerName As String) As Dictionary
+    Dim methodName As String
+    methodName = callerName
 
     Dim exclusiveCaptureEntered As Boolean
-    EnterExclusiveCaptureOperation METHOD_NAME
+    EnterExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = True
     On Error GoTo Failed
 
@@ -1825,31 +1980,29 @@ Public Function ExecuteDownloadsByXPath(ByVal triggerXpaths As Variant, _
     targetCtx = ResolveTargetContext(contextId)
 
     If m_downloadBehaviorStateUnknown Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & METHOD_NAME, _
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & methodName, _
                   "DownloadBehaviorStateUnknown: browser.setDownloadBehavior cleanup could not " & _
                   "be confirmed. Call SetDownloadFolder, SetDownloadDenied, or " & _
                   "ClearDownloadBehavior before starting another download."
     End If
-
-    Dim triggers As Collection
-    Set triggers = NormalizeDownloadTriggerXpaths(triggerXpaths, METHOD_NAME)
 
     Dim carryoverDiagnosticActive As Boolean
     Dim carryDomSeenBefore As Boolean
     Dim carryNetSeenBefore As Boolean
     Dim carryVisSeenBefore As Boolean
     carryoverDiagnosticActive = BeginSignalCarryoverDiagnostic( _
-        METHOD_NAME, targetCtx, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore)
+        methodName, targetCtx, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore)
 
     Me.ExecuteSessionSubscribe Array( _
         "browsingContext.downloadWillBegin", _
         "browsingContext.downloadEnd"), , True
 
-    ' Resolve every XPath before arming. A lookup failure therefore causes no download side effect.
+    ' Resolve every trigger before arming so a locator failure causes no download side effect.
     Dim resolvedTriggerIds As New Collection
     Dim trigger As Variant
     For Each trigger In triggers
-        resolvedTriggerIds.Add ResolveXPathOrThrow(CStr(trigger), targetCtx, searchTimeoutMs, METHOD_NAME)
+        resolvedTriggerIds.Add ResolveElementSharedId( _
+            triggerLocatorKind, trigger, targetCtx, searchTimeoutMs, methodName)
     Next trigger
 
     ProcessRecorderQueue
@@ -1864,10 +2017,8 @@ Public Function ExecuteDownloadsByXPath(ByVal triggerXpaths As Variant, _
     Dim clickErrDesc As String
 
     For Each triggerSharedId In resolvedTriggerIds
-        ' Drain immediately before dispatch as well. If a collision from the previous trigger has
-        ' arrived since the last drain, do not dispatch another side effect.
         ProcessRecorderQueue
-        If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision METHOD_NAME
+        If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision methodName
 
         Set clickArgs = NewElementArgs(CStr(triggerSharedId))
 
@@ -1881,9 +2032,6 @@ Public Function ExecuteDownloadsByXPath(ByVal triggerXpaths As Variant, _
         On Error GoTo Failed
 
         If clickErrNum <> 0 Then
-            ' Do not continue dispatching later triggers after an ambiguous/failed side effect.
-            ' Already-started downloads may continue in the browser, so the whole batch is failed
-            ' through the original action/protocol error and must never be blindly replayed.
             ProcessRecorderQueue
             m_downloadArmed = False
             m_downloadBatchActive = False
@@ -1892,25 +2040,22 @@ Public Function ExecuteDownloadsByXPath(ByVal triggerXpaths As Variant, _
 
         m_downloadBatchDispatchCount = m_downloadBatchDispatchCount + 1
 
-        ' Drain between clicks so fast begin/end events cannot accumulate behind later dispatches.
-        ' This does not wait for any transfer to complete. Once a same-filename collision is observed,
-        ' stop before dispatching any remaining trigger.
         ProcessRecorderQueue
-        If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision METHOD_NAME
+        If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision methodName
     Next triggerSharedId
 
-    WaitForDownloadBatch vTimeout, METHOD_NAME
+    WaitForDownloadBatch vTimeout, methodName
 
-    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+    EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
 
     Dim result As Dictionary
     Set result = BuildDownloadBatchResult()
 
     m_downloadBatchActive = False
-    LeaveExclusiveCaptureOperation METHOD_NAME
+    LeaveExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = False
 
-    Set ExecuteDownloadsByXPath = result
+    Set ExecuteDownloadsCore = result
     Exit Function
 
 Failed:
@@ -1923,8 +2068,8 @@ Failed:
     On Error Resume Next
     m_downloadArmed = False
     m_downloadBatchActive = False
-    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
-    If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation METHOD_NAME
+    EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+    If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation methodName
     On Error GoTo 0
 
     Err.Raise savedErrNum, savedErrSrc, savedErrDesc
@@ -2179,10 +2324,45 @@ Public Function ExecuteOpenNewContextByXPath(ByVal triggerXPath As String, _
                                               Optional ByVal searchTimeoutMs As Long = 10000, _
                                               Optional ByVal timeoutMs As Long = 10000, _
                                               Optional ByVal ownerContextId As String = "") As Dictionary
-    Const METHOD_NAME As String = "ExecuteOpenNewContextByXPath"
+    Set ExecuteOpenNewContextByXPath = ExecuteOpenNewContextCore( _
+        ElementLocatorXPath, triggerXPath, searchTimeoutMs, timeoutMs, ownerContextId, _
+        "ExecuteOpenNewContextByXPath")
+End Function
+
+' Opens a new top-level browsing context from a Shadow DOM trigger.
+Public Function ExecuteShadowOpenNewContext(ByVal selectorPath As Variant, _
+                                            Optional ByVal searchTimeoutMs As Long = 10000, _
+                                            Optional ByVal timeoutMs As Long = 10000, _
+                                            Optional ByVal ownerContextId As String = "", _
+                                            Optional ByVal requireUnlocker As Boolean = False) As Dictionary
+    On Error GoTo Failed
+    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteShadowOpenNewContext"
+
+    Set ExecuteShadowOpenNewContext = ExecuteOpenNewContextCore( _
+        ElementLocatorShadowPath, selectorPath, searchTimeoutMs, timeoutMs, ownerContextId, _
+        "ExecuteShadowOpenNewContext")
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, _
+                             "ExecuteShadowOpenNewContext"
+End Function
+
+' Runs the new-context capture transaction for either XPath or Shadow trigger locators.
+Private Function ExecuteOpenNewContextCore(ByVal triggerLocatorKind As ElementLocatorKind, _
+                                           ByVal triggerLocator As Variant, _
+                                           ByVal searchTimeoutMs As Long, _
+                                           ByVal timeoutMs As Long, _
+                                           ByVal ownerContextId As String, _
+                                           ByVal callerName As String) As Dictionary
+    Dim methodName As String
+    methodName = callerName
 
     Dim exclusiveCaptureEntered As Boolean
-    EnterExclusiveCaptureOperation METHOD_NAME
+    EnterExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = True
     On Error GoTo Failed
 
@@ -2197,11 +2377,12 @@ Public Function ExecuteOpenNewContextByXPath(ByVal triggerXPath As String, _
     Dim carryNetSeenBefore As Boolean
     Dim carryVisSeenBefore As Boolean
     carryoverDiagnosticActive = BeginSignalCarryoverDiagnostic( _
-        METHOD_NAME, ownerCtx, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore)
+        methodName, ownerCtx, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore)
 
     ' Resolve before arming so lookup cannot consume the capture boundary.
     Dim triggerSharedId As String
-    triggerSharedId = ResolveXPathOrThrow(triggerXPath, ownerCtx, searchTimeoutMs, METHOD_NAME)
+    triggerSharedId = ResolveElementSharedId( _
+        triggerLocatorKind, triggerLocator, ownerCtx, searchTimeoutMs, methodName)
 
     ProcessRecorderQueue
     ArmNewContextCapture ownerCtx
@@ -2225,17 +2406,17 @@ Public Function ExecuteOpenNewContextByXPath(ByVal triggerXPath As String, _
         Err.Raise clickErrNum, clickErrSrc, clickErrDesc
     End If
 
-    WaitForNewContextCapture vTimeout, METHOD_NAME
+    WaitForNewContextCapture vTimeout, methodName
 
     Dim result As Dictionary
     Set result = BuildNewContextResult()
     ResetNewContextCaptureState
-    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+    EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
 
-    LeaveExclusiveCaptureOperation METHOD_NAME
+    LeaveExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = False
 
-    Set ExecuteOpenNewContextByXPath = result
+    Set ExecuteOpenNewContextCore = result
     Exit Function
 
 Failed:
@@ -2245,8 +2426,8 @@ Failed:
 
     On Error Resume Next
     ResetNewContextCaptureState
-    EndSignalCarryoverDiagnostic METHOD_NAME, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
-    If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation METHOD_NAME
+    EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
+    If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation methodName
     On Error GoTo 0
 
     Err.Raise captureErrNum, captureErrSrc, captureErrDesc
@@ -2686,8 +2867,8 @@ Public Function ExecuteEnableResourceBlocking(ByVal patterns As Variant) As Stri
     End If
 End Function
 
-' Visibility means connected, style-visible, and non-zero geometry; it does not test
-' viewport intersection or occlusion.
+
+' Public compatibility facade. Basic operations delegate to the unified element core.
 Public Function ExecuteIsElementVisible(ByVal xpath As String, _
                                         Optional ByVal searchTimeoutMs As Long = 10000, _
                                         Optional ByVal waitNetworkIdle As Boolean = False, _
@@ -2701,66 +2882,53 @@ Public Function ExecuteIsElementVisible(ByVal xpath As String, _
         vSearchTimeout = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
     End If
 
-    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    Dim sharedId As String
-    sharedId = GetFindElementSharedIdByXPath(xpath, vSearchTimeout, targetCtx)
-    If Len(sharedId) = 0 Then Exit Function
-
-    Dim args As Collection: Set args = NewElementArgs(sharedId)
-    Dim strRes As String
-    strRes = ExecuteBaseAction(targetCtx, "visibility_check", args, waitNetworkIdle, _
-                               SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
-                               True, DEFAULT_STALE_RETRIES, _
-                               SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS))
-
-    ExecuteIsElementVisible = RequireBooleanResult( _
-        GetCleanResult(strRes), "ExecuteIsElementVisible", "visibility")
+    Dim noValue As Variant
+    ExecuteIsElementVisible = CBool(ExecuteElementActionCore( _
+        ElementLocatorXPath, xpath, ElementActionVisibilityCheck, False, noValue, _
+        vSearchTimeout, True, waitNetworkIdle, _
+        SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
+        SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS), _
+        False, contextId, "ExecuteIsElementVisible"))
 End Function
 
-' Reads normalized textContent; an absent element remains an action error.
 Public Function ExecuteGetTextByXPath(ByVal xpath As String, _
                                       Optional ByVal searchTimeoutMs As Long = 10000, _
                                       Optional ByVal contextId As String = "") As String
-    ExecuteGetTextByXPath = RequireStringResult( _
-        ReadElementValueByXPath(xpath, "get_text", searchTimeoutMs, contextId, _
-                                "ExecuteGetTextByXPath"), _
-        "ExecuteGetTextByXPath", "text")
+    Dim noValue As Variant
+    ExecuteGetTextByXPath = CStr(ExecuteElementActionCore( _
+        ElementLocatorXPath, xpath, ElementActionGetText, False, noValue, _
+        searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
+        False, contextId, "ExecuteGetTextByXPath"))
 End Function
 
-' Reads getAttribute(name); missing returns Null and empty remains empty.
 Public Function ExecuteGetAttributeByXPath(ByVal xpath As String, _
                                            ByVal attributeName As String, _
                                            Optional ByVal searchTimeoutMs As Long = 10000, _
                                            Optional ByVal contextId As String = "") As Variant
-    ValidateDomMemberName attributeName, "attributeName", "ExecuteGetAttributeByXPath"
-    ExecuteGetAttributeByXPath = RequireScalarResult( _
-        ReadElementValueByXPath(xpath, "get_attribute", searchTimeoutMs, contextId, _
-                                "ExecuteGetAttributeByXPath", attributeName), _
-        "ExecuteGetAttributeByXPath", _
-        "The attribute result was not a scalar value or Null.")
+    ExecuteGetAttributeByXPath = ExecuteElementActionCore( _
+        ElementLocatorXPath, xpath, ElementActionGetAttribute, True, attributeName, _
+        searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
+        False, contextId, "ExecuteGetAttributeByXPath")
 End Function
 
-' Reads a scalar DOM property (String, Boolean, numeric, or Null).
 Public Function ExecuteGetPropertyByXPath(ByVal xpath As String, _
                                           ByVal propertyName As String, _
                                           Optional ByVal searchTimeoutMs As Long = 10000, _
                                           Optional ByVal contextId As String = "") As Variant
-    ValidateDomMemberName propertyName, "propertyName", "ExecuteGetPropertyByXPath"
-    ExecuteGetPropertyByXPath = RequireScalarResult( _
-        ReadElementValueByXPath(xpath, "get_property", searchTimeoutMs, contextId, _
-                                "ExecuteGetPropertyByXPath", propertyName), _
-        "ExecuteGetPropertyByXPath", _
-        "The property result was not a supported scalar value or Null.")
+    ExecuteGetPropertyByXPath = ExecuteElementActionCore( _
+        ElementLocatorXPath, xpath, ElementActionGetProperty, True, propertyName, _
+        searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
+        False, contextId, "ExecuteGetPropertyByXPath")
 End Function
 
-' Returns outerHTML for the first element matching XPath.
 Public Function ExecuteGetOuterHtmlByXPath(ByVal xpath As String, _
                                            Optional ByVal searchTimeoutMs As Long = 10000, _
                                            Optional ByVal contextId As String = "") As String
-    ExecuteGetOuterHtmlByXPath = RequireStringResult( _
-        ReadElementValueByXPath(xpath, "get_outer_html", searchTimeoutMs, contextId, _
-                                "ExecuteGetOuterHtmlByXPath"), _
-        "ExecuteGetOuterHtmlByXPath", "outerHTML")
+    Dim noValue As Variant
+    ExecuteGetOuterHtmlByXPath = CStr(ExecuteElementActionCore( _
+        ElementLocatorXPath, xpath, ElementActionGetOuterHtml, False, noValue, _
+        searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
+        False, contextId, "ExecuteGetOuterHtmlByXPath"))
 End Function
 
 Private Function NewLocalValue(ByVal valueType As String, ByVal value As Variant) As Dictionary
@@ -2816,7 +2984,8 @@ Private Function IsStaleElementFailure(ByVal errNum As Long, _
 
         If isShellJsError Then
             If errDesc = "STALE_ELEMENT" Or _
-               errDesc = "STALE_ELEMENT_PRE_INPUT" Then
+               errDesc = "STALE_ELEMENT_PRE_INPUT" Or _
+               errDesc = "Element is no longer connected." Then
                 IsStaleElementFailure = True
                 Exit Function
             End If
@@ -2835,29 +3004,6 @@ Private Function IsStaleElementFailure(ByVal errNum As Long, _
        InStr(d, "element is no longer connected") > 0 Then
         IsStaleElementFailure = True
     End If
-End Function
-
-Private Function ReadElementValueByXPath(ByVal xpath As String, _
-                                         ByVal actionKey As String, _
-                                         ByVal searchTimeoutMs As Long, _
-                                         ByVal contextId As String, _
-                                         ByVal callerName As String, _
-                                         Optional ByVal memberValue As Variant) As Variant
-    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    Dim sharedId As String
-    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, callerName)
-
-    Dim args As Collection
-    If IsMissing(memberValue) Then
-        Set args = NewElementArgs(sharedId)
-    Else
-        Set args = NewElementArgs(sharedId, CStr(memberValue))
-    End If
-
-    ReadElementValueByXPath = GetCleanResult(ExecuteBaseAction( _
-        targetCtx, actionKey, args, False, DEFAULT_IDLE_STABLE_MS, True, _
-        DEFAULT_STALE_RETRIES, DEFAULT_IDLE_TIMEOUT_MS, False, xpath, _
-        searchTimeoutMs, callerName))
 End Function
 
 Private Sub ValidateDomMemberName(ByVal value As String, _
@@ -3378,6 +3524,63 @@ Failed:
     If m_debugMode Then Debug.Print "BiDi: navigate settle best-effort skip: " & errorDescription
 End Sub
 
+Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, _
+                                       ByVal locator As Variant, _
+                                       ByVal valueToSet As String, _
+                                       ByVal searchTimeoutMs As Long, _
+                                       ByVal waitNetworkIdle As Boolean, _
+                                       ByVal minStableMs As Long, _
+                                       ByVal maxTimeoutMs As Long, _
+                                       ByVal contextId As String, _
+                                       ByVal useKeyEvents As Boolean, _
+                                       ByVal useNativeKeys As Boolean, _
+                                       ByVal callerName As String) As String
+    ResetLastSyncState
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+    Dim sharedId As String
+    sharedId = ResolveElementSharedId( _
+        locatorKind, locator, targetCtx, searchTimeoutMs, callerName)
+
+    Dim args As Collection: Set args = NewElementArgs(sharedId, valueToSet)
+    If useNativeKeys Then
+        Dim nativeKeyActions As Collection
+        Set nativeKeyActions = BuildNativeKeyActions(valueToSet, callerName)
+
+        Dim focusArgs As Collection: Set focusArgs = NewElementArgs(sharedId)
+        Call ExecuteBaseAction(targetCtx, "click", focusArgs, False, minStableMs, _
+                               True, DEFAULT_STALE_RETRIES, maxTimeoutMs, False, _
+                               locatorKind, locator, searchTimeoutMs, callerName)
+        ExecuteInputValueCore = PerformNativeKeyInput( _
+            targetCtx, nativeKeyActions, maxTimeoutMs, waitNetworkIdle, minStableMs)
+        If m_debugMode Then Debug.Print "BiDi: Action 'native_keys' completed."
+    ElseIf Not useKeyEvents Then
+        Dim inputResult As String
+        inputResult = ExecuteBaseAction( _
+            targetCtx, "input", args, waitNetworkIdle, minStableMs, True, _
+            DEFAULT_STALE_RETRIES, maxTimeoutMs, False, locatorKind, locator, _
+            searchTimeoutMs, callerName)
+
+        LogInputValueMismatchBestEffort locatorKind, locator, valueToSet, _
+                                        searchTimeoutMs, targetCtx, callerName
+        ExecuteInputValueCore = inputResult
+    Else
+        Dim keySafetyMs As Long: keySafetyMs = maxTimeoutMs
+        If keySafetyMs < 20000 Then keySafetyMs = 20000
+
+        Dim keyResult As String
+        keyResult = ExecuteBaseAction( _
+            targetCtx, "input_keys", args, False, minStableMs, False, _
+            DEFAULT_STALE_RETRIES, keySafetyMs, False, locatorKind, locator, _
+            searchTimeoutMs, callerName)
+
+        Call TrySyncPhase(targetCtx, waitNetworkIdle, _
+                          SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
+                          SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS), False)
+        ExecuteInputValueCore = keyResult
+        If m_debugMode Then Debug.Print "BiDi: Action 'input_keys' completed."
+    End If
+End Function
+
 Public Function ExecuteClickByXPath(ByVal xpath As String, _
                                     Optional ByVal searchTimeoutMs As Long = 10000, _
                                     Optional ByVal waitNetworkIdle As Boolean = True, _
@@ -3385,15 +3588,11 @@ Public Function ExecuteClickByXPath(ByVal xpath As String, _
                                     Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                     Optional ByVal contextId As String = "", _
                                     Optional ByVal checkUrl As Boolean = False) As String
-    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    Dim sharedId As String
-    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteClickByXPath")
-
-    Dim args As Collection: Set args = NewElementArgs(sharedId)
-    ExecuteClickByXPath = ExecuteBaseAction(targetCtx, "click", args, waitNetworkIdle, _
-                                            minStableMs, True, DEFAULT_STALE_RETRIES, _
-                                            maxTimeoutMs, checkUrl, xpath, searchTimeoutMs, _
-                                            "ExecuteClickByXPath")
+    Dim noValue As Variant
+    ExecuteClickByXPath = CStr(ExecuteElementActionCore( _
+        ElementLocatorXPath, xpath, ElementActionClick, False, noValue, _
+        searchTimeoutMs, True, waitNetworkIdle, minStableMs, maxTimeoutMs, _
+        checkUrl, contextId, "ExecuteClickByXPath", True))
 End Function
 
 Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
@@ -3405,57 +3604,10 @@ Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
                                          Optional ByVal contextId As String = "", _
                                          Optional ByVal useKeyEvents As Boolean = True, _
                                          Optional ByVal useNativeKeys As Boolean = False) As String
-    ResetLastSyncState
-    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    Dim sharedId As String
-    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteInputValueByXPath")
-
-    Dim args As Collection: Set args = NewElementArgs(sharedId, valueToSet)
-    If useNativeKeys Then
-        ' Build and validate every key action BEFORE the focus click. Malformed UTF-16 is
-        ' caller input and must not cause even the preliminary click to run.
-        Dim nativeKeyActions As Collection
-        Set nativeKeyActions = BuildNativeKeyActions(valueToSet, "ExecuteInputValueByXPath")
-
-        Dim focusArgs As Collection: Set focusArgs = NewElementArgs(sharedId)
-        Call ExecuteBaseAction(targetCtx, "click", focusArgs, False, minStableMs, _
-                               True, DEFAULT_STALE_RETRIES, maxTimeoutMs, False, _
-                               xpath, searchTimeoutMs, "ExecuteInputValueByXPath")
-        ExecuteInputValueByXPath = PerformNativeKeyInput( _
-            targetCtx, nativeKeyActions, maxTimeoutMs, waitNetworkIdle, minStableMs)
-        If m_debugMode Then Debug.Print "BiDi: Action 'native_keys' completed."
-    ElseIf Not useKeyEvents Then
-        Dim inputResult As String
-        inputResult = ExecuteBaseAction( _
-            targetCtx, "input", args, waitNetworkIdle, minStableMs, True, _
-            DEFAULT_STALE_RETRIES, maxTimeoutMs, False, xpath, searchTimeoutMs, _
-            "ExecuteInputValueByXPath")
-
-        ' A successful execCommand/fallback dispatch does not prove that the page retained the
-        ' requested value. Controlled inputs, masks, and maxlength-like policies may normalize
-        ' or replace it. Observe the post-action value best-effort, but never convert a legitimate
-        ' site normalization into an action failure. Raw values are deliberately NOT logged because
-        ' this API may carry credentials or other sensitive form data.
-        LogInputValueMismatchBestEffort xpath, valueToSet, searchTimeoutMs, targetCtx
-
-        ' Preserve the historical public return contract: return the original action response.
-        ExecuteInputValueByXPath = inputResult
-    Else
-        Dim keySafetyMs As Long: keySafetyMs = maxTimeoutMs
-        If keySafetyMs < 20000 Then keySafetyMs = 20000
-
-        Dim keyResult As String
-        keyResult = ExecuteBaseAction( _
-            targetCtx, "input_keys", args, False, minStableMs, False, _
-            DEFAULT_STALE_RETRIES, keySafetyMs, False, xpath, searchTimeoutMs, _
-            "ExecuteInputValueByXPath")
-
-        Call TrySyncPhase(targetCtx, waitNetworkIdle, _
-                          SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
-                          SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS), False)
-        ExecuteInputValueByXPath = keyResult
-        If m_debugMode Then Debug.Print "BiDi: Action 'input_keys' completed."
-    End If
+    ExecuteInputValueByXPath = ExecuteInputValueCore( _
+        ElementLocatorXPath, xpath, valueToSet, searchTimeoutMs, waitNetworkIdle, _
+        minStableMs, maxTimeoutMs, contextId, useKeyEvents, useNativeKeys, _
+        "ExecuteInputValueByXPath")
 End Function
 
 Public Function ExecuteSetFilesByXPath(ByVal xpath As String, _
@@ -3465,24 +3617,41 @@ Public Function ExecuteSetFilesByXPath(ByVal xpath As String, _
                                        Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
                                        Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                        Optional ByVal contextId As String = "") As String
+    ExecuteSetFilesByXPath = ExecuteSetFilesCore( _
+        ElementLocatorXPath, xpath, filePaths, searchTimeoutMs, waitNetworkIdle, _
+        minStableMs, maxTimeoutMs, contextId, "ExecuteSetFilesByXPath")
+End Function
+
+' Shares input.setFiles across locator types.
+Private Function ExecuteSetFilesCore(ByVal locatorKind As ElementLocatorKind, _
+                                     ByVal locator As Variant, _
+                                     ByVal filePaths As Variant, _
+                                     ByVal searchTimeoutMs As Long, _
+                                     ByVal waitNetworkIdle As Boolean, _
+                                     ByVal minStableMs As Long, _
+                                     ByVal maxTimeoutMs As Long, _
+                                     ByVal contextId As String, _
+                                     ByVal callerName As String) As String
     ResetLastSyncState
-    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    
+
+    Dim targetCtx As String
+    targetCtx = ResolveTargetContext(contextId)
+
     Dim sharedId As String
-    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteSetFilesByXPath")
-    
+    sharedId = ResolveElementSharedId( _
+        locatorKind, locator, targetCtx, searchTimeoutMs, callerName)
+
     Dim paths As Variant
     paths = NormalizeFilePaths(filePaths)
 
-    ' When this operation promises a post-selection SPA wait, validate the active
-    ' completion-signal owner BEFORE input.setFiles changes browser state.
-    ' waitNetworkIdle=False intentionally performs no completion-signal wait, so a
-    ' signal owned by another context is irrelevant and is left untouched.
+    ' Validate ownership before input.setFiles changes browser state.
     If waitNetworkIdle Then
-        ValidateSignalWaitContext targetCtx, "ExecuteSetFilesByXPath"
+        ValidateSignalWaitContext targetCtx, callerName
     End If
-    
-    ExecuteSetFilesByXPath = PerformSetFiles(targetCtx, sharedId, paths, maxTimeoutMs, waitNetworkIdle, minStableMs)
+
+    ExecuteSetFilesCore = PerformSetFiles( _
+        targetCtx, sharedId, paths, maxTimeoutMs, waitNetworkIdle, minStableMs)
+
     If m_debugMode Then Debug.Print "BiDi: Action 'set_files' completed."
 End Function
 
@@ -3508,8 +3677,8 @@ End Function
 '
 ' Native picker suppression is Chromium-specific and deliberately narrow:
 '   CDP Page.setInterceptFileChooserDialog(enabled=True, cancel=False)
-' The CDP session is resolved from the SAME BiDi browsing context as triggerXPath and is held
-' for cleanup so iframe/popup contexts do not silently fall back to the main-context session.
+' The CDP session is resolved from the SAME BiDi browsing context as the trigger locator and is
+' held for cleanup so iframe/popup contexts do not silently fall back to the main-context session.
 '
 ' File-dialog observation and file selection remain WebDriver BiDi:
 '   input.fileDialogOpened -> event.element.sharedId -> input.setFiles
@@ -3531,13 +3700,52 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
                                                   Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
                                                   Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                                   Optional ByVal contextId As String = "") As String
-    Const METHOD_NAME As String = "ExecuteSetFileSelectionViaDialog"
+    ExecuteSetFileSelectionViaDialog = ExecuteSetFileSelectionViaDialogCore( _
+        ElementLocatorXPath, triggerXPath, filePaths, searchTimeoutMs, fileDialogTimeoutMs, _
+        minStableMs, maxTimeoutMs, contextId, "ExecuteSetFileSelectionViaDialog")
+End Function
 
-    ' Acquire before ResetLastSyncState or any chooser/capture state mutation. If a DoEvents callback
-    ' attempts a nested chooser/download/new-context capture, it is rejected before this invocation
-    ' installs the cleanup handler, so the outer transaction cannot be reset by the rejected call.
+' Opens a native file chooser from a Shadow DOM trigger and applies the selected files.
+Public Function ExecuteShadowSetFileSelectionViaDialog(ByVal selectorPath As Variant, _
+                                                        ByVal filePaths As Variant, _
+                                                        Optional ByVal searchTimeoutMs As Long = 10000, _
+                                                        Optional ByVal fileDialogTimeoutMs As Long = 10000, _
+                                                        Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                                        Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                                        Optional ByVal contextId As String = "", _
+                                                        Optional ByVal requireUnlocker As Boolean = False) As String
+    On Error GoTo Failed
+    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteShadowSetFileSelectionViaDialog"
+
+    ExecuteShadowSetFileSelectionViaDialog = ExecuteSetFileSelectionViaDialogCore( _
+        ElementLocatorShadowPath, selectorPath, filePaths, searchTimeoutMs, fileDialogTimeoutMs, _
+        minStableMs, maxTimeoutMs, contextId, "ExecuteShadowSetFileSelectionViaDialog")
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, _
+                             "ExecuteShadowSetFileSelectionViaDialog"
+End Function
+
+' Runs the native file-chooser transaction for either XPath or Shadow locators.
+Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind As ElementLocatorKind, _
+                                                       ByVal triggerLocator As Variant, _
+                                                       ByVal filePaths As Variant, _
+                                                       ByVal searchTimeoutMs As Long, _
+                                                       ByVal fileDialogTimeoutMs As Long, _
+                                                       ByVal minStableMs As Long, _
+                                                       ByVal maxTimeoutMs As Long, _
+                                                       ByVal contextId As String, _
+                                                       ByVal callerName As String) As String
+    Dim methodName As String
+    methodName = callerName
+
+    ' Acquire before any chooser/capture state mutation.
     Dim exclusiveCaptureEntered As Boolean
-    EnterExclusiveCaptureOperation METHOD_NAME
+    EnterExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = True
     On Error GoTo Failed
 
@@ -3546,12 +3754,10 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     Dim targetCtx As String
     targetCtx = ResolveTargetContext(contextId)
 
-    ' Ownership is checked only when a signal is actually armed. With no arm, an empty owner is
-    ' the normal ungated state, not a mismatch.
     If AnySignalArmed() Then
         If Len(m_signalOwnerContextId) = 0 Or _
            StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                       "CompletionSignalContextMismatch: The active completion signal does not belong " & _
                       "to the file-selection context." & vbCrLf & _
                       "Signal owner: " & m_signalOwnerContextId & vbCrLf & _
@@ -3559,10 +3765,9 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
         End If
     End If
 
-    ' Never begin another chooser operation while a previous interception may still be active.
     If m_fileChooserInterceptMayBeActive Then
         If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                       "ResidualFileChooserInterception: a previous native file-chooser " & _
                       "interception could not be confirmed disabled. Call Shutdown or " & _
                       "reconnect before starting another file-selection operation."
@@ -3575,7 +3780,7 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     Dim pathCount As Long
     pathCount = VariantArrayCount(paths)
     If pathCount = 0 Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "NoFilesSupplied: No file paths were supplied for file selection."
     End If
 
@@ -3586,67 +3791,53 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     vMinStable = SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS)
     vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
 
-    ' Subscribe before enabling interception and before the trigger click. Subscription remains
-    ' session-scoped; the one-shot local arm below decides which event this operation consumes.
     Me.ExecuteSessionSubscribe Array("input.fileDialogOpened"), , True
 
-    ' Resolve the trigger before the local capture arm. A slow XPath lookup must not create a
-    ' window in which an unrelated chooser can satisfy this operation.
+    ' Resolve before arming so locator work cannot consume an unrelated chooser event.
     Dim triggerSharedId As String
-    triggerSharedId = ResolveXPathOrThrow(triggerXPath, targetCtx, searchTimeoutMs, _
-                                          "ExecuteSetFileSelectionViaDialog")
+    triggerSharedId = ResolveElementSharedId( _
+        triggerLocatorKind, triggerLocator, targetCtx, searchTimeoutMs, callerName)
 
-    ' Resolve a fresh CDP session for the SAME BiDi context as the trigger, then hold that session
-    ' id for cleanup. This matters for out-of-process frames and non-main top-level contexts.
     Dim fileChooserCdpSessionId As String
     fileChooserCdpSessionId = GetCdpSessionIdForContext(targetCtx)
     BeginNativeFileChooserInterception targetCtx, fileChooserCdpSessionId
 
-    ' Dispatch already-buffered events immediately before the local arm. CDP resolution and
-    ' interception above can perform command round-trips that preserve asynchronous events in
-    ' the socket FIFO. Process them while the local arm is still down so ordinary stale
-    ' fileDialogOpened events are rejected.
-    ' This deliberately remains a best-effort drain rather than introducing a queue watermark.
     ProcessRecorderQueue
-
     ArmFileDialogCapture targetCtx
 
     Dim clickArgs As Collection
     Set clickArgs = NewElementArgs(triggerSharedId)
 
-    ' File-picker triggers require real user activation. PerformTrustedClick uses BiDi
-    ' input.performActions and does not replay an ambiguous click.
+    ' The chooser trigger requires real user activation.
     Dim clickResult As String
     clickResult = PerformTrustedClick(targetCtx, clickArgs, vMaxTimeout, False)
 
     If Not WaitForFileDialogCapture(vDialogTimeout) Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "FileDialogTimeout: input.fileDialogOpened was not observed within " & _
                   vDialogTimeout & "ms."
     End If
 
     If Not m_fileDlgMultipleKnown Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & callerName, _
                   "FileDialogMissingMultiple: input.fileDialogOpened did not include the " & _
                   "required 'multiple' field."
     End If
 
     If Not m_fileDlgHasElement Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "FileDialogHasNoInputElement: input.fileDialogOpened had no HTML " & _
                   "file-input element. Elementless picker paths are outside this API contract."
     End If
 
     If pathCount > 1 And Not m_fileDlgMultiple Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "MultipleFilesNotAllowed: the opened file input does not allow multiple files."
     End If
 
     Dim capturedSharedId As String
     capturedSharedId = m_fileDlgSharedId
 
-    ' Send input.setFiles first, but deliberately postpone the required application-completion wait.
-    ' The interceptor is needed only through the chooser/setFiles hand-off.
     Dim setFilesResult As String
     setFilesResult = PerformSetFiles(targetCtx, capturedSharedId, paths, _
                                      vMaxTimeout, False, vMinStable)
@@ -3656,11 +3847,9 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
 
     ResetFileDialogCaptureState
 
-    ' input.setFiles is already state-changing, so cleanup failure is surfaced as NON-RETRYABLE.
-    ' Keep the tracked residual state if both the held session and a fresh session fail to disable.
     If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
         Me.DisarmSignal
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteSetFileSelectionViaDialog", _
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "PostSelectionInterceptionCleanupFailed: input.setFiles succeeded, but native " & _
                   "file-chooser interception could not be confirmed disabled. The selection may " & _
                   "already have triggered application work; do not retry the whole operation. " & _
@@ -3668,9 +3857,9 @@ Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
     End If
 
     RunRequiredSpaSync targetCtx, vMinStable, vMaxTimeout
-    ExecuteSetFileSelectionViaDialog = setFilesResult
+    ExecuteSetFileSelectionViaDialogCore = setFilesResult
 
-    LeaveExclusiveCaptureOperation METHOD_NAME
+    LeaveExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = False
 
     If m_debugMode Then Debug.Print "BiDi: Action 'set_file_selection_via_dialog' completed."
@@ -3684,14 +3873,12 @@ Failed:
     primaryErrSrc = Err.source
     primaryErrDesc = Err.description
 
-    ' Abnormal-flow cleanup must never replace the primary error. The tracked interceptor state
-    ' survives a failed disable so Shutdown / reconnect can retry it.
     Dim cleanupConfirmed As Boolean
     On Error Resume Next
     ResetFileDialogCaptureState
     cleanupConfirmed = ReleaseTrackedFileChooserInterceptionBestEffort(True)
     Me.DisarmSignal
-    If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation METHOD_NAME
+    If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation methodName
     On Error GoTo 0
 
     If primaryErrNum = 0 Then primaryErrNum = ERR_ACTION_FAILED
@@ -3701,7 +3888,7 @@ Failed:
         underlyingSrc = primaryErrSrc
         If Len(underlyingSrc) = 0 Then underlyingSrc = "(unknown)"
 
-        primaryErrSrc = "BiDi:ExecuteSetFileSelectionViaDialog"
+        primaryErrSrc = "BiDi:" & callerName
         primaryErrDesc = _
             "PostSelectionCompletionFailed: input.setFiles succeeded before the completion " & _
             "wait failed. File selection may already have triggered application work; do not " & _
@@ -3709,7 +3896,7 @@ Failed:
             "Underlying source: " & underlyingSrc & vbCrLf & _
             "Underlying error: " & primaryErrDesc
     ElseIf Len(primaryErrSrc) = 0 Then
-        primaryErrSrc = "BiDi:ExecuteSetFileSelectionViaDialog"
+        primaryErrSrc = "BiDi:" & callerName
     End If
 
     If m_fileChooserInterceptMayBeActive And Not cleanupConfirmed Then
@@ -4436,6 +4623,46 @@ Private Function BuildPointerButton(ByVal actionType As String, _
     Set BuildPointerButton = a
 End Function
 
+Private Function ExecuteSelectValueCore(ByVal locatorKind As ElementLocatorKind, _
+                                        ByVal locator As Variant, _
+                                        ByVal valueOrText As String, _
+                                        ByVal selectByText As Boolean, _
+                                        ByVal searchTimeoutMs As Long, _
+                                        ByVal waitNetworkIdle As Boolean, _
+                                        ByVal maxTimeoutMs As Long, _
+                                        ByVal contextId As String, _
+                                        ByVal callerName As String) As String
+    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+    Dim sharedId As String
+    sharedId = ResolveElementSharedId( _
+        locatorKind, locator, targetCtx, searchTimeoutMs, callerName)
+
+    Dim elementArgs As Collection: Set elementArgs = NewElementArgs(sharedId)
+    Dim isStandardSelect As Boolean
+    isStandardSelect = RequireBooleanResult(GetCleanResult(CallScript( _
+        "return arguments[0].tagName==='SELECT';", elementArgs, targetCtx, _
+        False, False, 2000, Silent:=True, allowAmbiguousRetry:=True)), _
+        callerName, "standard-select probe")
+
+    If isStandardSelect Then
+        Dim jsKey As String
+        If selectByText Then jsKey = "select_text" Else jsKey = "select"
+        ExecuteSelectValueCore = ExecuteBaseAction( _
+            targetCtx, jsKey, NewElementArgs(sharedId, valueOrText), waitNetworkIdle, _
+            DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs, _
+            False, locatorKind, locator, searchTimeoutMs, callerName)
+    Else
+        Call ExecuteBaseAction(targetCtx, "click", elementArgs, False, _
+                               DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, _
+                               maxTimeoutMs, False, locatorKind, locator, _
+                               searchTimeoutMs, callerName)
+
+        ExecuteSelectValueCore = ExecuteUniqueVisibleRoleOptionClick( _
+            targetCtx, valueOrText, searchTimeoutMs, waitNetworkIdle, maxTimeoutMs, _
+            callerName)
+    End If
+End Function
+
 Public Function ExecuteSelectValueByXPath(ByVal xpath As String, _
                                           ByVal valueOrText As String, _
                                           Optional ByVal selectByText As Boolean = False, _
@@ -4443,34 +4670,9 @@ Public Function ExecuteSelectValueByXPath(ByVal xpath As String, _
                                           Optional ByVal waitNetworkIdle As Boolean = True, _
                                           Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                           Optional ByVal contextId As String = "") As String
-    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    Dim sharedId As String
-    sharedId = ResolveXPathOrThrow(xpath, targetCtx, searchTimeoutMs, "ExecuteSelectValueByXPath")
-
-    Dim elementArgs As Collection: Set elementArgs = NewElementArgs(sharedId)
-    Dim isStandardSelect As Boolean
-    isStandardSelect = RequireBooleanResult(GetCleanResult(CallScript( _
-        "return arguments[0].tagName==='SELECT';", elementArgs, targetCtx, _
-        False, False, 2000, Silent:=True, allowAmbiguousRetry:=True)), _
-        "ExecuteSelectValueByXPath", "standard-select probe")
-
-    If isStandardSelect Then
-        Dim jsKey As String
-        If selectByText Then jsKey = "select_text" Else jsKey = "select"
-        ExecuteSelectValueByXPath = ExecuteBaseAction( _
-            targetCtx, jsKey, NewElementArgs(sharedId, valueOrText), waitNetworkIdle, _
-            DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, maxTimeoutMs, _
-            False, xpath, searchTimeoutMs, "ExecuteSelectValueByXPath")
-    Else
-        Call ExecuteBaseAction(targetCtx, "click", elementArgs, False, _
-                               DEFAULT_IDLE_STABLE_MS, True, DEFAULT_STALE_RETRIES, _
-                               maxTimeoutMs, False, xpath, searchTimeoutMs, _
-                               "ExecuteSelectValueByXPath")
-
-        ExecuteSelectValueByXPath = ExecuteUniqueVisibleRoleOptionClick( _
-            targetCtx, valueOrText, searchTimeoutMs, waitNetworkIdle, maxTimeoutMs, _
-            "ExecuteSelectValueByXPath")
-    End If
+    ExecuteSelectValueByXPath = ExecuteSelectValueCore( _
+        ElementLocatorXPath, xpath, valueOrText, selectByText, searchTimeoutMs, _
+        waitNetworkIdle, maxTimeoutMs, contextId, "ExecuteSelectValueByXPath")
 End Function
 
 Private Function ExecuteBrowsingContextLocateNodes(ByVal xpath As String, _
@@ -4484,28 +4686,106 @@ Private Function ExecuteBrowsingContextLocateNodes(ByVal xpath As String, _
     ExecuteBrowsingContextLocateNodes = ExecuteBiDiCommand("browsingContext.locateNodes", params, Silent, _
                                 allowContextRetarget:=(targetCtx = m_mainContextId))
 End Function
-' Custom role-option resolution is intentionally stricter than the generic XPath resolver.
-' It uses exact normalized text, ignores hidden duplicates, and refuses multiple visible matches.
-Private Function BuildExactRoleOptionXPath(ByVal optionText As String) As String
-    BuildExactRoleOptionXPath = "//*[@role='option' and normalize-space(.)=normalize-space(" & _
-                                EscapeXPathString(optionText) & ")]"
-End Function
 
-Private Function IsSharedIdVisibleStrict(ByVal sharedId As String, _
-                                         ByVal targetCtx As String, _
-                                         ByVal callerName As String) As Boolean
+' Custom role-option resolution traverses both the document tree and open ShadowRoots.
+' It preserves exact normalized text, strict visibility, and ambiguity rejection.
+Private Function TryResolveUniqueVisibleRoleOptionDeepOnce(ByVal optionText As String, _
+                                                            ByVal targetCtx As String, _
+                                                            ByRef state As String, _
+                                                            ByRef candidateCount As Long, _
+                                                            ByRef visibleCount As Long) As String
+    Dim params As New Dictionary
+    Dim targetDic As New Dictionary
+    Dim args As New Collection
+    Dim functionDeclaration As String
+
+    functionDeclaration = "function(t){" & _
+        "const norm=s=>String(s==null?'':s).replace(/\s+/g,' ').trim();" & _
+        "const vis=e=>{if(!e||!e.isConnected)return false;const s=getComputedStyle(e),r=e.getBoundingClientRect();" & _
+        "return s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&" & _
+        "(r.width>0||r.height>0||e.getClientRects().length>0);};" & _
+        "const matches=[];const walk=r=>{for(const e of r.querySelectorAll('[role=option]')){" & _
+        "if(norm(e.textContent)===norm(t))matches.push(e);}" & _
+        "for(const e of r.querySelectorAll('*')){if(e.shadowRoot)walk(e.shadowRoot);}};" & _
+        "walk(document);const visible=matches.filter(vis);" & _
+        "if(visible.length===1)return visible[0];" & _
+        "if(visible.length>1)return 'A|'+matches.length+'|'+visible.length;" & _
+        "if(matches.length>0)return 'H|'+matches.length+'|0';" & _
+        "return 'N|0|0';}"
+
+    args.Add NewLocalValue("string", optionText)
+    targetDic.Add "context", targetCtx
+
+    params.Add "functionDeclaration", functionDeclaration
+    params.Add "arguments", args
+    params.Add "target", targetDic
+    params.Add "awaitPromise", False
+
     Dim rawRes As String
-    rawRes = CallScript(GetActionJs("visibility_check"), NewElementArgs(sharedId), targetCtx, _
-                        False, False, 2000, Silent:=True, allowAmbiguousRetry:=True)
+    rawRes = ExecuteBiDiCommand("script.callFunction", params, True, True, True, _
+                                (targetCtx = m_mainContextId), ResolveTransportTimeout(5000))
 
-    IsSharedIdVisibleStrict = RequireBooleanResult( _
-        GetCleanResult(rawRes), callerName, "dropdown option visibility")
+    Dim json As Object
+    Set json = ValidateProtocolResponse(rawRes, "script.callFunction")
+
+    Dim resultType As String
+    resultType = LCase$(GetPathString(json, "result.result.type"))
+
+    If resultType = "node" Then
+        Dim sid As String
+        sid = GetPathString(json, "result.result.sharedId")
+        If Len(sid) = 0 Then
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveUniqueVisibleRoleOptionDeepOnce", _
+                      "Deep role-option resolver returned a node without sharedId."
+        End If
+
+        state = "unique"
+        candidateCount = 1
+        visibleCount = 1
+        TryResolveUniqueVisibleRoleOptionDeepOnce = sid
+        Exit Function
+    End If
+
+    If resultType <> "string" Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveUniqueVisibleRoleOptionDeepOnce", _
+                  "Deep role-option resolver returned unexpected remote value type: " & resultType
+    End If
+
+    Dim token As String
+    token = GetPathString(json, "result.result.value")
+
+    Dim parts() As String
+    parts = Split(token, "|")
+    If UBound(parts) <> 2 Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveUniqueVisibleRoleOptionDeepOnce", _
+                  "Deep role-option resolver returned an invalid status token: " & token
+    End If
+
+    If Not IsNumeric(parts(1)) Or Not IsNumeric(parts(2)) Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveUniqueVisibleRoleOptionDeepOnce", _
+                  "Deep role-option resolver returned invalid counts: " & token
+    End If
+
+    candidateCount = CLng(parts(1))
+    visibleCount = CLng(parts(2))
+
+    Select Case parts(0)
+        Case "A"
+            state = "ambiguous"
+        Case "H"
+            state = "hidden"
+        Case "N"
+            state = "notfound"
+        Case Else
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveUniqueVisibleRoleOptionDeepOnce", _
+                      "Deep role-option resolver returned an unknown status token: " & token
+    End Select
 End Function
 
 Private Function ResolveUniqueVisibleRoleOptionByText(ByVal optionText As String, _
-                                                      ByVal targetCtx As String, _
-                                                      ByVal searchTimeoutMs As Long, _
-                                                      ByVal callerName As String) As String
+                                                       ByVal targetCtx As String, _
+                                                       ByVal searchTimeoutMs As Long, _
+                                                       ByVal callerName As String) As String
     If Len(optionText) = 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "DropdownOptionTextEmpty: option text must not be empty."
@@ -4523,66 +4803,25 @@ Private Function ResolveUniqueVisibleRoleOptionByText(ByVal optionText As String
         vTimeoutMs = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 10000)
     End If
 
-    Dim optionXPath As String: optionXPath = BuildExactRoleOptionXPath(optionText)
     Dim startTick As Currency: startTick = socket_.NowTicks()
-    Dim pendingTransient As String
-    Dim lastLoggedTransient As String
+    Dim lastState As String
     Dim lastCandidateCount As Long
     Dim lastVisibleCount As Long
 
     Do
-        Dim strRes As String
-        Dim json As Object
-        Dim nodes As Collection
+        Dim sid As String
+        sid = TryResolveUniqueVisibleRoleOptionDeepOnce( _
+            optionText, targetCtx, lastState, lastCandidateCount, lastVisibleCount)
 
-        strRes = ExecuteBrowsingContextLocateNodes(optionXPath, targetCtx, True)
-        If TryGetPollingResponse(strRes, "browsingContext.locateNodes", json, _
-                                 pendingTransient, lastLoggedTransient) Then
-            Set nodes = GetPathObject(json, "result.nodes")
-            If nodes Is Nothing Then
-                Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & callerName, _
-                          "DropdownOptionLocatorInvalid: browsingContext.locateNodes omitted result.nodes."
-            End If
+        If Len(sid) > 0 Then
+            ResolveUniqueVisibleRoleOptionByText = sid
+            Exit Function
+        End If
 
-            lastCandidateCount = nodes.count
-            lastVisibleCount = 0
-            Dim visibleSharedId As String: visibleSharedId = vbNullString
-
-            Dim i As Long
-            For i = 1 To nodes.count
-                Dim nodeObj As Object
-                Set nodeObj = nodes(i)
-                If nodeObj Is Nothing Then
-                    Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & callerName, _
-                              "DropdownOptionLocatorInvalid: matched option node was not an object."
-                End If
-                If Not nodeObj.Exists("sharedId") Then
-                    Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & callerName, _
-                              "DropdownOptionLocatorInvalid: matched option node omitted sharedId."
-                End If
-
-                Dim sid As String: sid = CStr(nodeObj("sharedId"))
-                If Len(sid) = 0 Then
-                    Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & callerName, _
-                              "DropdownOptionLocatorInvalid: matched option node returned an empty sharedId."
-                End If
-
-                If IsSharedIdVisibleStrict(sid, targetCtx, callerName) Then
-                    lastVisibleCount = lastVisibleCount + 1
-                    visibleSharedId = sid
-                End If
-            Next i
-
-            If lastVisibleCount = 1 Then
-                ResolveUniqueVisibleRoleOptionByText = visibleSharedId
-                Exit Function
-            End If
-
-            If lastVisibleCount > 1 Then
-                Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
-                          "AmbiguousDropdownOption: exact normalized text matched " & _
-                          CStr(lastVisibleCount) & " visible role=option elements. Text=" & optionText
-            End If
+        If lastState = "ambiguous" Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                      "AmbiguousDropdownOption: exact normalized text matched " & _
+                      CStr(lastVisibleCount) & " visible role=option elements across document/Shadow DOM. Text=" & optionText
         End If
 
         If isImmediate Then Exit Do
@@ -4590,17 +4829,22 @@ Private Function ResolveUniqueVisibleRoleOptionByText(ByVal optionText As String
         If IsTimeout(startTick, CDbl(vTimeoutMs)) Then Exit Do
     Loop
 
-    RaiseIfPollingEndedOnProtocolError "browsingContext.locateNodes", pendingTransient
-
     If lastCandidateCount > 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "DropdownOptionNotVisible: exact normalized text matched " & _
-                  CStr(lastCandidateCount) & " role=option element(s), but none was visible. Text=" & optionText
+                  CStr(lastCandidateCount) & " role=option element(s) across document/Shadow DOM, but none was visible. Text=" & optionText
+    End If
+
+    Dim timeoutLabel As String
+    If vTimeoutMs = 0 Then
+        timeoutLabel = "0 (immediate)"
+    Else
+        timeoutLabel = CStr(vTimeoutMs)
     End If
 
     Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
               "DropdownOptionNotFound: no role=option with exact normalized text was found within " & _
-              IIf(vTimeoutMs = 0, "0 (immediate)", CStr(vTimeoutMs)) & "ms. Text=" & optionText
+              timeoutLabel & "ms across document/Shadow DOM. Text=" & optionText
 End Function
 
 Private Function ExecuteUniqueVisibleRoleOptionClick(ByVal targetCtx As String, _
@@ -4731,49 +4975,533 @@ Public Function ExecuteWebExtensionInstall(ByVal extensionPath As String) As Str
     ExecuteWebExtensionInstall = strRes
 End Function
 
+Private Function TryResolveShadowElementSharedIdOnce(ByVal selectorsArray As Variant, _
+                                                       ByVal targetCtx As String) As String
+    Dim params As New Dictionary
+    Dim targetDic As New Dictionary
+    Dim args As New Collection
+    Dim functionDeclaration As String
+
+    ' Node references must bypass CallScript because the Safety Shell JSON-stringifies results.
+    ' Compatibility contract: each selector is deep-searched through the current root and all open
+    ' descendant ShadowRoots. When an array is supplied, the next selector starts from the matched
+    ' element's ShadowRoot when present. This preserves the v4.2/v4.3 single-selector behavior used
+    ' by live-site samples such as ExecuteShadowClick "#utility-sign-in button".
+    functionDeclaration = "function(sels){" & _
+        "const fd=(r,s)=>{let n=r.querySelector(String(s));if(n)return n;" & _
+        "for(const c of r.querySelectorAll('*')){if(c.shadowRoot){n=fd(c.shadowRoot,s);if(n)return n;}}return null;};" & _
+        "let el=document;for(const s of sels){el=fd(el.shadowRoot||el,s);if(!el)return null;}return el;}"
+
+    args.Add BuildShadowSelectorArg(selectorsArray)
+    targetDic.Add "context", targetCtx
+
+    params.Add "functionDeclaration", functionDeclaration
+    params.Add "arguments", args
+    params.Add "target", targetDic
+    params.Add "awaitPromise", False
+
+    Dim rawRes As String
+    rawRes = ExecuteBiDiCommand("script.callFunction", params, True, True, True, _
+                                (targetCtx = m_mainContextId), ResolveTransportTimeout(5000))
+
+    Dim json As Object
+    Set json = ValidateProtocolResponse(rawRes, "script.callFunction")
+
+    Dim resultType As String
+    resultType = LCase$(GetPathString(json, "result.result.type"))
+
+    If resultType = "null" Or resultType = "undefined" Then Exit Function
+
+    If resultType <> "node" Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveShadowElementSharedIdOnce", _
+                  "Shadow resolver returned unexpected remote value type: " & resultType
+    End If
+
+    Dim sid As String
+    sid = GetPathString(json, "result.result.sharedId")
+    If Len(sid) = 0 Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveShadowElementSharedIdOnce", _
+                  "Shadow resolver returned a node without sharedId."
+    End If
+
+    TryResolveShadowElementSharedIdOnce = sid
+End Function
+
+Private Function ResolveShadowElementSharedId(ByVal selectorsArray As Variant, _
+                                                          ByVal targetCtx As String, _
+                                                          ByVal searchTimeoutMs As Long, _
+                                                          ByVal callerName As String, _
+                                                          Optional ByVal required As Boolean = True) As String
+    Dim isImmediate As Boolean
+    isImmediate = (searchTimeoutMs <= 0)
+
+    Dim vTimeoutMs As Long
+    If isImmediate Then
+        vTimeoutMs = 0
+    Else
+        vTimeoutMs = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 5000)
+    End If
+
+    Dim startTick As Currency
+    startTick = socket_.NowTicks()
+
+    Do
+        Dim sid As String
+        sid = TryResolveShadowElementSharedIdOnce(selectorsArray, targetCtx)
+        If Len(sid) > 0 Then
+            ResolveShadowElementSharedId = sid
+            Exit Function
+        End If
+
+        If isImmediate Then Exit Do
+        WaitHeartbeat 100
+        If IsTimeout(startTick, CDbl(vTimeoutMs)) Then Exit Do
+    Loop
+
+    Dim timeoutLabel As String
+    If isImmediate Then
+        timeoutLabel = "0 (immediate)"
+    Else
+        timeoutLabel = CStr(vTimeoutMs)
+    End If
+
+    If required Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "Shadow element not found within " & timeoutLabel & "ms."
+    End If
+End Function
+
+Private Sub ResolveElementActionSpec(ByVal actionType As BiDiElementAction, _
+                                     ByRef actionKey As String, _
+                                     ByRef requiresValue As Boolean, _
+                                     ByRef defaultWaitNetworkIdle As Boolean)
+    actionKey = vbNullString
+    requiresValue = False
+    defaultWaitNetworkIdle = False
+
+    Select Case actionType
+        Case ElementActionClick
+            actionKey = "click"
+            defaultWaitNetworkIdle = True
+        Case ElementActionInput
+            actionKey = "input"
+            requiresValue = True
+            defaultWaitNetworkIdle = True
+        Case ElementActionInputKeys
+            actionKey = "input_keys"
+            requiresValue = True
+            defaultWaitNetworkIdle = True
+        Case ElementActionSelect
+            actionKey = "select"
+            requiresValue = True
+            defaultWaitNetworkIdle = True
+        Case ElementActionSelectText
+            actionKey = "select_text"
+            requiresValue = True
+            defaultWaitNetworkIdle = True
+        Case ElementActionGetText
+            actionKey = "get_text"
+        Case ElementActionGetAttribute
+            actionKey = "get_attribute"
+            requiresValue = True
+        Case ElementActionGetProperty
+            actionKey = "get_property"
+            requiresValue = True
+        Case ElementActionGetOuterHtml
+            actionKey = "get_outer_html"
+        Case ElementActionVisibilityCheck
+            actionKey = "visibility_check"
+        Case Else
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ResolveElementActionSpec", _
+                      "Unsupported element action value: " & CStr(actionType)
+    End Select
+End Sub
+
+Private Function ExecuteElementActionCore(ByVal locatorKind As ElementLocatorKind, _
+                                          ByVal locator As Variant, _
+                                          ByVal actionType As BiDiElementAction, _
+                                          ByVal hasValue As Boolean, _
+                                          ByVal value As Variant, _
+                                          ByVal searchTimeoutMs As Long, _
+                                          ByVal hasWaitNetworkIdle As Boolean, _
+                                          ByVal waitNetworkIdleValue As Boolean, _
+                                          ByVal minStableMs As Long, _
+                                          ByVal maxTimeoutMs As Long, _
+                                          ByVal checkUrl As Boolean, _
+                                          ByVal contextId As String, _
+                                          ByVal callerName As String, _
+                                          Optional ByVal returnRaw As Boolean = False) As Variant
+    Dim actionKey As String
+    Dim requiresValue As Boolean
+    Dim defaultWaitNetworkIdle As Boolean
+    ResolveElementActionSpec actionType, actionKey, requiresValue, defaultWaitNetworkIdle
+
+    If requiresValue Then
+        If Not hasValue Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                      "Action '" & actionKey & "' requires a value argument."
+        End If
+    ElseIf hasValue Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "Action '" & actionKey & "' does not accept a value argument."
+    End If
+
+    If actionType = ElementActionGetAttribute Then
+        ValidateDomMemberName CStr(value), "attributeName", callerName
+    ElseIf actionType = ElementActionGetProperty Then
+        ValidateDomMemberName CStr(value), "propertyName", callerName
+    End If
+
+    Dim shouldWaitNetworkIdle As Boolean
+    If hasWaitNetworkIdle Then
+        shouldWaitNetworkIdle = waitNetworkIdleValue
+    Else
+        shouldWaitNetworkIdle = defaultWaitNetworkIdle
+    End If
+
+    If checkUrl And actionType <> ElementActionClick Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "checkUrl is supported only for ElementActionClick."
+    End If
+
+    Dim targetCtx As String
+    targetCtx = ResolveTargetContext(contextId)
+
+    Dim elementRequired As Boolean
+    elementRequired = (actionType <> ElementActionVisibilityCheck)
+
+    Dim sid As String
+    sid = ResolveElementSharedId( _
+        locatorKind, locator, targetCtx, searchTimeoutMs, callerName, elementRequired)
+
+    If Len(sid) = 0 Then
+        ExecuteElementActionCore = False
+        Exit Function
+    End If
+
+    Dim args As Collection
+    If requiresValue Then
+        Set args = NewElementArgs(sid, CStr(value))
+    Else
+        Set args = NewElementArgs(sid)
+    End If
+
+    Dim rawResult As String
+    rawResult = ExecuteBaseAction( _
+        targetCtx, actionKey, args, shouldWaitNetworkIdle, minStableMs, True, _
+        DEFAULT_STALE_RETRIES, maxTimeoutMs, checkUrl, locatorKind, locator, _
+        searchTimeoutMs, callerName)
+
+    If returnRaw Then
+        ExecuteElementActionCore = rawResult
+        Exit Function
+    End If
+
+    Dim cleanResult As Variant
+    cleanResult = GetCleanResult(rawResult)
+
+    Select Case actionType
+        Case ElementActionGetText
+            ExecuteElementActionCore = RequireStringResult( _
+                cleanResult, callerName, "text")
+        Case ElementActionGetAttribute
+            ExecuteElementActionCore = RequireScalarResult( _
+                cleanResult, callerName, _
+                "The attribute result was not a scalar value or Null.")
+        Case ElementActionGetProperty
+            ExecuteElementActionCore = RequireScalarResult( _
+                cleanResult, callerName, _
+                "The property result was not a supported scalar value or Null.")
+        Case ElementActionGetOuterHtml
+            ExecuteElementActionCore = RequireStringResult( _
+                cleanResult, callerName, "outerHTML")
+        Case ElementActionVisibilityCheck
+            ExecuteElementActionCore = RequireBooleanResult( _
+                cleanResult, callerName, "visibility")
+        Case Else
+            ExecuteElementActionCore = cleanResult
+    End Select
+End Function
+
+Private Sub ValidateShadowUnlockerRequirement(ByVal requireUnlocker As Boolean, _
+                                                   ByVal callerName As String)
+    If requireUnlocker And Not m_shadowUnlockerRegistered Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & callerName, _
+            "Shadow Unlocker is not registered for this session. Reconnect with " & _
+            "requireShadowUnlocker:=True, or verify script.addPreloadScript support."
+    End If
+End Sub
+
+Private Sub ReraiseShadowPublicError(ByVal errorNumber As Long, _
+                                     ByVal errorSource As String, _
+                                     ByVal errorDescription As String, _
+                                     ByVal callerName As String)
+    If Not m_shadowUnlockerRegistered And _
+       InStr(1, errorDescription, "Shadow element not found", vbTextCompare) > 0 Then
+        errorDescription = errorDescription & vbCrLf & _
+            "Diagnostic: Shadow Unlocker is not registered. The target may be inside a " & _
+            "closed shadow root. Open shadow roots remain accessible without the Unlocker."
+    End If
+
+    If Len(errorSource) = 0 Then errorSource = "BiDi:" & callerName
+    Err.Raise errorNumber, errorSource, errorDescription
+End Sub
+
+' Centralizes Shadow facade validation and diagnostics.
+Private Function ExecuteShadowElementActionCore(ByVal selectorPath As Variant, _
+                                                ByVal actionType As BiDiElementAction, _
+                                                ByVal hasValue As Boolean, _
+                                                ByVal value As Variant, _
+                                                ByVal searchTimeoutMs As Long, _
+                                                ByVal hasWaitNetworkIdle As Boolean, _
+                                                ByVal waitNetworkIdleValue As Boolean, _
+                                                ByVal minStableMs As Long, _
+                                                ByVal maxTimeoutMs As Long, _
+                                                ByVal checkUrl As Boolean, _
+                                                ByVal contextId As String, _
+                                                ByVal requireUnlocker As Boolean, _
+                                                ByVal callerName As String, _
+                                                Optional ByVal returnRaw As Boolean = False) As Variant
+    On Error GoTo Failed
+    ValidateShadowUnlockerRequirement requireUnlocker, callerName
+
+    ExecuteShadowElementActionCore = ExecuteElementActionCore( _
+        ElementLocatorShadowPath, selectorPath, actionType, hasValue, value, _
+        searchTimeoutMs, hasWaitNetworkIdle, waitNetworkIdleValue, minStableMs, _
+        maxTimeoutMs, checkUrl, contextId, callerName, returnRaw)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, callerName
+End Function
+
+' Basic element operations use BiDiElementAction for both XPath and Shadow locators.
+' Executes a basic element action against an XPath locator.
+Public Function ExecuteElementActionByXPath(ByVal xpath As String, _
+                                            ByVal actionType As BiDiElementAction, _
+                                            Optional ByVal value As Variant, _
+                                            Optional ByVal searchTimeoutMs As Long = 10000, _
+                                            Optional ByVal waitNetworkIdle As Variant, _
+                                            Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                            Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                            Optional ByVal contextId As String = "", _
+                                            Optional ByVal checkUrl As Boolean = False) As Variant
+    Dim hasValue As Boolean
+    Dim actionValue As Variant
+    hasValue = Not IsMissing(value)
+    If hasValue Then actionValue = value
+
+    Dim hasWaitOverride As Boolean
+    Dim waitValue As Boolean
+    hasWaitOverride = Not IsMissing(waitNetworkIdle)
+    If hasWaitOverride Then
+        If VarType(waitNetworkIdle) <> vbBoolean Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteElementActionByXPath", _
+                      "waitNetworkIdle must be Boolean."
+        End If
+        waitValue = CBool(waitNetworkIdle)
+    End If
+
+    ExecuteElementActionByXPath = ExecuteElementActionCore( _
+        ElementLocatorXPath, xpath, actionType, hasValue, actionValue, searchTimeoutMs, _
+        hasWaitOverride, waitValue, minStableMs, maxTimeoutMs, checkUrl, contextId, _
+        "ExecuteElementActionByXPath")
+End Function
+
+' Executes the same basic element actions against a Shadow DOM locator path.
+Public Function ExecuteShadowAction(ByVal selectorPath As Variant, _
+                                    ByVal actionType As BiDiElementAction, _
+                                    Optional ByVal value As Variant, _
+                                    Optional ByVal searchTimeoutMs As Long = 10000, _
+                                    Optional ByVal waitNetworkIdle As Variant, _
+                                    Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                    Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                    Optional ByVal contextId As String = "", _
+                                    Optional ByVal checkUrl As Boolean = False, _
+                                    Optional ByVal requireUnlocker As Boolean = False) As Variant
+    Dim hasValue As Boolean
+    Dim actionValue As Variant
+    hasValue = Not IsMissing(value)
+    If hasValue Then actionValue = value
+
+    Dim hasWaitOverride As Boolean
+    Dim waitValue As Boolean
+    hasWaitOverride = Not IsMissing(waitNetworkIdle)
+    If hasWaitOverride Then
+        If VarType(waitNetworkIdle) <> vbBoolean Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteShadowAction", _
+                      "waitNetworkIdle must be Boolean."
+        End If
+        waitValue = CBool(waitNetworkIdle)
+    End If
+
+    ExecuteShadowAction = ExecuteShadowElementActionCore( _
+        selectorPath, actionType, hasValue, actionValue, searchTimeoutMs, _
+        hasWaitOverride, waitValue, minStableMs, maxTimeoutMs, checkUrl, _
+        contextId, requireUnlocker, "ExecuteShadowAction")
+End Function
+
+' Compatibility facade for Shadow DOM click.
 Public Function ExecuteShadowClick(ByVal selectorsArray As Variant, _
                                    Optional ByVal searchTimeoutMs As Long = 10000, _
                                    Optional ByVal waitNetworkIdle As Boolean = True, _
                                    Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
                                    Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                    Optional ByVal contextId As String = "", _
-                                   Optional ByVal requireUnlocker As Boolean = False) As String
-    
-    If requireUnlocker And Not m_shadowUnlockerRegistered Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteShadowClick", _
-            "Shadow Unlocker is not registered for this session. Reconnect with " & _
-            "requireShadowUnlocker:=True, or verify script.addPreloadScript support."
-    End If
+                                   Optional ByVal requireUnlocker As Boolean = False, _
+                                   Optional ByVal checkUrl As Boolean = False) As String
+    Dim noValue As Variant
+    ExecuteShadowClick = CStr(ExecuteShadowElementActionCore( _
+        selectorsArray, ElementActionClick, False, noValue, searchTimeoutMs, _
+        True, waitNetworkIdle, minStableMs, maxTimeoutMs, checkUrl, contextId, _
+        requireUnlocker, "ExecuteShadowClick", True))
+End Function
 
-    Dim vSearchTimeout As Long: vSearchTimeout = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 5000)
-    
-    Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
-    
-    Dim args As New Collection
-    args.Add BuildShadowSelectorArg(selectorsArray)
-    
-    Dim argTime As New Dictionary
-    argTime.Add "type", "number": argTime.Add "value", vSearchTimeout
-    args.Add argTime
-    
-    On Error GoTo ShadowClickFailed
-    ExecuteShadowClick = ExecuteBaseAction(targetCtx, "shadow_click", args, waitNetworkIdle, minStableMs, True, DEFAULT_STALE_RETRIES, maxTimeoutMs)
+' Compatibility facade for Shadow DOM input.
+Public Function ExecuteShadowInputValue(ByVal selectorPath As Variant, _
+                                        ByVal valueToSet As String, _
+                                        Optional ByVal searchTimeoutMs As Long = 10000, _
+                                        Optional ByVal waitNetworkIdle As Boolean = True, _
+                                        Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                        Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                        Optional ByVal contextId As String = "", _
+                                        Optional ByVal useKeyEvents As Boolean = True, _
+                                        Optional ByVal useNativeKeys As Boolean = False, _
+                                        Optional ByVal requireUnlocker As Boolean = False) As String
+    On Error GoTo Failed
+    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteShadowInputValue"
+
+    ExecuteShadowInputValue = ExecuteInputValueCore( _
+        ElementLocatorShadowPath, selectorPath, valueToSet, searchTimeoutMs, _
+        waitNetworkIdle, minStableMs, maxTimeoutMs, contextId, useKeyEvents, _
+        useNativeKeys, "ExecuteShadowInputValue")
     Exit Function
 
-ShadowClickFailed:
-    Dim shadowErrNum As Long: shadowErrNum = Err.Number
-    Dim shadowErrSrc As String: shadowErrSrc = Err.source
-    Dim shadowErrDesc As String: shadowErrDesc = Err.description
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, "ExecuteShadowInputValue"
+End Function
 
-    If Not m_shadowUnlockerRegistered And _
-       InStr(1, shadowErrDesc, "ShadowSearchError", vbTextCompare) > 0 Then
-        shadowErrDesc = shadowErrDesc & vbCrLf & _
-            "Diagnostic: Shadow Unlocker is not registered. The target may be inside a " & _
-            "closed shadow root. Open shadow roots remain accessible without the Unlocker."
+Public Function ExecuteShadowSelectValue(ByVal selectorPath As Variant, _
+                                         ByVal valueOrText As String, _
+                                         Optional ByVal selectByText As Boolean = False, _
+                                         Optional ByVal searchTimeoutMs As Long = 10000, _
+                                         Optional ByVal waitNetworkIdle As Boolean = True, _
+                                         Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                         Optional ByVal contextId As String = "", _
+                                         Optional ByVal requireUnlocker As Boolean = False) As String
+    On Error GoTo Failed
+    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteShadowSelectValue"
+
+    ExecuteShadowSelectValue = ExecuteSelectValueCore( _
+        ElementLocatorShadowPath, selectorPath, valueOrText, selectByText, _
+        searchTimeoutMs, waitNetworkIdle, maxTimeoutMs, contextId, _
+        "ExecuteShadowSelectValue")
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, _
+                             "ExecuteShadowSelectValue"
+End Function
+
+Public Function ExecuteShadowSetFiles(ByVal selectorPath As Variant, _
+                                      ByVal filePaths As Variant, _
+                                      Optional ByVal searchTimeoutMs As Long = 10000, _
+                                      Optional ByVal waitNetworkIdle As Boolean = True, _
+                                      Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                      Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                      Optional ByVal contextId As String = "", _
+                                      Optional ByVal requireUnlocker As Boolean = False) As String
+    On Error GoTo Failed
+    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteShadowSetFiles"
+
+    ExecuteShadowSetFiles = ExecuteSetFilesCore( _
+        ElementLocatorShadowPath, selectorPath, filePaths, searchTimeoutMs, _
+        waitNetworkIdle, minStableMs, maxTimeoutMs, contextId, _
+        "ExecuteShadowSetFiles")
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, _
+                             "ExecuteShadowSetFiles"
+End Function
+
+Public Function ExecuteShadowGetText(ByVal selectorPath As Variant, _
+                                     Optional ByVal searchTimeoutMs As Long = 10000, _
+                                     Optional ByVal contextId As String = "", _
+                                     Optional ByVal requireUnlocker As Boolean = False) As String
+    Dim noValue As Variant
+    ExecuteShadowGetText = CStr(ExecuteShadowElementActionCore( _
+        selectorPath, ElementActionGetText, False, noValue, searchTimeoutMs, _
+        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
+        contextId, requireUnlocker, "ExecuteShadowGetText"))
+End Function
+
+Public Function ExecuteShadowGetAttribute(ByVal selectorPath As Variant, _
+                                          ByVal attributeName As String, _
+                                          Optional ByVal searchTimeoutMs As Long = 10000, _
+                                          Optional ByVal contextId As String = "", _
+                                          Optional ByVal requireUnlocker As Boolean = False) As Variant
+    ExecuteShadowGetAttribute = ExecuteShadowElementActionCore( _
+        selectorPath, ElementActionGetAttribute, True, attributeName, searchTimeoutMs, _
+        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
+        contextId, requireUnlocker, "ExecuteShadowGetAttribute")
+End Function
+
+Public Function ExecuteShadowGetProperty(ByVal selectorPath As Variant, _
+                                         ByVal propertyName As String, _
+                                         Optional ByVal searchTimeoutMs As Long = 10000, _
+                                         Optional ByVal contextId As String = "", _
+                                         Optional ByVal requireUnlocker As Boolean = False) As Variant
+    ExecuteShadowGetProperty = ExecuteShadowElementActionCore( _
+        selectorPath, ElementActionGetProperty, True, propertyName, searchTimeoutMs, _
+        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
+        contextId, requireUnlocker, "ExecuteShadowGetProperty")
+End Function
+
+Public Function ExecuteShadowGetOuterHtml(ByVal selectorPath As Variant, _
+                                          Optional ByVal searchTimeoutMs As Long = 10000, _
+                                          Optional ByVal contextId As String = "", _
+                                          Optional ByVal requireUnlocker As Boolean = False) As String
+    Dim noValue As Variant
+    ExecuteShadowGetOuterHtml = CStr(ExecuteShadowElementActionCore( _
+        selectorPath, ElementActionGetOuterHtml, False, noValue, searchTimeoutMs, _
+        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
+        contextId, requireUnlocker, "ExecuteShadowGetOuterHtml"))
+End Function
+
+Public Function ExecuteShadowIsElementVisible(ByVal selectorPath As Variant, _
+                                              Optional ByVal searchTimeoutMs As Long = 10000, _
+                                              Optional ByVal waitNetworkIdle As Boolean = False, _
+                                              Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                              Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                              Optional ByVal contextId As String = "", _
+                                              Optional ByVal requireUnlocker As Boolean = False) As Boolean
+    Dim vSearchTimeout As Long
+    If searchTimeoutMs = 0 Then
+        vSearchTimeout = 0
+    Else
+        vSearchTimeout = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
     End If
 
-    If Len(shadowErrSrc) = 0 Then shadowErrSrc = "BiDi:ExecuteShadowClick"
-    Err.Raise shadowErrNum, shadowErrSrc, shadowErrDesc
+    Dim noValue As Variant
+    ExecuteShadowIsElementVisible = CBool(ExecuteShadowElementActionCore( _
+        selectorPath, ElementActionVisibilityCheck, False, noValue, vSearchTimeout, _
+        True, waitNetworkIdle, _
+        SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
+        SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS), _
+        False, contextId, requireUnlocker, "ExecuteShadowIsElementVisible"))
 End Function
 
 ' Lazy scrolling delegates only the scroll loop to JS; final quiescence remains the
@@ -4847,6 +5575,7 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
     If socket_ Is Nothing Then Err.Raise 91, "ExecuteBiDiCommand", "Socket object is not set."
 
     Dim retryCount As Long
+    Dim recoveryAttemptCount As Long
     Dim strRes As String
     Dim localErrNum As Long
     Dim localErrDesc As String
@@ -4918,7 +5647,8 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                 Debug.Print "BiDi [FATAL]: Socket down and auto-reconnect disabled. Aborting command retries."
                 Exit Do
             End If
-            
+
+            recoveryAttemptCount = recoveryAttemptCount + 1
             m_isRecovering = True
 
             ' F1: Wrapper recovery is a critical phase. Disable the communicator's guarded
@@ -4939,7 +5669,7 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
 
             If recoveryErr = 0 Then
                 If m_debugMode Then
-                    Debug.Print "BiDi [RECOVERY]: Attempting to refresh context (" & (retryCount + 1) & "/" & MAX_CONTEXT_RECOVERY_RETRIES & ")..."
+                    Debug.Print "BiDi [RECOVERY]: Attempting to refresh context (" & recoveryAttemptCount & "/" & MAX_CONTEXT_RECOVERY_RETRIES & ")..."
                 End If
 
                 Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
@@ -4969,6 +5699,9 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                 retryCount = retryCount + 1
             Else
                 Debug.Print "BiDi [RECOVERY FAIL]: " & recoveryErrDesc
+                If Len(recoveryErrDesc) > 0 Then
+                    localErrDesc = localErrDesc & " | Recovery failed: " & recoveryErrDesc
+                End If
                 Exit Do
             End If
         Else
@@ -4978,7 +5711,7 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
 
     Err.Raise IIf(localErrNum = 0, ERR_ACTION_FAILED, localErrNum), _
               "BiDi:ExecuteBiDiCommand", _
-              "Command '" & method & "' failed after " & retryCount & " recovery attempt(s). " & _
+              "Command '" & method & "' failed after " & recoveryAttemptCount & " recovery attempt(s). " & _
               "Last Error: " & localErrDesc
 End Function
 
@@ -5117,13 +5850,25 @@ Private Sub ResetVolatileContextState()
     m_contextLifecycleNeedsReconcile = True
 End Sub
 
-Private Function ReleaseTrackedSubscriptionsBeforeClearBestEffort() As Boolean
+Private Function ReleaseTrackedSubscriptionsBeforeClearBestEffort( _
+    Optional ByVal commandTimeoutMs As Long = 0) As Boolean
+
     ReleaseTrackedSubscriptionsBeforeClearBestEffort = True
 
-    If m_activeSubscriptions Is Nothing Then Exit Function
-    If m_activeSubscriptions.count = 0 Then Exit Function
-    If socket_ Is Nothing Then Exit Function
-    If socket_.state <> StateConnected Then Exit Function
+    If m_activeSubscriptions Is Nothing Then Set m_activeSubscriptions = New Dictionary
+    EnsureRetiredSubscriptionRegistry
+    If m_activeSubscriptions.count = 0 And m_retiredSubscriptionIds.count = 0 Then Exit Function
+
+    ' Once IDs have been issued, a disconnected socket cannot prove that the BiDi session
+    ' forgot them. Report "not confirmed" so the caller can retain deferred cleanup ownership.
+    If socket_ Is Nothing Then
+        ReleaseTrackedSubscriptionsBeforeClearBestEffort = False
+        Exit Function
+    End If
+    If socket_.state <> StateConnected Then
+        ReleaseTrackedSubscriptionsBeforeClearBestEffort = False
+        Exit Function
+    End If
 
     On Error GoTo Failed
 
@@ -5135,6 +5880,13 @@ Private Function ReleaseTrackedSubscriptionsBeforeClearBestEffort() As Boolean
 
     For Each key In m_activeSubscriptions.keys
         subId = CStr(m_activeSubscriptions(key))
+        If Len(subId) > 0 Then
+            If Not uniqueIds.Exists(subId) Then uniqueIds.Add subId, True
+        End If
+    Next key
+
+    For Each key In m_retiredSubscriptionIds.keys
+        subId = CStr(key)
         If Len(subId) > 0 Then
             If Not uniqueIds.Exists(subId) Then uniqueIds.Add subId, True
         End If
@@ -5162,29 +5914,235 @@ Private Function ReleaseTrackedSubscriptionsBeforeClearBestEffort() As Boolean
               params, _
               True, _
               allowAmbiguousRetry:=False, _
-              allowRecoveryRetry:=False)
+              allowRecoveryRetry:=False, _
+              allowContextRetarget:=False, _
+              commandTimeoutMs:=commandTimeoutMs)
 
     Call ValidateProtocolResponse(raw, "session.unsubscribe")
     Exit Function
 
 Failed:
+    Dim cleanupErrNum As Long
+    Dim cleanupErrDesc As String
+    cleanupErrNum = Err.Number
+    cleanupErrDesc = Err.description
+    Err.Clear
+
+    ' One unknown ID makes a by-ID batch invalid without removing any of the others. Fall back
+    ' to one-ID requests only for that deterministic response; each single unknown ID means the
+    ' desired absent state is already true. Do not expand ambiguous transport failures here.
+    If cleanupErrNum = ERR_BIDI_PROTOCOL And _
+       InStr(1, cleanupErrDesc, "invalid argument", vbTextCompare) > 0 Then
+        Dim fallbackIds As Variant
+        fallbackIds = uniqueIds.keys
+
+        Dim fallbackTimeoutMs As Long
+        fallbackTimeoutMs = commandTimeoutMs
+        If fallbackTimeoutMs <= 0 Then fallbackTimeoutMs = DEFAULT_COMMAND_TIMEOUT_MS
+
+        Dim fallbackFailure As String
+        Dim j As Long
+        For j = LBound(fallbackIds) To UBound(fallbackIds)
+            If Not TryReleaseDeferredSubscriptionId(CStr(fallbackIds(j)), _
+                                                     fallbackTimeoutMs, fallbackFailure) Then
+                GoTo FallbackFailed
+            End If
+        Next j
+
+        ReleaseTrackedSubscriptionsBeforeClearBestEffort = True
+        Exit Function
+    End If
+
+FallbackFailed:
     ReleaseTrackedSubscriptionsBeforeClearBestEffort = False
     If m_debugMode Then
-        Debug.Print "BiDi Warning: ClearState could not confirm remote subscription cleanup. " & _
-                    "Err " & CStr(Err.Number) & ": " & Err.description
+        Debug.Print "BiDi Warning: remote subscription cleanup was not confirmed. " & _
+                    "Err " & CStr(cleanupErrNum) & ": " & cleanupErrDesc & _
+                    IIf(Len(fallbackFailure) > 0, " | fallback=" & fallbackFailure, vbNullString)
     End If
+End Function
+
+Private Sub EnsureRetiredSubscriptionRegistry()
+    If m_retiredSubscriptionIds Is Nothing Then _
+        Set m_retiredSubscriptionIds = New Dictionary
+End Sub
+
+Private Sub EnsurePendingSubscriptionCleanupRegistry()
+    If m_pendingSubscriptionCleanupIds Is Nothing Then _
+        Set m_pendingSubscriptionCleanupIds = New Dictionary
+End Sub
+
+Private Function GetBiDiSessionIdentity(ByVal webSocketUrl As String) As String
+    ' Ports and localhost address-family spelling may vary while the WebDriver session path is
+    ' stable. Prefer the /session/... suffix so reconnect cleanup is tied to the actual session.
+    Dim value As String
+    value = Trim$(webSocketUrl)
+
+    Dim p As Long
+    p = InStr(1, value, "/session/", vbTextCompare)
+    If p > 0 Then value = Mid$(value, p)
+
+    Dim cut As Long
+    cut = InStr(1, value, "?", vbBinaryCompare)
+    If cut > 0 Then value = Left$(value, cut - 1)
+    cut = InStr(1, value, "#", vbBinaryCompare)
+    If cut > 0 Then value = Left$(value, cut - 1)
+
+    GetBiDiSessionIdentity = value
+End Function
+
+Private Sub CaptureTrackedSubscriptionsForDeferredCleanup()
+    If m_activeSubscriptions Is Nothing Then Set m_activeSubscriptions = New Dictionary
+    EnsureRetiredSubscriptionRegistry
+    If m_activeSubscriptions.count = 0 And m_retiredSubscriptionIds.count = 0 Then Exit Sub
+    If Len(m_currentSessionIdentity) = 0 Then Exit Sub
+
+    EnsurePendingSubscriptionCleanupRegistry
+
+    If m_pendingSubscriptionCleanupIds.count > 0 Then
+        If StrComp(m_pendingSubscriptionCleanupSessionIdentity, _
+                   m_currentSessionIdentity, vbBinaryCompare) <> 0 Then
+            If m_debugMode Then
+                Debug.Print "BiDi Warning: replacing deferred subscription cleanup ownership " & _
+                            "because the tracked BiDi session identity changed."
+            End If
+            Set m_pendingSubscriptionCleanupIds = New Dictionary
+        End If
+    End If
+
+    m_pendingSubscriptionCleanupSessionIdentity = m_currentSessionIdentity
+
+    Dim key As Variant
+    Dim subId As String
+    For Each key In m_activeSubscriptions.keys
+        subId = CStr(m_activeSubscriptions(key))
+        If Len(subId) > 0 Then
+            If Not m_pendingSubscriptionCleanupIds.Exists(subId) Then _
+                m_pendingSubscriptionCleanupIds.Add subId, True
+        End If
+    Next key
+
+    For Each key In m_retiredSubscriptionIds.keys
+        subId = CStr(key)
+        If Len(subId) > 0 Then
+            If Not m_pendingSubscriptionCleanupIds.Exists(subId) Then _
+                m_pendingSubscriptionCleanupIds.Add subId, True
+        End If
+    Next key
+End Sub
+
+Private Function TryReleaseDeferredSubscriptionId(ByVal subscriptionId As String, _
+                                                   ByVal commandTimeoutMs As Long, _
+                                                   ByRef failureDescription As String) As Boolean
+    failureDescription = vbNullString
+    On Error GoTo Failed
+
+    Dim ids(0 To 0) As String
+    ids(0) = subscriptionId
+
+    Dim params As New Dictionary
+    params.Add "subscriptions", ids
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand( _
+              "session.unsubscribe", _
+              params, _
+              True, _
+              allowAmbiguousRetry:=False, _
+              allowRecoveryRetry:=False, _
+              allowContextRetarget:=False, _
+              commandTimeoutMs:=commandTimeoutMs)
+
+    Dim json As Object
+    Set json = WebJsonConverter.ParseJson(raw)
+    If json Is Nothing Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:session.unsubscribe", _
+                  "session.unsubscribe returned malformed JSON during deferred cleanup."
+    End If
+
+    If json.Exists("error") Then
+        ' By-ID unsubscribe reports invalid argument when this one ID is no longer known. For a
+        ' single server-issued ID that is exactly the cleanup condition we need to establish.
+        If StrComp(LCase$(CStr(json("error"))), "invalid argument", vbBinaryCompare) = 0 Then
+            TryReleaseDeferredSubscriptionId = True
+            Exit Function
+        End If
+    End If
+
+    Call ValidateProtocolResponse(raw, "session.unsubscribe")
+    TryReleaseDeferredSubscriptionId = True
+    Exit Function
+
+Failed:
+    failureDescription = "Err " & CStr(Err.Number) & ": " & Err.description
     Err.Clear
 End Function
 
+Private Sub RecoverPendingSubscriptionCleanupOnConnect(ByVal requestedSessionIdentity As String)
+    EnsurePendingSubscriptionCleanupRegistry
+    If m_pendingSubscriptionCleanupIds.count = 0 Then Exit Sub
+
+    If StrComp(m_pendingSubscriptionCleanupSessionIdentity, _
+               requestedSessionIdentity, vbBinaryCompare) <> 0 Then
+        If m_debugMode Then
+            Debug.Print "BiDi: Deferred subscription IDs belong to a different WebDriver session; " & _
+                        "local ownership record discarded."
+        End If
+        Set m_pendingSubscriptionCleanupIds = New Dictionary
+        m_pendingSubscriptionCleanupSessionIdentity = vbNullString
+        Exit Sub
+    End If
+
+    Dim ids As Variant
+    ids = m_pendingSubscriptionCleanupIds.keys
+
+    Dim i As Long
+    Dim failure As String
+    For i = LBound(ids) To UBound(ids)
+        If TryReleaseDeferredSubscriptionId(CStr(ids(i)), 3000, failure) Then
+            If m_pendingSubscriptionCleanupIds.Exists(CStr(ids(i))) Then _
+                m_pendingSubscriptionCleanupIds.Remove CStr(ids(i))
+        Else
+            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ConnectTo", _
+                "Same-session reconnect could not confirm cleanup of deferred subscription ID " & _
+                CStr(ids(i)) & ". Start a new WebDriver session or retry ConnectTo. " & failure
+        End If
+    Next i
+
+    m_pendingSubscriptionCleanupSessionIdentity = vbNullString
+    If m_debugMode Then Debug.Print "BiDi: Deferred subscription cleanup completed on ConnectTo."
+End Sub
+
 Private Sub ClearStateCore(ByVal releaseRemoteSubscriptions As Boolean)
+    Dim subscriptionsReleased As Boolean
+    subscriptionsReleased = True
+
     If releaseRemoteSubscriptions Then
-        Call ReleaseTrackedSubscriptionsBeforeClearBestEffort
+        subscriptionsReleased = ReleaseTrackedSubscriptionsBeforeClearBestEffort()
+
+        If Not subscriptionsReleased Then
+            ' If the socket is already gone, preserve only the issued IDs for a same-session
+            ' reconnect. If it is still connected, retain the full active registry so delta
+            ' subscribe logic cannot create duplicates while cleanup remains uncertain.
+            If socket_ Is Nothing Then
+                CaptureTrackedSubscriptionsForDeferredCleanup
+                Set m_activeSubscriptions = New Dictionary
+                Set m_retiredSubscriptionIds = New Dictionary
+            ElseIf socket_.state <> StateConnected Then
+                CaptureTrackedSubscriptionsForDeferredCleanup
+                Set m_activeSubscriptions = New Dictionary
+                Set m_retiredSubscriptionIds = New Dictionary
+            End If
+        End If
     End If
 
     ResetVolatileContextState
 
     SetMainContextUnbound
-    Set m_activeSubscriptions = New Dictionary
+    If Not releaseRemoteSubscriptions Or subscriptionsReleased Then
+        Set m_activeSubscriptions = New Dictionary
+        Set m_retiredSubscriptionIds = New Dictionary
+    End If
     Set m_blockingPatterns = New Collection
 
     If Not socket_ Is Nothing Then
@@ -5231,6 +6189,9 @@ Private Sub ResetSessionBoundaryState()
 
     m_shadowUnlockerRegistered = False
     m_shadowUnlockerScriptId = vbNullString
+    m_shadowUnlockerSuppressorScriptId = vbNullString
+    m_shadowUnlockerContainmentRisk = False
+    m_lastShadowUnlockerGuardGeneration = 0#
     Set m_autoClickerScriptIds = New Dictionary
     Set m_autoClickerTimeouts = New Dictionary
     Set m_autoClickerGenerations = New Dictionary
@@ -5792,76 +6753,94 @@ End Sub
 
 ' AutoClicker uses script.addPreloadScript. addPreloadScript is state-changing and a lost
 ' response can mean that the browser installed a preload whose script ID the wrapper never learned.
-' A7 therefore makes the browser-side behavior generation-idempotent by exact XPath. Every active
-' or suppressor preload shares one globalThis registry in each new realm. Only the highest generation
-' is allowed to own the observer/click; an inert suppressor can neutralize an older untracked preload.
+' A7 makes browser-side behavior generation-idempotent. XPath and Shadow paths share the same
+' wrapper registry and preload lifecycle; only locator resolution differs inside the preload.
 Public Sub ExecuteRegisterAutoClickerByXPath(ByVal xpath As String, _
                                              Optional ByVal timeoutMs As Long = 30000)
+    ExecuteRegisterAutoClickerCore BuildAutoClickerXPathKey(xpath), timeoutMs, _
+                                   "ExecuteRegisterAutoClickerByXPath"
+End Sub
+
+Public Sub ExecuteRegisterShadowAutoClicker(ByVal selectorPath As Variant, _
+                                            Optional ByVal timeoutMs As Long = 30000, _
+                                            Optional ByVal requireUnlocker As Boolean = False)
+    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteRegisterShadowAutoClicker"
+    ExecuteRegisterAutoClickerCore _
+        BuildAutoClickerShadowKey(selectorPath, "ExecuteRegisterShadowAutoClicker"), _
+        timeoutMs, "ExecuteRegisterShadowAutoClicker"
+End Sub
+
+Private Sub ExecuteRegisterAutoClickerCore(ByVal registrationKey As String, _
+                                           ByVal timeoutMs As Long, _
+                                           ByVal callerName As String)
     Dim vTimeoutMs As Long
     vTimeoutMs = SanitizeMs(timeoutMs, "timeoutMs", 30000)
 
     EnsureAutoClickerRegistry
 
-    ' Same tracked registration is a true no-op. Do not add another browser-side preload.
-    If m_autoClickerScriptIds.Exists(xpath) Then
+    If m_autoClickerScriptIds.Exists(registrationKey) Then
         Dim existingTimeout As Long
-        existingTimeout = CLng(m_autoClickerTimeouts(xpath))
+        existingTimeout = CLng(m_autoClickerTimeouts(registrationKey))
 
         If existingTimeout = vTimeoutMs Then
             If m_debugMode Then
-                Debug.Print "BiDi: AutoClicker already registered for XPath: " & xpath & _
-                            " (ID: " & CStr(m_autoClickerScriptIds(xpath)) & ")"
+                Debug.Print "BiDi: AutoClicker already registered for " & _
+                            AutoClickerLocatorSummary(registrationKey) & _
+                            " (ID: " & CStr(m_autoClickerScriptIds(registrationKey)) & ")"
             End If
             Exit Sub
         End If
 
-        ' A timeout change remains replacement, not additive registration. First remove the known
-        ' active preload. If that cannot be confirmed, preserve the old registry and fail closed.
         Dim oldScriptId As String
-        oldScriptId = CStr(m_autoClickerScriptIds(xpath))
+        oldScriptId = CStr(m_autoClickerScriptIds(registrationKey))
 
         Dim removeErrNum As Long
         Dim removeErrSource As String
         Dim removeErrDesc As String
         If Not TryRemovePreloadScript(oldScriptId, True, removeErrNum, removeErrSource, removeErrDesc) Then
-            Err.Raise IIf(removeErrNum <> 0, removeErrNum, ERR_BIDI_PROTOCOL), _
-                      "BiDi:ExecuteRegisterAutoClickerByXPath", _
+            Dim removeRaiseNum As Long
+            removeRaiseNum = removeErrNum
+            If removeRaiseNum = 0 Then removeRaiseNum = ERR_BIDI_PROTOCOL
+
+            Err.Raise removeRaiseNum, "BiDi:" & callerName, _
                       "AutoClicker replacement aborted because the previous tracked preload script " & _
-                      "could not be confirmed removed. XPath=" & xpath & _
-                      IIf(Len(removeErrDesc) > 0, vbCrLf & removeErrDesc, vbNullString)
+                      "could not be confirmed removed. " & AutoClickerLocatorSummary(registrationKey) & _
+                      AppendErrorDescription(removeErrDesc)
         End If
 
-        RemoveTrackedAutoClickerRegistration xpath
+        RemoveTrackedAutoClickerRegistration registrationKey
 
-        ' A prior ambiguous add may have left an older untracked preload. Before attempting the new
-        ' registration, install an inert higher-generation suppressor so a failed replacement cannot
-        ' reactivate that orphan in future documents.
         Dim replacementSuppressorId As String
         Dim suppressErrNum As Long
         Dim suppressErrSource As String
         Dim suppressErrDesc As String
-        If Not TryInstallAutoClickerSuppressor(xpath, replacementSuppressorId, _
+        If Not TryInstallAutoClickerSuppressor(registrationKey, replacementSuppressorId, _
                                                suppressErrNum, suppressErrSource, suppressErrDesc) Then
-            Err.Raise IIf(suppressErrNum <> 0, suppressErrNum, ERR_BIDI_PROTOCOL), _
-                      "BiDi:ExecuteRegisterAutoClickerByXPath", _
+            Dim suppressRaiseNum As Long
+            suppressRaiseNum = suppressErrNum
+            If suppressRaiseNum = 0 Then suppressRaiseNum = ERR_BIDI_PROTOCOL
+
+            Err.Raise suppressRaiseNum, "BiDi:" & callerName, _
                       "AutoClicker replacement stopped after removing the previous tracked preload " & _
-                      "because residual-orphan containment could not be confirmed. XPath=" & xpath & _
-                      IIf(Len(suppressErrDesc) > 0, vbCrLf & suppressErrDesc, vbNullString)
+                      "because residual-orphan containment could not be confirmed. " & _
+                      AutoClickerLocatorSummary(registrationKey) & _
+                      AppendErrorDescription(suppressErrDesc)
         End If
-    ElseIf m_autoClickerContainmentRisks.Exists(xpath) Then
-        ' A prior ambiguous initial registration was not contained. Re-establish a known disabled
-        ' generation before attempting another active registration.
+    ElseIf m_autoClickerContainmentRisks.Exists(registrationKey) Then
         Dim riskSuppressorId As String
         Dim riskErrNum As Long
         Dim riskErrSource As String
         Dim riskErrDesc As String
-        If Not TryInstallAutoClickerSuppressor(xpath, riskSuppressorId, _
+        If Not TryInstallAutoClickerSuppressor(registrationKey, riskSuppressorId, _
                                                riskErrNum, riskErrSource, riskErrDesc) Then
-            Err.Raise IIf(riskErrNum <> 0, riskErrNum, ERR_BIDI_PROTOCOL), _
-                      "BiDi:ExecuteRegisterAutoClickerByXPath", _
+            Dim riskRaiseNum As Long
+            riskRaiseNum = riskErrNum
+            If riskRaiseNum = 0 Then riskRaiseNum = ERR_BIDI_PROTOCOL
+
+            Err.Raise riskRaiseNum, "BiDi:" & callerName, _
                       "AutoClicker registration blocked because a prior ambiguous preload could not " & _
-                      "be contained. XPath=" & xpath & _
-                      IIf(Len(riskErrDesc) > 0, vbCrLf & riskErrDesc, vbNullString)
+                      "be contained. " & AutoClickerLocatorSummary(registrationKey) & _
+                      AppendErrorDescription(riskErrDesc)
         End If
     End If
 
@@ -5875,13 +6854,13 @@ Public Sub ExecuteRegisterAutoClickerByXPath(ByVal xpath As String, _
     Dim addErrSource As String
     Dim addErrDesc As String
 
-    If Not TryAddAutoClickerPreload(xpath, vTimeoutMs, generation, True, scriptId, _
+    If Not TryAddAutoClickerPreload(registrationKey, vTimeoutMs, generation, True, scriptId, _
                                     addErrNum, addErrSource, addErrDesc) Then
         Dim finalDesc As String
         finalDesc = addErrDesc
 
         If IsAmbiguousDispatchFailure(addErrNum, addErrSource, addErrDesc) Then
-            LogSignalLine "[AUTOCLICKER-AMBIGUOUS] xpath=" & xpath & _
+            LogSignalLine "[AUTOCLICKER-AMBIGUOUS] " & AutoClickerSignalLocator(registrationKey) & _
                           " | generation=" & AutoClickerGenerationLiteral(generation) & _
                           " | error=" & CStr(addErrNum)
 
@@ -5890,93 +6869,191 @@ Public Sub ExecuteRegisterAutoClickerByXPath(ByVal xpath As String, _
             Dim containmentErrSource As String
             Dim containmentErrDesc As String
 
-            If TryInstallAutoClickerSuppressor(xpath, containmentId, _
+            If TryInstallAutoClickerSuppressor(registrationKey, containmentId, _
                                                containmentErrNum, containmentErrSource, containmentErrDesc) Then
                 finalDesc = finalDesc & vbCrLf & _
                             "AutoClickerAmbiguousContained: a higher-generation inert preload was " & _
                             "installed, so any untracked registration from the ambiguous dispatch " & _
                             "cannot click in future realms."
             Else
-                MarkAutoClickerContainmentRisk xpath
+                MarkAutoClickerContainmentRisk registrationKey
                 finalDesc = finalDesc & vbCrLf & _
                             "AutoClickerAmbiguousUncontained: browser-side registration state may " & _
                             "remain active because the containment preload could not be confirmed." & _
-                            IIf(Len(containmentErrDesc) > 0, vbCrLf & containmentErrDesc, vbNullString)
+                            AppendErrorDescription(containmentErrDesc)
             End If
         End If
 
-        Err.Raise IIf(addErrNum <> 0, addErrNum, ERR_BIDI_PROTOCOL), _
-                  IIf(Len(addErrSource) > 0, addErrSource, "BiDi:ExecuteRegisterAutoClickerByXPath"), _
-                  finalDesc
+        Dim addRaiseNum As Long
+        addRaiseNum = addErrNum
+        If addRaiseNum = 0 Then addRaiseNum = ERR_BIDI_PROTOCOL
+
+        Dim addRaiseSource As String
+        addRaiseSource = addErrSource
+        If Len(addRaiseSource) = 0 Then addRaiseSource = "BiDi:" & callerName
+
+        Err.Raise addRaiseNum, addRaiseSource, finalDesc
     End If
 
-    m_autoClickerScriptIds.Add xpath, scriptId
-    m_autoClickerTimeouts.Add xpath, vTimeoutMs
-    m_autoClickerGenerations.Add xpath, generation
-    If m_autoClickerContainmentRisks.Exists(xpath) Then m_autoClickerContainmentRisks.Remove xpath
+    m_autoClickerScriptIds.Add registrationKey, scriptId
+    m_autoClickerTimeouts.Add registrationKey, vTimeoutMs
+    m_autoClickerGenerations.Add registrationKey, generation
+    If m_autoClickerContainmentRisks.Exists(registrationKey) Then _
+        m_autoClickerContainmentRisks.Remove registrationKey
 
-    ' The active registration has a newer generation than any known suppressor. Removing that
-    ' suppressor reduces inert session state; failure is harmless because the lower generation
-    ' cannot override the active script.
-    BestEffortRemoveKnownAutoClickerSuppressor xpath
+    BestEffortRemoveKnownAutoClickerSuppressor registrationKey
 
     If m_debugMode Then
-        Debug.Print "BiDi: AutoClicker registered for XPath: " & xpath & _
+        Debug.Print "BiDi: AutoClicker registered for " & AutoClickerLocatorSummary(registrationKey) & _
                     " (ID: " & scriptId & ", timeoutMs=" & CStr(vTimeoutMs) & _
                     ", generation=" & AutoClickerGenerationLiteral(generation) & ")"
     End If
 End Sub
 
-' Explicitly removes the tracked AutoClicker and then installs a higher-generation inert preload.
-' The suppressor is intentionally session-scoped: an older addPreloadScript whose response was lost
-' cannot be removed by ID, so leaving the inert generation in place is the only deterministic way to
-' keep such an orphan from becoming active again in later documents.
 Public Function ExecuteUnregisterAutoClickerByXPath(ByVal xpath As String) As Boolean
+    ExecuteUnregisterAutoClickerByXPath = ExecuteUnregisterAutoClickerCore( _
+        BuildAutoClickerXPathKey(xpath), "ExecuteUnregisterAutoClickerByXPath")
+End Function
+
+Public Function ExecuteUnregisterShadowAutoClicker(ByVal selectorPath As Variant) As Boolean
+    ExecuteUnregisterShadowAutoClicker = ExecuteUnregisterAutoClickerCore( _
+        BuildAutoClickerShadowKey(selectorPath, "ExecuteUnregisterShadowAutoClicker"), _
+        "ExecuteUnregisterShadowAutoClicker")
+End Function
+
+Private Function ExecuteUnregisterAutoClickerCore(ByVal registrationKey As String, _
+                                                  ByVal callerName As String) As Boolean
     EnsureAutoClickerRegistry
 
     Dim hadTrackedRegistration As Boolean
     Dim hadContainmentRisk As Boolean
-    hadTrackedRegistration = m_autoClickerScriptIds.Exists(xpath)
-    hadContainmentRisk = m_autoClickerContainmentRisks.Exists(xpath)
+    hadTrackedRegistration = m_autoClickerScriptIds.Exists(registrationKey)
+    hadContainmentRisk = m_autoClickerContainmentRisks.Exists(registrationKey)
 
     If Not hadTrackedRegistration And Not hadContainmentRisk Then Exit Function
 
     If hadTrackedRegistration Then
         Dim scriptId As String
-        scriptId = CStr(m_autoClickerScriptIds(xpath))
+        scriptId = CStr(m_autoClickerScriptIds(registrationKey))
 
         Dim errNum As Long
         Dim errSource As String
         Dim errDesc As String
         If Not TryRemovePreloadScript(scriptId, True, errNum, errSource, errDesc) Then
-            Err.Raise IIf(errNum <> 0, errNum, ERR_BIDI_PROTOCOL), _
-                      "BiDi:ExecuteUnregisterAutoClickerByXPath", _
-                      "AutoClicker tracked preload removal could not be confirmed. XPath=" & xpath & _
-                      IIf(Len(errDesc) > 0, vbCrLf & errDesc, vbNullString)
+            Dim removeRaiseNum As Long
+            removeRaiseNum = errNum
+            If removeRaiseNum = 0 Then removeRaiseNum = ERR_BIDI_PROTOCOL
+
+            Err.Raise removeRaiseNum, "BiDi:" & callerName, _
+                      "AutoClicker tracked preload removal could not be confirmed. " & _
+                      AutoClickerLocatorSummary(registrationKey) & AppendErrorDescription(errDesc)
         End If
 
-        RemoveTrackedAutoClickerRegistration xpath
+        RemoveTrackedAutoClickerRegistration registrationKey
     End If
 
     Dim suppressorId As String
     Dim suppressErrNum As Long
     Dim suppressErrSource As String
     Dim suppressErrDesc As String
-    If Not TryInstallAutoClickerSuppressor(xpath, suppressorId, _
+    If Not TryInstallAutoClickerSuppressor(registrationKey, suppressorId, _
                                            suppressErrNum, suppressErrSource, suppressErrDesc) Then
-        MarkAutoClickerContainmentRisk xpath
-        Err.Raise IIf(suppressErrNum <> 0, suppressErrNum, ERR_BIDI_PROTOCOL), _
-                  "BiDi:ExecuteUnregisterAutoClickerByXPath", _
+        MarkAutoClickerContainmentRisk registrationKey
+
+        Dim suppressRaiseNum As Long
+        suppressRaiseNum = suppressErrNum
+        If suppressRaiseNum = 0 Then suppressRaiseNum = ERR_BIDI_PROTOCOL
+
+        Err.Raise suppressRaiseNum, "BiDi:" & callerName, _
                   "AutoClicker tracked preload was removed, but residual-orphan containment could " & _
-                  "not be confirmed. XPath=" & xpath & _
-                  IIf(Len(suppressErrDesc) > 0, vbCrLf & suppressErrDesc, vbNullString)
+                  "not be confirmed. " & AutoClickerLocatorSummary(registrationKey) & _
+                  AppendErrorDescription(suppressErrDesc)
     End If
 
-    ExecuteUnregisterAutoClickerByXPath = True
+    ExecuteUnregisterAutoClickerCore = True
 
     If m_debugMode Then
-        Debug.Print "BiDi: AutoClicker unregistered/contained for XPath: " & xpath & _
+        Debug.Print "BiDi: AutoClicker unregistered/contained for " & _
+                    AutoClickerLocatorSummary(registrationKey) & _
                     " (suppressor ID: " & suppressorId & ")"
+    End If
+End Function
+
+Private Function AppendErrorDescription(ByVal description As String) As String
+    If Len(description) > 0 Then AppendErrorDescription = vbCrLf & description
+End Function
+
+Private Function BuildAutoClickerXPathKey(ByVal xpath As String) As String
+    BuildAutoClickerXPathKey = "X|" & xpath
+End Function
+
+Private Function BuildAutoClickerShadowKey(ByVal selectorPath As Variant, _
+                                           ByVal callerName As String) As String
+    BuildAutoClickerShadowKey = "S|" & BuildShadowSelectorJson(selectorPath, callerName)
+End Function
+
+Private Function BuildShadowSelectorJson(ByVal selectorPath As Variant, _
+                                         ByVal callerName As String) As String
+    Dim result As String
+    result = "["
+
+    Dim itemCount As Long
+    Dim selector As String
+    Dim i As Long
+
+    If IsArray(selectorPath) Then
+        For i = LBound(selectorPath) To UBound(selectorPath)
+            selector = CStr(selectorPath(i))
+            ValidateShadowSelector selector, callerName
+            If itemCount > 0 Then result = result & ","
+            result = result & WebJsonConverter.ConvertToJson(selector)
+            itemCount = itemCount + 1
+        Next i
+    Else
+        selector = CStr(selectorPath)
+        ValidateShadowSelector selector, callerName
+        result = result & WebJsonConverter.ConvertToJson(selector)
+        itemCount = 1
+    End If
+
+    If itemCount = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "Shadow selector path must contain at least one selector."
+    End If
+
+    BuildShadowSelectorJson = result & "]"
+End Function
+
+Private Sub ValidateShadowSelector(ByVal selector As String, _
+                                              ByVal callerName As String)
+    If Len(selector) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "Shadow selector path contains an empty selector."
+    End If
+
+    If InStr(selector, Chr$(0)) > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "Shadow selector contains a null byte."
+    End If
+End Sub
+
+Private Function AutoClickerLocatorSummary(ByVal registrationKey As String) As String
+    If Left$(registrationKey, 2) = "X|" Then
+        AutoClickerLocatorSummary = "XPath=" & Mid$(registrationKey, 3)
+    ElseIf Left$(registrationKey, 2) = "S|" Then
+        AutoClickerLocatorSummary = "ShadowPath=" & Mid$(registrationKey, 3)
+    Else
+        AutoClickerLocatorSummary = "LocatorKey=" & registrationKey
+    End If
+End Function
+
+Private Function AutoClickerSignalLocator(ByVal registrationKey As String) As String
+    If Left$(registrationKey, 2) = "X|" Then
+        AutoClickerSignalLocator = "xpath=" & Mid$(registrationKey, 3)
+    ElseIf Left$(registrationKey, 2) = "S|" Then
+        AutoClickerSignalLocator = "shadowPath=" & Mid$(registrationKey, 3)
+    Else
+        AutoClickerSignalLocator = "locatorKey=" & registrationKey
     End If
 End Function
 
@@ -5988,15 +7065,15 @@ Private Sub EnsureAutoClickerRegistry()
     If m_autoClickerContainmentRisks Is Nothing Then Set m_autoClickerContainmentRisks = New Dictionary
 End Sub
 
-Private Sub RemoveTrackedAutoClickerRegistration(ByVal xpath As String)
-    If m_autoClickerScriptIds.Exists(xpath) Then m_autoClickerScriptIds.Remove xpath
-    If m_autoClickerTimeouts.Exists(xpath) Then m_autoClickerTimeouts.Remove xpath
-    If m_autoClickerGenerations.Exists(xpath) Then m_autoClickerGenerations.Remove xpath
+Private Sub RemoveTrackedAutoClickerRegistration(ByVal registrationKey As String)
+    If m_autoClickerScriptIds.Exists(registrationKey) Then m_autoClickerScriptIds.Remove registrationKey
+    If m_autoClickerTimeouts.Exists(registrationKey) Then m_autoClickerTimeouts.Remove registrationKey
+    If m_autoClickerGenerations.Exists(registrationKey) Then m_autoClickerGenerations.Remove registrationKey
 End Sub
 
-Private Sub MarkAutoClickerContainmentRisk(ByVal xpath As String)
-    If Not m_autoClickerContainmentRisks.Exists(xpath) Then
-        m_autoClickerContainmentRisks.Add xpath, True
+Private Sub MarkAutoClickerContainmentRisk(ByVal registrationKey As String)
+    If Not m_autoClickerContainmentRisks.Exists(registrationKey) Then
+        m_autoClickerContainmentRisks.Add registrationKey, True
     End If
 End Sub
 
@@ -6019,20 +7096,47 @@ Private Function AutoClickerGenerationLiteral(ByVal generation As Double) As Str
     AutoClickerGenerationLiteral = Format$(generation, "0")
 End Function
 
-Private Function BuildAutoClickerPreloadSource(ByVal xpath As String, _
+Private Function BuildAutoClickerPreloadSource(ByVal registrationKey As String, _
                                                ByVal timeoutMs As Long, _
                                                ByVal generation As Double, _
                                                ByVal enabled As Boolean) As String
+    Dim locatorMode As String
+    Dim locatorJson As String
+    Dim guardKeyJson As String
+
+    If Left$(registrationKey, 2) = "X|" Then
+        locatorMode = "xpath"
+        locatorJson = WebJsonConverter.ConvertToJson(Mid$(registrationKey, 3))
+        ' Keep the historical raw-XPath browser guard key so older XPath preloads remain containable.
+        guardKeyJson = locatorJson
+    ElseIf Left$(registrationKey, 2) = "S|" Then
+        locatorMode = "shadow"
+        locatorJson = Mid$(registrationKey, 3)
+        guardKeyJson = WebJsonConverter.ConvertToJson("shadow|" & locatorJson)
+    Else
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:BuildAutoClickerPreloadSource", _
+                  "Invalid AutoClicker registration key."
+    End If
+
+    Dim enabledLiteral As String
+    If enabled Then
+        enabledLiteral = "true"
+    Else
+        enabledLiteral = "false"
+    End If
+
     Dim sourceJs As String
     sourceJs = GetActionJs("autoclicker")
-    sourceJs = Replace(sourceJs, "{{XPATH}}", WebJsonConverter.ConvertToJson(xpath))
+    sourceJs = Replace(sourceJs, "{{KEY}}", guardKeyJson)
+    sourceJs = Replace(sourceJs, "{{MODE}}", WebJsonConverter.ConvertToJson(locatorMode))
+    sourceJs = Replace(sourceJs, "{{LOCATOR}}", locatorJson)
     sourceJs = Replace(sourceJs, "{{TIMEOUT}}", CStr(timeoutMs))
     sourceJs = Replace(sourceJs, "{{GENERATION}}", AutoClickerGenerationLiteral(generation))
-    sourceJs = Replace(sourceJs, "{{ENABLED}}", IIf(enabled, "true", "false"))
+    sourceJs = Replace(sourceJs, "{{ENABLED}}", enabledLiteral)
     BuildAutoClickerPreloadSource = sourceJs
 End Function
 
-Private Function TryAddAutoClickerPreload(ByVal xpath As String, _
+Private Function TryAddAutoClickerPreload(ByVal registrationKey As String, _
                                           ByVal timeoutMs As Long, _
                                           ByVal generation As Double, _
                                           ByVal enabled As Boolean, _
@@ -6049,7 +7153,7 @@ Private Function TryAddAutoClickerPreload(ByVal xpath As String, _
 
     Dim params As New Dictionary
     params.Add "functionDeclaration", _
-               BuildAutoClickerPreloadSource(xpath, timeoutMs, generation, enabled)
+               BuildAutoClickerPreloadSource(registrationKey, timeoutMs, generation, enabled)
 
     Dim strRes As String
     strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True, _
@@ -6074,7 +7178,7 @@ Failed:
     Err.Clear
 End Function
 
-Private Function TryInstallAutoClickerSuppressor(ByVal xpath As String, _
+Private Function TryInstallAutoClickerSuppressor(ByVal registrationKey As String, _
                                                  ByRef scriptId As String, _
                                                  ByRef failureNumber As Long, _
                                                  ByRef failureSource As String, _
@@ -6082,32 +7186,32 @@ Private Function TryInstallAutoClickerSuppressor(ByVal xpath As String, _
     EnsureAutoClickerRegistry
 
     Dim previousSuppressorId As String
-    If m_autoClickerSuppressorScriptIds.Exists(xpath) Then
-        previousSuppressorId = CStr(m_autoClickerSuppressorScriptIds(xpath))
+    If m_autoClickerSuppressorScriptIds.Exists(registrationKey) Then
+        previousSuppressorId = CStr(m_autoClickerSuppressorScriptIds(registrationKey))
     End If
 
     Dim generation As Double
     generation = NextAutoClickerGuardGeneration()
 
-    If Not TryAddAutoClickerPreload(xpath, 0, generation, False, scriptId, _
+    If Not TryAddAutoClickerPreload(registrationKey, 0, generation, False, scriptId, _
                                     failureNumber, failureSource, failureDescription) Then
-        MarkAutoClickerContainmentRisk xpath
-        LogSignalLine "[AUTOCLICKER-CONTAINMENT-FAILED] xpath=" & xpath & _
+        MarkAutoClickerContainmentRisk registrationKey
+        LogSignalLine "[AUTOCLICKER-CONTAINMENT-FAILED] " & _
+                      AutoClickerSignalLocator(registrationKey) & _
                       " | generation=" & AutoClickerGenerationLiteral(generation) & _
                       " | error=" & CStr(failureNumber)
         Exit Function
     End If
 
-    If m_autoClickerSuppressorScriptIds.Exists(xpath) Then
-        m_autoClickerSuppressorScriptIds(xpath) = scriptId
+    If m_autoClickerSuppressorScriptIds.Exists(registrationKey) Then
+        m_autoClickerSuppressorScriptIds(registrationKey) = scriptId
     Else
-        m_autoClickerSuppressorScriptIds.Add xpath, scriptId
+        m_autoClickerSuppressorScriptIds.Add registrationKey, scriptId
     End If
 
-    If m_autoClickerContainmentRisks.Exists(xpath) Then m_autoClickerContainmentRisks.Remove xpath
+    If m_autoClickerContainmentRisks.Exists(registrationKey) Then _
+        m_autoClickerContainmentRisks.Remove registrationKey
 
-    ' Once the newer suppressor is confirmed, an older known suppressor is redundant. Failure to
-    ' remove it is harmless because its generation is lower and therefore inert.
     If Len(previousSuppressorId) > 0 And _
        StrComp(previousSuppressorId, scriptId, vbBinaryCompare) <> 0 Then
         Dim oldErrNum As Long
@@ -6116,27 +7220,28 @@ Private Function TryInstallAutoClickerSuppressor(ByVal xpath As String, _
         Call TryRemovePreloadScript(previousSuppressorId, False, oldErrNum, oldErrSource, oldErrDesc)
     End If
 
-    LogSignalLine "[AUTOCLICKER-CONTAINED] xpath=" & xpath & _
+    LogSignalLine "[AUTOCLICKER-CONTAINED] " & AutoClickerSignalLocator(registrationKey) & _
                   " | generation=" & AutoClickerGenerationLiteral(generation) & _
                   " | suppressorId=" & scriptId
 
     TryInstallAutoClickerSuppressor = True
 End Function
 
-Private Sub BestEffortRemoveKnownAutoClickerSuppressor(ByVal xpath As String)
+Private Sub BestEffortRemoveKnownAutoClickerSuppressor(ByVal registrationKey As String)
     EnsureAutoClickerRegistry
-    If Not m_autoClickerSuppressorScriptIds.Exists(xpath) Then Exit Sub
+    If Not m_autoClickerSuppressorScriptIds.Exists(registrationKey) Then Exit Sub
 
     Dim scriptId As String
-    scriptId = CStr(m_autoClickerSuppressorScriptIds(xpath))
+    scriptId = CStr(m_autoClickerSuppressorScriptIds(registrationKey))
 
     Dim errNum As Long
     Dim errSource As String
     Dim errDesc As String
     If TryRemovePreloadScript(scriptId, False, errNum, errSource, errDesc) Then
-        m_autoClickerSuppressorScriptIds.Remove xpath
+        m_autoClickerSuppressorScriptIds.Remove registrationKey
     Else
-        LogSignalLine "[AUTOCLICKER-SUPPRESSOR-RESIDUAL] xpath=" & xpath & _
+        LogSignalLine "[AUTOCLICKER-SUPPRESSOR-RESIDUAL] " & _
+                      AutoClickerSignalLocator(registrationKey) & _
                       " | suppressorId=" & scriptId & _
                       " | error=" & CStr(errNum)
     End If
@@ -6207,25 +7312,25 @@ Private Function ReleaseAllAutoClickersBestEffort() As Long
     Next key
 
     For Each key In work.keys
-        Dim xpath As String
-        xpath = CStr(key)
+        Dim registrationKey As String
+        registrationKey = CStr(key)
 
         Dim removalFailed As Boolean
-        If m_autoClickerScriptIds.Exists(xpath) Then
+        If m_autoClickerScriptIds.Exists(registrationKey) Then
             Dim activeId As String
-            activeId = CStr(m_autoClickerScriptIds(xpath))
+            activeId = CStr(m_autoClickerScriptIds(registrationKey))
 
             Dim removeErrNum As Long
             Dim removeErrSource As String
             Dim removeErrDesc As String
             If TryRemovePreloadScript(activeId, False, removeErrNum, removeErrSource, removeErrDesc) Then
-                RemoveTrackedAutoClickerRegistration xpath
+                RemoveTrackedAutoClickerRegistration registrationKey
             Else
                 removalFailed = True
                 If m_debugMode Then
                     Debug.Print "BiDi CRITICAL: AutoClicker tracked preload cleanup could not be confirmed. " & _
-                                "XPath=" & xpath & " | ID=" & activeId & _
-                                IIf(Len(removeErrDesc) > 0, " | " & Replace(Replace(removeErrDesc, vbCr, " "), vbLf, " "), vbNullString)
+                                AutoClickerLocatorSummary(registrationKey) & " | ID=" & activeId & _
+                                AppendErrorDescription(Replace(Replace(removeErrDesc, vbCr, " "), vbLf, " "))
                 End If
             End If
         End If
@@ -6234,25 +7339,35 @@ Private Function ReleaseAllAutoClickersBestEffort() As Long
         Dim suppressErrNum As Long
         Dim suppressErrSource As String
         Dim suppressErrDesc As String
-        If Not TryInstallAutoClickerSuppressor(xpath, suppressorId, _
+        If Not TryInstallAutoClickerSuppressor(registrationKey, suppressorId, _
                                                suppressErrNum, suppressErrSource, suppressErrDesc) Then
             ReleaseAllAutoClickersBestEffort = ReleaseAllAutoClickersBestEffort + 1
         ElseIf removalFailed Then
-            ' Behavioral containment succeeded but physical cleanup of a known script did not.
-            ' Count it so shutdown diagnostics still expose residual browser-side state.
             ReleaseAllAutoClickersBestEffort = ReleaseAllAutoClickersBestEffort + 1
         End If
     Next key
 End Function
 
 Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dictionary
-    Dim values As New Collection, i As Long
+    Dim values As New Collection
+    Dim i As Long
+    Dim selector As String
+
     If IsArray(selectorsArray) Then
         For i = LBound(selectorsArray) To UBound(selectorsArray)
-            values.Add NewLocalValue("string", CStr(selectorsArray(i)))
+            selector = CStr(selectorsArray(i))
+            ValidateShadowSelector selector, "BuildShadowSelectorArg"
+            values.Add NewLocalValue("string", selector)
         Next i
     Else
-        values.Add NewLocalValue("string", CStr(selectorsArray))
+        selector = CStr(selectorsArray)
+        ValidateShadowSelector selector, "BuildShadowSelectorArg"
+        values.Add NewLocalValue("string", selector)
+    End If
+
+    If values.count = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:BuildShadowSelectorArg", _
+                  "Shadow selector path must contain at least one selector."
     End If
 
     Dim arg As New Dictionary
@@ -7244,12 +8359,14 @@ Private Function IsSpaProbeReady(ByVal probe As Dictionary) As Boolean
     If Not health.Exists("fetchWrapped") Then Exit Function
     If Not health.Exists("xhrWrapped") Then Exit Function
     If Not health.Exists("observerActive") Then Exit Function
+    If Not health.Exists("shadowObserverReady") Then Exit Function
     If Not health.Exists("inputWrapped") Then Exit Function
 
     IsSpaProbeReady = CBool(health("versionOk")) And _
                       CBool(health("fetchWrapped")) And _
                       CBool(health("xhrWrapped")) And _
                       CBool(health("observerActive")) And _
+                      CBool(health("shadowObserverReady")) And _
                       CBool(health("inputWrapped"))
     Exit Function
 
@@ -7270,7 +8387,7 @@ End Function
 
 Private Function BuildSpaProbeFalseFlags(ByVal health As Object) As String
     Dim keys As Variant
-    keys = Array("versionOk", "fetchWrapped", "xhrWrapped", "observerActive", "inputWrapped")
+    keys = Array("versionOk", "fetchWrapped", "xhrWrapped", "observerActive", "shadowObserverReady", "inputWrapped")
 
     Dim i As Long
     Dim flagText As String
@@ -7319,6 +8436,7 @@ Private Function BuildSpaProbeHealthSummary(ByVal probe As Dictionary) As String
         " | fetchWrapped=" & ProbeHealthFlagText(health, "fetchWrapped") & _
         " | xhrWrapped=" & ProbeHealthFlagText(health, "xhrWrapped") & _
         " | observerActive=" & ProbeHealthFlagText(health, "observerActive") & _
+        " | shadowObserverReady=" & ProbeHealthFlagText(health, "shadowObserverReady") & _
         " | inputWrapped=" & ProbeHealthFlagText(health, "inputWrapped") & _
         " | falseFlags=" & falseFlags
 
@@ -7526,6 +8644,53 @@ Public Sub ArmContentSignal(ByVal signalXPath As String, _
     End Select
 End Sub
 
+' Arms a rewrite signal for an existing element inside nested Shadow DOM.
+Public Sub ArmShadowContentSignal(ByVal selectorPath As Variant, _
+                                  Optional ByVal includeAttributes As Boolean = False, _
+                                  Optional ByVal contextId As String = "", _
+                                  Optional ByVal requireUnlocker As Boolean = False)
+    ValidateShadowUnlockerRequirement requireUnlocker, "ArmShadowContentSignal"
+
+    Dim targetCtx As String
+    targetCtx = ResolveSignalContextForArm(contextId, "ArmShadowContentSignal")
+
+    Dim selectorJson As String
+    selectorJson = BuildShadowSelectorJson(selectorPath, "ArmShadowContentSignal")
+
+    Dim js As String
+    js = "var p=window.__vbaIdleProbe;if(!p||!p.armShadowDomSignal)return -9;" & _
+         "return p.armShadowDomSignal(" & selectorJson & "," & _
+         LCase$(CStr(includeAttributes)) & ");"
+
+    Dim rc As Long
+    rc = InvokeProbeArm(js, targetCtx)
+
+    Select Case rc
+        Case 0
+            ClaimSignalOwner targetCtx
+            If m_sigDomArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=dom | overwrite=true (previous dom arm replaced)"
+            m_sigDomArmed = True
+            m_sigDomSeen = False
+            m_sigDomXPath = "ShadowPath=" & selectorJson
+            m_sigLostWarned = False
+            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | shadowPath=" & selectorJson & " | ctx=" & targetCtx
+        Case -1
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=not-found | shadowPath=" & selectorJson
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmShadowContentSignal", _
+                "ArmShadowContentSignal: target element not found at arm time: " & selectorJson & vbCrLf & _
+                "This method watches an EXISTING element for rewrites. To wait for an element " & _
+                "that appears only after the action, use ArmShadowVisibilitySignal instead."
+        Case -2
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=invalid-selector | shadowPath=" & selectorJson
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmShadowContentSignal", _
+                "ArmShadowContentSignal: invalid Shadow selector path: " & selectorJson
+        Case Else
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=probe-unavailable | shadowPath=" & selectorJson
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmShadowContentSignal", _
+                "ArmShadowContentSignal: SPA probe unavailable in the target context (rc=" & rc & ")."
+    End Select
+End Sub
+
 ' ArmNetworkSignal uses the shared URL-pattern syntax and matches before ignore filters.
 ' Arrival is not rendering; increase the tail or combine with a DOM signal when needed.
 Public Sub ArmNetworkSignal(ByVal urlPattern As String, _
@@ -7588,6 +8753,52 @@ Public Sub ArmVisibilitySignal(ByVal signalXPath As String, _
             LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=probe-unavailable | xpath=" & signalXPath
             Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
                 "ArmVisibilitySignal: SPA probe unavailable in the target context (rc=" & rc & ")."
+    End Select
+End Sub
+
+' Arms a visibility signal for an element that may appear later inside nested Shadow DOM.
+Public Sub ArmShadowVisibilitySignal(ByVal selectorPath As Variant, _
+                                     Optional ByVal contextId As String = "", _
+                                     Optional ByVal requireUnlocker As Boolean = False)
+    ValidateShadowUnlockerRequirement requireUnlocker, "ArmShadowVisibilitySignal"
+
+    Dim targetCtx As String
+    targetCtx = ResolveSignalContextForArm(contextId, "ArmShadowVisibilitySignal")
+
+    Dim selectorJson As String
+    selectorJson = BuildShadowSelectorJson(selectorPath, "ArmShadowVisibilitySignal")
+
+    Dim js As String
+    js = "var p=window.__vbaIdleProbe;if(!p||!p.armShadowVisSignal)return -9;" & _
+         "return p.armShadowVisSignal(" & selectorJson & ");"
+
+    Dim rc As Long
+    rc = InvokeProbeArm(js, targetCtx)
+
+    Select Case rc
+        Case 0
+            ClaimSignalOwner targetCtx
+            If m_sigVisArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=vis | overwrite=true (previous vis arm replaced)"
+            m_sigVisArmed = True
+            m_sigVisSeen = False
+            m_sigVisXPath = "ShadowPath=" & selectorJson
+            m_sigLostWarned = False
+            LogSignalLine "[SPA-SIGNAL-ARM] type=vis | shadowPath=" & selectorJson & " | ctx=" & targetCtx
+        Case -3
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=already-visible | shadowPath=" & selectorJson
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmShadowVisibilitySignal", _
+                "ArmShadowVisibilitySignal: target is ALREADY visible at arm time: " & selectorJson & vbCrLf & _
+                "Waiting for the appearance of something already visible is meaningless and " & _
+                "would open the gate instantly. To wait for this element's content to be " & _
+                "REWRITTEN, use ArmShadowContentSignal instead."
+        Case -2
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=invalid-selector | shadowPath=" & selectorJson
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmShadowVisibilitySignal", _
+                "ArmShadowVisibilitySignal: invalid Shadow selector path: " & selectorJson
+        Case Else
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=probe-unavailable | shadowPath=" & selectorJson
+            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmShadowVisibilitySignal", _
+                "ArmShadowVisibilitySignal: SPA probe unavailable in the target context (rc=" & rc & ")."
     End Select
 End Sub
 
@@ -7909,19 +9120,18 @@ End Sub
 
 ' Advisory-only postcondition check for the fast bulk-input path. Never raises into the
 ' completed action: failure to inspect is less important than preserving the original result.
-Private Sub LogInputValueMismatchBestEffort(ByVal xpath As String, _
+Private Sub LogInputValueMismatchBestEffort(ByVal locatorKind As ElementLocatorKind, _
+                                             ByVal locator As Variant, _
                                              ByVal expectedValue As String, _
                                              ByVal searchTimeoutMs As Long, _
-                                             ByVal contextId As String)
+                                             ByVal contextId As String, _
+                                             ByVal callerName As String)
     On Error Resume Next
     Err.Clear
 
-    ' Do not call ReadElementValueByXPath here: that helper uses ExecuteBaseAction, whose
-    ' top-level ResetLastSyncState would erase the synchronization result of the input action we
-    ' are diagnosing. Re-resolve the node, then perform a direct read-only CallScript instead.
     Dim postSharedId As String
-    postSharedId = ResolveXPathOrThrow(xpath, contextId, searchTimeoutMs, _
-                                       "ExecuteInputValueByXPath:postcheck")
+    postSharedId = ResolveElementSharedId( _
+        locatorKind, locator, contextId, searchTimeoutMs, callerName & ":postcheck")
 
     Dim readArgs As Collection
     Set readArgs = NewElementArgs(postSharedId, "value")
@@ -7942,10 +9152,15 @@ Private Sub LogInputValueMismatchBestEffort(ByVal xpath As String, _
 
     Dim actualText As String: actualText = CStr(actualValue)
     If StrComp(actualText, expectedValue, vbBinaryCompare) <> 0 Then
+        Dim locatorNote As String
+        If locatorKind = ElementLocatorXPath Then
+            locatorNote = " | xpath=" & CStr(locator)
+        Else
+            locatorNote = " | locator=" & ElementLocatorKindName(locatorKind)
+        End If
         LogActionDiagnosticLine "[INPUT-VALUE-MISMATCH] exactMatch=false" & _
                                 " | expectedLen=" & CStr(Len(expectedValue)) & _
-                                " | actualLen=" & CStr(Len(actualText)) & _
-                                " | xpath=" & xpath
+                                " | actualLen=" & CStr(Len(actualText)) & locatorNote
     End If
 End Sub
 
@@ -8693,7 +9908,7 @@ End Function
 ' Non-idempotent actions may duplicate user-visible or server-visible state.
 Private Function IsNonIdempotentActionKey(ByVal key As String) As Boolean
     Select Case LCase$(key)
-        Case "click", "input", "input_keys", "select", "select_text", "shadow_click"
+        Case "click", "input", "input_keys", "select", "select_text"
             IsNonIdempotentActionKey = True
     End Select
 End Function
@@ -8760,43 +9975,33 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "const e=arguments[0]; if(!e||!e.isConnected)return false; const s=window.getComputedStyle(e),r=e.getBoundingClientRect(); "
             js = js & "return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0));"
    
-        Case "shadow_click"
-            js = js & "const sels=arguments[0],tout=arguments[1],start=performance.now(); let lastS=null; "
-            js = js & "const fd=(r,s)=>{let n=r.querySelector(s);if(n)return n;for(let c of r.querySelectorAll('*')){if(c.shadowRoot&&(n=fd(c.shadowRoot,s)))return n;}return null;}; "
-            js = js & "while(performance.now()-start<tout){ hb(); let el=document; lastS=null; "
-            js = js & "for(const s of sels){el=fd(el.shadowRoot||el,s);if(!el){lastS=s;break;}} "
-            js = js & "if(el){el.scrollIntoView({block:'center'});el.focus();" & rp & "el.click();return true;} "
-            js = js & "if(performance.now()-start+100>tout)throw new Error('ShadowSearchError: Failed at ['+lastS+'] within '+tout+'ms'); "
-            js = js & "await new Promise(r=>setTimeout(r,100));} throw new Error('ShadowSearchError: Failed at ['+lastS+'] within '+tout+'ms'); "
-            
-      Case "input_keys"
+        Case "input_keys"
 
-            js = js & "try{let e=arguments[0],v=arguments[1];if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
+            js = js & "try{let e=arguments[0],v=arguments[1];const da=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement){a=a.shadowRoot.activeElement;}return a;};if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
             js = js & "e.scrollIntoView({block:'center',inline:'center'});if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');e.click();e.focus();"
-            js = js & "if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');let prev=null,stb=0;for(let t=performance.now();performance.now()-t<3000;){hb();let a=document.activeElement;"
+            js = js & "if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');let prev=null,stb=0;for(let t=performance.now();performance.now()-t<3000;){hb();let a=da();"
             js = js & "if(a&&a.isConnected&&a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type)&&typeof a.selectionStart==='number'){if(a===prev){stb++;if(stb>=2){e=a;break;}}else{prev=a;stb=1;}}else{prev=null;stb=0;}await new Promise(r=>setTimeout(r,15));}"
             js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');(e.select?e.select():document.execCommand('selectAll'));await new Promise(r=>setTimeout(r,80));document.execCommand('delete');await new Promise(r=>setTimeout(r,80));"
             js = js & "if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(e.value){if(e.select)e.select();document.execCommand('forwardDelete');await new Promise(r=>setTimeout(r,80));}if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');"
             js = js & "if(e.value){e.value='';e.dispatchEvent(new Event('input',{bubbles:true}));await new Promise(r=>setTimeout(r,80));}if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');" & rp & "await new Promise(r=>setTimeout(r,40));"
-            js = js & "for(let c of v){hb();if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');let s=(typeof e.selectionStart==='number'?e.selectionStart:0);document.execCommand('insertText',false,c);for(let k=0;k<80;k++){let a=document.activeElement;if(a&&a.isConnected&&a!==e&&a.tagName==='INPUT'&&(a.type==='text'||!a.type))e=a;if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(document.activeElement===e&&typeof e.selectionStart==='number'&&e.selectionStart>=s+1)break;await new Promise(r=>setTimeout(r,10));}}"
+            js = js & "for(let c of v){hb();if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');let s=(typeof e.selectionStart==='number'?e.selectionStart:0);document.execCommand('insertText',false,c);for(let k=0;k<80;k++){let a=da();if(a&&a.isConnected&&a!==e&&a.tagName==='INPUT'&&(a.type==='text'||!a.type))e=a;if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(da()===e&&typeof e.selectionStart==='number'&&e.selectionStart>=s+1)break;await new Promise(r=>setTimeout(r,10));}}"
             js = js & "if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(v.length>0&&(!e.value||e.value.length<v.length))throw new Error('Wiz Input Validation Failed: '+e.value);return true;}catch(err){throw err;}"
 
         Case "autoclicker"
-            ' A7: browser-side generation guard. Every duplicate preload for the same exact XPath
-            ' competes in one per-realm slot; only the highest generation may click. Suppressors
-            ' use enabled=false and therefore cancel/replace older active observers without clicking.
-            js = js & "function(){const x={{XPATH}},t={{TIMEOUT}},g={{GENERATION}},en={{ENABLED}};"
+            ' XPath and Shadow AutoClickers share one generation registry. Shadow mode observes
+            ' every open shadow root and also polls briefly so late attachShadow calls are visible.
+            js = js & "function(){const k={{KEY}},m={{MODE}},p={{LOCATOR}},t={{TIMEOUT}},g={{GENERATION}},en={{ENABLED}};"
             js = js & "const rk='__seleniumvba_bidi_autoclicker_v41',bag=globalThis[rk]||(globalThis[rk]=Object.create(null));"
-            js = js & "const p=bag[x];if(p&&Number(p.g)>=g)return;"
-            js = js & "if(p){p.cancelled=true;try{if(p.o)p.o.disconnect()}catch(_){ }try{if(p.tm)clearTimeout(p.tm)}catch(_){ }}"
-            js = js & "const s={g:g,cancelled:!en,o:null,tm:0};bag[x]=s;if(!en)return;"
-            js = js & "const own=()=>bag[x]===s&&!s.cancelled;"
-            js = js & "const f=()=>{if(!own())return 0;const e=document.evaluate(x,document,null,9,null).singleNodeValue;"
-            js = js & "if(e&&(e.offsetWidth>0||e.offsetHeight>0)){e.click();console.log('BiDi-AutoClicker: Target clicked');return 1}return 0};"
-            js = js & "setTimeout(()=>{if(!own())return;if(f())return;if(!own())return;"
-            js = js & "const o=new MutationObserver(()=>{if(!own()){o.disconnect();return}if(f()){if(s.tm)clearTimeout(s.tm);o.disconnect()}});s.o=o;"
-            js = js & "const tm=setTimeout(()=>{if(own())o.disconnect()},t);s.tm=tm;"
-            js = js & "o.observe(document.body||document,{childList:1,subtree:1,attributes:1});},0);}"
+            js = js & "const q=bag[k];if(q&&Number(q.g)>=g)return;"
+            js = js & "if(q){q.cancelled=true;try{if(q.o)q.o.disconnect()}catch(_){ }try{for(const z of(q.os||[]))z.disconnect()}catch(_){ }try{if(q.tm)clearTimeout(q.tm)}catch(_){ }try{if(q.poll)clearInterval(q.poll)}catch(_){ }}"
+            js = js & "const s={g:g,cancelled:!en,os:[],tm:0,poll:0};bag[k]=s;if(!en)return;const own=()=>bag[k]===s&&!s.cancelled;"
+            js = js & "const stop=()=>{s.cancelled=true;try{for(const z of s.os)z.disconnect()}catch(_){ }try{if(s.tm)clearTimeout(s.tm)}catch(_){ }try{if(s.poll)clearInterval(s.poll)}catch(_){ }};"
+            js = js & "const fd=(r,x)=>{let n=null;try{n=r.querySelector(String(x))}catch(_){return null}if(n)return n;let a=[];try{a=r.querySelectorAll('*')}catch(_){return null}for(const c of a){if(c.shadowRoot){n=fd(c.shadowRoot,x);if(n)return n}}return null};"
+            js = js & "const find=()=>{if(m==='xpath'){try{return document.evaluate(p,document,null,9,null).singleNodeValue}catch(_){return null}}if(!Array.isArray(p)||p.length===0)return null;let e=document;for(const x of p){e=fd(e.shadowRoot||e,x);if(!e)return null}return e};"
+            js = js & "const f=()=>{if(!own())return 0;const e=find();if(e&&e.isConnected&&(e.offsetWidth>0||e.offsetHeight>0||e.getClientRects().length>0)){e.click();console.log('BiDi-AutoClicker: Target clicked');return 1}return 0};"
+            js = js & "const seen=new WeakSet();let scan=null;const watch=r=>{if(!own()||!r||seen.has(r))return;seen.add(r);const o=new MutationObserver(()=>{if(!own()){stop();return}if(m==='shadow')scan(document);if(f())stop()});s.os.push(o);try{o.observe(r,{childList:1,subtree:1,attributes:1})}catch(_){ }};"
+            js = js & "scan=r=>{if(!own()||!r)return;watch(r);let a=[];try{a=r.querySelectorAll('*')}catch(_){return}for(const c of a){if(c.shadowRoot)scan(c.shadowRoot)}};"
+            js = js & "setTimeout(()=>{if(!own())return;if(f()){stop();return}watch(document);if(m==='shadow'){scan(document);s.poll=setInterval(()=>{if(!own()){stop();return}scan(document);if(f())stop()},100)}s.tm=setTimeout(()=>{if(own())stop()},t)},0);}"
 
         Case "lazy_scroll"
             js = js & "try{const tout=arguments[0],poll=arguments[1],start=performance.now();"
@@ -8941,26 +10146,33 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "(function(){var V=" & SPA_PROBE_VERSION & ",selectors=" & selArray & ",ignoreNetwork=" & netArray & ",p=window.__vbaIdleProbe;"
             js = js & "var proto=(typeof XMLHttpRequest==='function')?XMLHttpRequest.prototype:null;"
             js = js & "var getInputDesc=()=>{try{return Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')}catch(e){return null}};"
-            js = js & "var probeHealth=()=>{var d=getInputDesc();return{versionOk:!!p&&p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p&&!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p&&!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p&&!!p.baseObserver,inputWrapped:!!d&&(!!p&&!!p.inputSetterWrapper&&d.set===p.inputSetterWr"
+            js = js & "var probeHealth=()=>{var d=getInputDesc();return{versionOk:!!p&&p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p&&!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p&&!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p&&!!p.baseObserver,shadowObserverReady:!!p&&typeof p.observeShadowRoot==='function'&&Array.isArray(p.shadowObservers),inputWrapped:!!d&&(!!p&&!!p.inputSetterWrapper&&d.set===p.inputSetterWr"
             js = js & "apper)}};"
-            js = js & "if(p){p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';var h0=probeHealth();if(h0.versionOk&&h0.fetchWrapped&&h0.xhrWrapped&&h0.observerActive&&h0.inputWrapped){window.__vbaSpaProbeInstalled=true;return true}}"
+            js = js & "if(p){p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';var h0=probeHealth();if(h0.versionOk&&h0.fetchWrapped&&h0.xhrWrapped&&h0.observerActive&&h0.shadowObserverReady&&h0.inputWrapped){window.__vbaSpaProbeInstalled=true;return true}}"
             js = js & "var legacy=!!(window.__vbaSpaProbeInstalled&&p&&(p.version===undefined||p.version===null));"
             js = js & "p=p||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],inflightUrlCounts:new Map()};window.__vbaIdleProbe=p;window.__vbaSpaProbeInstalled=true;p.version=V;p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';"
             js = js & "if(typeof p.inflightFetchCount!=='number')p.inflightFetchCount=0;if(typeof p.inflightXhrCount!=='number')p.inflightXhrCount=0;if(typeof p.lastMutationTs!=='number')p.lastMutationTs=performance.now();if(!Array.isArray(p.changeList))p.changeList=[];"
             js = js & "if(!(p.inflightUrlCounts instanceof Map)){p.inflightUrlCounts=new Map();if(p.inflightUrls&&p.inflightUrls.forEach)p.inflightUrls.forEach((u)=>p.inflightUrlCounts.set(u,1))}"
             js = js & "p.invalidSelectors=new Set();"
-            js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath=''}"
+            js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath='';p.visKind='';p.visPath=null}"
             js = js & "var gX=function(e){if(!e||e.nodeType!==1)return '';var s=[];while(e&&e.nodeType===1){if(e.id){s.unshift('//*[@id=\''+e.id+'\']');return s.join('/')}var i=1,b=e.previousSibling;while(b){if(b.nodeType===1&&b.tagName===e.tagName)i++;b=b.previousSibling}s.unshift(e.tagName.toLowerCase()+'['+i+']');e=e.parentNode}return '/'+s.join('/')};"
             js = js & "p.vChk=function(e){if(!e||!e.isConnected)return false;var s=window.getComputedStyle(e),r=e.getBoundingClientRect();return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0))};"
+            js = js & "p.shadowResolve=function(a){if(!Array.isArray(a)||a.length===0)return null;var fd=function(r,s){var n=r.querySelector(String(s));if(n)return n;var z=r.querySelectorAll('*');for(var j=0;j<z.length;j++){var c=z[j];if(c.shadowRoot){n=fd(c.shadowRoot,s);if(n)return n}}return null};var e=document;for(var i=0;i<a.length;i++){e=fd(e.shadowRoot||e,a[i]);if(!e)return null}return e};"
             js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
-            js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visXPath=x;p.visArmed=true;p.visSeen=false;return 0};"
-            js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath=''};"
+            js = js & "p.armShadowDomSignal=function(a,b){var n;try{n=p.shadowResolve(a)}catch(e){return -2}if(!n)return -1;if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!b});return 0};"
+            js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visKind='xpath';p.visXPath=x;p.visPath=null;p.visArmed=true;p.visSeen=false;return 0};"
+            js = js & "p.armShadowVisSignal=function(a){var n=null;try{n=p.shadowResolve(a)}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visKind='shadow';p.visXPath='';p.visPath=a.slice();p.visArmed=true;p.visSeen=false;return 0};"
+            js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath='';p.visKind='';p.visPath=null};"
             js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{if(e){uT();if(p.changeList.indexOf(e)===-1&&p.changeList.length<50)p.changeList.push(e)}};p.touch=uT;p.logChange=lg;"
-            js = js & "var iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;if(!t)return 0;for(var i=0;i<s.length;i++){var x=s[i],k=String(x);if(p.invalidSelectors.has(k))continue;try{if(t.closest(x)!==null)return 1}catch(e){p.invalidSelectors.add(k)}}return 0};"
+            js = js & "var iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;if(!t)return 0;for(var i=0;i<s.length;i++){var x=s[i],k=String(x);if(p.invalidSelectors.has(k))continue;var q=t;while(q){try{if(q.closest&&q.closest(x)!==null)return 1}catch(e){p.invalidSelectors.add(k);break}var r=null;try{r=q.getRootNode?q.getRootNode():null}catch(e){}q=(r&&r.host)?r.host:null}}return 0};"
             js = js & "try{var d=getInputDesc();if(legacy&&!p.inputSetterWrapper&&d&&typeof d.set==='function'){p.inputSetterWrapper=d.set;p.inputGetterWrapper=d.get||null}else if(!(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&!p.inputOriginalSet)){var bS=(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&p.inputOriginalSet)?p.inputOriginalSet:(d&&d.set),bG=(p.inputGetterWrapper&&d&&d.get===p.inputGetterWrapper&&p.inputOrigi"
             js = js & "nalGet)?p.inputOriginalGet:(d&&d.get);if(bS&&bG){var sW=function(v){if(!iN(this,p.selectors||[]))lg('PROP:'+gX(this)+'[value]');return bS.call(this,v)},gW=function(){return bG.call(this)};Object.defineProperty(HTMLInputElement.prototype,'value',{set:sW,get:gW,configurable:true});p.inputOriginalSet=bS;p.inputOriginalGet=bG;p.inputSetterWrapper=sW;p.inputGetterWrapper=gW}}}catch(e){p.lastHealthError='input:'+String(e&&e.message||e)}"
             js = js & "try{if(p.baseObserver&&p.baseObserver.disconnect)p.baseObserver.disconnect()}catch(e){}p.baseObserver=null;"
-            js = js & "try{p.baseObserver=new MutationObserver((ms)=>{ms.forEach((m)=>{if(iN(m.target,p.selectors||[]))return;var t=(m.type==='characterData')?m.target.parentElement:m.target,path=gX(t),entry=(m.type==='attributes')?'ATTR:'+path+'['+m.attributeName+']':'DOM:'+path;lg(entry)})});p.baseObserver.observe(document,{childList:true,characterData:true,subtree:true,attributes:true})}catch(e){p.baseObserver="
+            js = js & "try{if(Array.isArray(p.shadowObservers)){for(const o of p.shadowObservers){try{o.disconnect()}catch(e){}}}}catch(e){}p.shadowObservers=[];p.shadowSeen=new WeakSet();"
+            js = js & "p.handleMutations=(ms)=>{ms.forEach((m)=>{if(!iN(m.target,p.selectors||[])){var t=(m.type==='characterData')?m.target.parentElement:m.target,path=gX(t),entry=(m.type==='attributes')?'ATTR:'+path+'['+m.attributeName+']':'DOM:'+path;lg(entry)}if(m.type==='childList'&&m.addedNodes){for(const n of m.addedNodes){if(n&&n.nodeType===1){try{if(n.shadowRoot)p.observeShadowRoot(n.shadowRoot)}catch(e){}try{p.scanShadowRoots(n)}catch(e){}}}}})};"
+            js = js & "p.scanShadowRoots=function(r){if(!r||!r.querySelectorAll)return;var a=[];try{a=r.querySelectorAll('*')}catch(e){return}for(const c of a){try{if(c.shadowRoot)p.observeShadowRoot(c.shadowRoot)}catch(e){}}};"
+            js = js & "p.observeShadowRoot=function(r){if(!r||p.shadowSeen.has(r))return false;p.shadowSeen.add(r);try{var o=new MutationObserver(p.handleMutations);o.observe(r,{childList:true,characterData:true,subtree:true,attributes:true});p.shadowObservers.push(o);p.scanShadowRoots(r);return true}catch(e){p.lastHealthError='shadow-observer:'+String(e&&e.message||e);return false}};"
+            js = js & "try{p.baseObserver=new MutationObserver(p.handleMutations);p.baseObserver.observe(document,{childList:true,characterData:true,subtree:true,attributes:true});p.scanShadowRoots(document)}catch(e){p.baseObserver="
             js = js & "null;p.lastHealthError='observer:'+String(e&&e.message||e)}"
             js = js & "var __vbaMatch=function(u,pat){u=String(u||'').toLowerCase();pat=String(pat||'').toLowerCase();if(!pat)return false;if(pat.indexOf('*')<0)return u.indexOf(pat)!==-1;var a=pat.split('*'),pos=0;for(var i=0;i<a.length;i++){var q=a[i];if(!q)continue;var n=u.indexOf(q,pos);if(n<0)return false;pos=n+q.length}return true};"
             js = js & "if(typeof window.fetch==='function'){if(legacy&&!p.fetchWrapper&&window.fetch.__vbaWrapped){p.fetchWrapper=window.fetch}else if(!(p.fetchWrapper&&window.fetch===p.fetchWrapper&&!p.fetchOriginal)){var oF=(p.fetchWrapper&&window.fetch===p.fetchWrapper&&p.fetchOriginal)?p.fetchOriginal:window.fetch;p.fetchGen=(p.fetchGen||0)+1;var myFetchGen=p.fetchGen;var fW=function(u,o){if(myFetchGen!==p.fetchGen)return oF.apply(this,arguments);var r=(typeof u==='string')?u:(u&&u.url)||'';if((p.ignoreNetwork||[]).some((pat)=>__vbaMatch(r,pat)))return oF"
@@ -8970,17 +10182,17 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "per&&p.xhrSendOriginal)?p.xhrSendOriginal:proto.send;p.xhrGen=(p.xhrGen||0)+1;var myXhrGen=p.xhrGen;var xO=function(m,u){if(myXhrGen!==p.xhrGen)return oO.apply(this,arguments);this.__vbaUrl=u;this.__vbaHooked=true;return oO.apply(this,arguments)},xS=function(){if(myXhrGen!==p.xhrGen)return oS.apply(this,arguments);var s=this,u=this.__vbaUrl||'';if((p.ignoreNetwork||[]).some((pat)=>__vbaMatch(u,pat))){s.__vbaHooked=false;return oS.apply(this,arguments)}p.inflightXhrCount++;p.inflightUrlCounts.set(u,(p.inflightUrlCounts.get(u)||0)+1);var dn=()=>{if(s.__vbaHooked){p.inflightXhrCoun"
             js = js & "t=Math.max(0,p.inflightXhrCount-1);var n=(p.inflightUrlCounts.get(u)||0)-1;if(n<=0)p.inflightUrlCounts.delete(u);else p.inflightUrlCounts.set(u,n);s.__vbaHooked=false;uT()}s.removeEventListener('loadend',dn)};this.addEventListener('loadend',dn);try{return oS.apply(this,arguments)}catch(e2){dn();throw e2}};xO.__vbaProbeGeneration=myXhrGen;xS.__vbaProbeGeneration=myXhrGen;p.xhrOpenOriginal=oO;p.xhrSendOriginal=oS;p.xhrOpenWrapper=xO;p.xhrSendWrapper=xS;proto.open=xO;proto.send=xS;pro"
             js = js & "to.__vbaWrapped=true;proto.__vbaProbeVersion=V}}"
-            js = js & "var h=probeHealth();return h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.inputWrapped})();"
+            js = js & "var h=probeHealth();return h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.shadowObserverReady&&h.inputWrapped})();"
 
         Case "query"
             ' Query reports hook-by-hook health. VBA treats any missing/mismatched field as
             ' inactive, resets the stable window, and routes through bounded probe recovery.
             js = js & "var V=" & SPA_PROBE_VERSION & ";"
-            js = js & "var p=window.__vbaIdleProbe;if(!p)return JSON.stringify({active:false,version:0,health:{versionOk:false,fetchWrapped:false,xhrWrapped:false,observerActive:false,inputWrapped:false},lastHealthError:''});"
+            js = js & "var p=window.__vbaIdleProbe;if(!p)return JSON.stringify({active:false,version:0,health:{versionOk:false,fetchWrapped:false,xhrWrapped:false,observerActive:false,shadowObserverReady:false,inputWrapped:false},lastHealthError:''});"
             js = js & "var proto=(typeof XMLHttpRequest==='function')?XMLHttpRequest.prototype:null,d=null;try{d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')}catch(e){}"
-            js = js & "var h={versionOk:p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p.baseObserver,inputWrapped:!!d&&(!!p.inputSetterWrapper&&d.set===p.inputSetterWrapper)};"
-            js = js & "var healthy=h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.inputWrapped;"
-            js = js & "if(p.visArmed&&!p.visSeen&&p.visXPath){try{var vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
+            js = js & "var h={versionOk:p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p.baseObserver,shadowObserverReady:typeof p.observeShadowRoot==='function'&&Array.isArray(p.shadowObservers),inputWrapped:!!d&&(!!p.inputSetterWrapper&&d.set===p.inputSetterWrapper)};"
+            js = js & "var healthy=h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.shadowObserverReady&&h.inputWrapped;"
+            js = js & "if(p.visArmed&&!p.visSeen){try{var vn=null;if(p.visKind==='shadow'&&p.visPath)vn=p.shadowResolve(p.visPath);else if(p.visXPath)vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
             js = js & "var res={active:healthy,version:p.version||0,health:h,lastHealthError:String(p.lastHealthError||''),now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,inflightUrls:Array.from((p.inflightUrlCounts||new Map()).keys()),invalidSelectors:Array.from(p.invalidSelectors||[]),sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};p.changeList=[];return JSON.stringify(res);"
     End Select
     GetProbeJs = js
@@ -9332,7 +10544,8 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
                                     Optional ByVal maxRetries As Long = DEFAULT_STALE_RETRIES, _
                                     Optional ByVal maxTimeout As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                     Optional ByVal checkUrl As Boolean = False, _
-                                    Optional ByVal retryXPath As String = "", _
+                                    Optional ByVal retryLocatorKind As ElementLocatorKind = ElementLocatorNone, _
+                                    Optional ByVal retryLocator As Variant, _
                                     Optional ByVal retrySearchTimeoutMs As Long = 10000, _
                                     Optional ByVal retryCallerName As String = "") As String
     ResetLastSyncState
@@ -9380,20 +10593,26 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
 
             WaitHeartbeat 500
 
-            If staleFailure And Len(retryXPath) > 0 Then
+            If staleFailure And retryLocatorKind <> ElementLocatorNone Then
                 Dim freshSharedId As String
                 Dim resolverName As String
+
+                If IsMissing(retryLocator) Then
+                    Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteBaseAction", _
+                              "Retry locator is missing for stale-element recovery."
+                End If
 
                 resolverName = retryCallerName
                 If Len(resolverName) = 0 Then resolverName = "ExecuteBaseAction"
 
-                freshSharedId = ResolveXPathOrThrow( _
-                    retryXPath, targetCtx, retrySearchTimeoutMs, resolverName)
+                freshSharedId = ResolveElementSharedId( _
+                    retryLocatorKind, retryLocator, targetCtx, retrySearchTimeoutMs, resolverName)
 
                 Set currentArgs = ReplaceFirstElementReference(currentArgs, freshSharedId)
 
                 If m_debugMode Then
-                    Debug.Print "BiDi: Stale element re-resolved from XPath: " & retryXPath
+                    Debug.Print "BiDi: Stale element re-resolved via " & _
+                                ElementLocatorKindName(retryLocatorKind) & "."
                 End If
             End If
         End If
@@ -9708,36 +10927,79 @@ Private Sub AssignValue(ByRef dic As Dictionary, ByVal key As String, ByRef val 
     End If
 End Sub
 
-Private Function ResolveXPathOrThrow(ByVal xpath As String, _
-                                     ByVal contextId As String, _
-                                     ByVal timeoutMs As Long, _
-                                     ByVal methodName As String) As String
+Private Function ElementLocatorKindName(ByVal locatorKind As ElementLocatorKind) As String
+    Select Case locatorKind
+        Case ElementLocatorXPath
+            ElementLocatorKindName = "XPath"
+        Case ElementLocatorShadowPath
+            ElementLocatorKindName = "ShadowPath"
+        Case Else
+            ElementLocatorKindName = "Unknown"
+    End Select
+End Function
+
+
+' Centralizes element lookup while keeping locator-specific logic isolated.
+Private Function ResolveElementSharedId(ByVal locatorKind As ElementLocatorKind, _
+                                        ByVal locator As Variant, _
+                                        ByVal contextId As String, _
+                                        ByVal searchTimeoutMs As Long, _
+                                        ByVal callerName As String, _
+                                        Optional ByVal required As Boolean = True) As String
+    Select Case locatorKind
+        Case ElementLocatorXPath
+            If VarType(locator) <> vbString Then
+                Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                          "XPath locator must be a String."
+            End If
+
+            ResolveElementSharedId = ResolveXPathSharedId( _
+                CStr(locator), contextId, searchTimeoutMs, callerName, required)
+
+        Case ElementLocatorShadowPath
+            ResolveElementSharedId = ResolveShadowElementSharedId( _
+                locator, contextId, searchTimeoutMs, callerName, required)
+
+        Case Else
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                      "Unsupported element locator kind: " & CStr(locatorKind)
+    End Select
+End Function
+
+Private Function ResolveXPathSharedId(ByVal xpath As String, _
+                                      ByVal contextId As String, _
+                                      ByVal timeoutMs As Long, _
+                                      ByVal methodName As String, _
+                                      Optional ByVal required As Boolean = True) As String
     Dim sid As String
     Dim targetCtx As String
-    
+
     If InStr(xpath, Chr$(0)) > 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
                   "XPath contains null byte (Chr$(0)) which would corrupt the WebSocket message. Sanitize input before calling."
     End If
+
     Dim vTimeout As Long
     If timeoutMs = 0 Then
         vTimeout = 0
     Else
         vTimeout = SanitizeMs(timeoutMs, "searchTimeoutMs", 10000)
     End If
+
     If contextId <> "" Then
         targetCtx = contextId
     Else
         targetCtx = UpdateMainContextId()
     End If
+
     sid = GetFindElementSharedIdByXPath(xpath, vTimeout, targetCtx)
-    
-    If sid = "" Then
+
+    If Len(sid) = 0 And required Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
                   "Element not found within " & IIf(vTimeout = 0, "0 (immediate)", vTimeout) & "ms for XPath: " & xpath
     End If
-    
-    ResolveXPathOrThrow = sid
+
+    ResolveXPathSharedId = sid
 End Function
 
 Private Sub PrepareProbeForAction(ByVal contextId As String)
@@ -9891,6 +11153,15 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
                     CStr(autoClickerCleanupFailures) & " AutoClicker cleanup/containment operation(s)."
     End If
 
+    ' Shadow Unlocker is also preload/browser-realm state. Remove the tracked preload, restore
+    ' Element.prototype.attachShadow in current realms, and contain any ambiguous orphan.
+    Dim shadowCleanupFailures As Long
+    shadowCleanupFailures = ReleaseGlobalShadowUnlockerBestEffort()
+    If shadowCleanupFailures > 0 And m_debugMode Then
+        Debug.Print "BiDi CRITICAL: Shutdown could not confirm " & _
+                    CStr(shadowCleanupFailures) & " Shadow Unlocker cleanup/containment operation(s)."
+    End If
+
     ' Download behavior is browser-side state and may survive wrapper/WebSocket teardown. Clear
     ' only when this wrapper attempted to change it; unrelated browser defaults remain untouched.
     ' Shutdown owns the result check so cleanup failure is not silently discarded immediately
@@ -9914,6 +11185,16 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
             End If
         End If
     End If
+
+    ' Subscriptions belong to the BiDi session, not the WebSocket transport. Use one bounded
+    ' unsubscribe while the socket is still live. If acknowledgement is lost, retain only the
+    ' issued IDs and session identity so a same-session ConnectTo must reconcile them first.
+    If Not ReleaseTrackedSubscriptionsBeforeClearBestEffort(2000) Then
+        CaptureTrackedSubscriptionsForDeferredCleanup
+        If m_debugMode Then
+            Debug.Print "BiDi Warning: Shutdown deferred subscription cleanup to the next same-session ConnectTo."
+        End If
+    End If
     
     ' ForceClose skips acknowledged CDP detach because teardown should not spend a receive
     ' timeout on a suspended browser. The tunnel dies with the BiDi socket. Graceful callers
@@ -9928,11 +11209,9 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     End If
     
     ' Order matters: drop flags before releasing collections, otherwise a guarded append
-    ' path can observe m_isRecording=True with m_recorderLogs already Nothing.
+    ' path can observe m_isRecording=True with m_recorderLogs already Nothing. Subscription
+    ' ownership has already been released or copied into the deferred-ID registry above.
     ResetSessionBoundaryState
-
-    ' Shutdown is already tearing down the transport. Keep this local-only so ForceClose does
-    ' not acquire a new command-correlation wait merely to unsubscribe event IDs.
     ClearStateCore False
 
     If ForceClose Then
@@ -9944,7 +11223,9 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     End If
 
     ' Retain the disconnected communicator so this wrapper remains reusable, as ConnectTo's
-    ' own error message promises. ForceClose and Disconnect are both idempotent.
+    ' own error message promises. ForceClose and Disconnect are both idempotent. Deferred
+    ' subscription cleanup carries its own session identity, so the active identity can be dropped.
+    m_currentSessionIdentity = vbNullString
     m_shutdownCompleted = True
     
     If m_debugMode Then Debug.Print "BiDi: Shutdown sequence completed."
@@ -10043,8 +11324,282 @@ Private Function GetHudJs(ByVal snippetType As String) As String
     End Select
 End Function
 
-' Returns the registered preload script ID. Raises on protocol or malformed-response
-' failure; failure is no longer represented by an empty string.
+Private Function NextShadowUnlockerGuardGeneration() As Double
+    ' QPC is system-wide and monotonic, so a later wrapper instance naturally supersedes any
+    ' orphaned preload from an earlier instance even after local generation state was lost.
+    Dim candidate As Double
+    candidate = Fix(socket_.nowMs() * 1000#)
+
+    If candidate <= m_lastShadowUnlockerGuardGeneration Then
+        candidate = m_lastShadowUnlockerGuardGeneration + 1#
+    End If
+
+    m_lastShadowUnlockerGuardGeneration = candidate
+    NextShadowUnlockerGuardGeneration = candidate
+End Function
+
+Private Function ShadowUnlockerGenerationLiteral(ByVal generation As Double) As String
+    ShadowUnlockerGenerationLiteral = Format$(generation, "0")
+End Function
+
+Private Function BuildShadowUnlockerPreloadSource(ByVal generation As Double, _
+                                                  ByVal enabled As Boolean) As String
+    Dim enabledLiteral As String
+    If enabled Then
+        enabledLiteral = "true"
+    Else
+        enabledLiteral = "false"
+    End If
+
+    Dim js As String
+    js = "function(){const rk=Symbol.for('seleniumvba.bidi.shadow_unlocker.v44')," & _
+         "g=" & ShadowUnlockerGenerationLiteral(generation) & ",en=" & enabledLiteral & ";"
+    js = js & "const prior=globalThis[rk];if(prior&&Number(prior.g)>=g)return;if(prior)prior.enabled=false;"
+    js = js & "if(prior&&prior.wrapper&&prior.original&&Element.prototype.attachShadow===prior.wrapper){" & _
+              "try{Element.prototype.attachShadow=prior.original}catch(_){ }}"
+    js = js & "const s={g:g,enabled:en,original:null,wrapper:null};globalThis[rk]=s;if(!en)return;"
+    js = js & "const original=Element.prototype.attachShadow;if(typeof original!=='function')return;s.original=original;"
+    js = js & "const wrapper=function(options){const next=s.enabled?Object.assign({},options||{},{mode:'open'}):options;" & _
+              "const r=Reflect.apply(original,this,[next]);" & _
+              "if(s.enabled){try{const p=globalThis.__vbaIdleProbe;if(p&&typeof p.observeShadowRoot==='function')p.observeShadowRoot(r)}catch(_){ }}" & _
+              "return r};s.wrapper=wrapper;Element.prototype.attachShadow=wrapper;}"
+
+    BuildShadowUnlockerPreloadSource = js
+End Function
+
+Private Function BuildShadowUnlockerRuntimeCleanupSource() As String
+    BuildShadowUnlockerRuntimeCleanupSource = _
+        "function(){const rk=Symbol.for('seleniumvba.bidi.shadow_unlocker.v44'),s=globalThis[rk];" & _
+        "if(!s)return false;s.enabled=false;if(s.wrapper&&s.original&&Element.prototype.attachShadow===s.wrapper){" & _
+        "try{Element.prototype.attachShadow=s.original}catch(_){return false}}return true;}"
+End Function
+
+Private Function TryAddShadowUnlockerPreload(ByVal generation As Double, _
+                                             ByVal enabled As Boolean, _
+                                             ByRef scriptId As String, _
+                                             ByRef failureNumber As Long, _
+                                             ByRef failureSource As String, _
+                                             ByRef failureDescription As String) As Boolean
+    scriptId = vbNullString
+    failureNumber = 0
+    failureSource = vbNullString
+    failureDescription = vbNullString
+
+    On Error GoTo Failed
+
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", BuildShadowUnlockerPreloadSource(generation, enabled)
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand("script.addPreloadScript", params, True, _
+                             allowAmbiguousRetry:=False, _
+                             allowContextRetarget:=False)
+
+    Dim json As Object
+    Set json = ValidateProtocolResponse(raw, "script.addPreloadScript")
+
+    scriptId = GetPathString(json, "result.script")
+    If Len(scriptId) = 0 Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:script.addPreloadScript", _
+                  "Shadow Unlocker preload registration succeeded without returning result.script."
+    End If
+
+    TryAddShadowUnlockerPreload = True
+    Exit Function
+
+Failed:
+    failureNumber = Err.Number
+    failureSource = Err.source
+    failureDescription = Err.description
+    Err.Clear
+End Function
+
+Private Function TryInstallShadowUnlockerSuppressor(ByRef scriptId As String, _
+                                                    ByRef failureNumber As Long, _
+                                                    ByRef failureSource As String, _
+                                                    ByRef failureDescription As String) As Boolean
+    Dim previousSuppressorId As String
+    previousSuppressorId = m_shadowUnlockerSuppressorScriptId
+
+    Dim generation As Double
+    generation = NextShadowUnlockerGuardGeneration()
+
+    If Not TryAddShadowUnlockerPreload(generation, False, scriptId, _
+                                       failureNumber, failureSource, failureDescription) Then
+        m_shadowUnlockerContainmentRisk = True
+        Exit Function
+    End If
+
+    m_shadowUnlockerSuppressorScriptId = scriptId
+    m_shadowUnlockerContainmentRisk = False
+
+    If Len(previousSuppressorId) > 0 And _
+       StrComp(previousSuppressorId, scriptId, vbBinaryCompare) <> 0 Then
+        Dim oldErrNum As Long
+        Dim oldErrSource As String
+        Dim oldErrDesc As String
+        Call TryRemovePreloadScript(previousSuppressorId, False, oldErrNum, oldErrSource, oldErrDesc)
+    End If
+
+    If m_debugMode Then
+        Debug.Print "BiDi: Shadow DOM Unlocker containment preload registered (ID: " & _
+                    scriptId & ", generation=" & ShadowUnlockerGenerationLiteral(generation) & ")"
+    End If
+
+    TryInstallShadowUnlockerSuppressor = True
+End Function
+
+Private Sub BestEffortRemoveKnownShadowUnlockerSuppressor()
+    If Len(m_shadowUnlockerSuppressorScriptId) = 0 Then Exit Sub
+
+    Dim scriptId As String
+    scriptId = m_shadowUnlockerSuppressorScriptId
+
+    Dim errNum As Long
+    Dim errSource As String
+    Dim errDesc As String
+    If TryRemovePreloadScript(scriptId, False, errNum, errSource, errDesc) Then
+        m_shadowUnlockerSuppressorScriptId = vbNullString
+    ElseIf m_debugMode Then
+        Debug.Print "BiDi Warning: inert Shadow Unlocker containment preload could not be removed. " & _
+                    "ID=" & scriptId & AppendErrorDescription(errDesc)
+    End If
+End Sub
+
+Private Function TryRestoreShadowUnlockerInContext(ByVal contextId As String, _
+                                                   ByRef failureDescription As String) As Boolean
+    failureDescription = vbNullString
+    On Error GoTo Failed
+
+    Dim target As New Dictionary
+    target.Add "context", contextId
+
+    Dim args As New Collection
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", BuildShadowUnlockerRuntimeCleanupSource()
+    params.Add "arguments", args
+    params.Add "target", target
+    params.Add "awaitPromise", False
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand("script.callFunction", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
+    Call ValidateProtocolResponse(raw, "script.callFunction")
+
+    TryRestoreShadowUnlockerInContext = True
+    Exit Function
+
+Failed:
+    failureDescription = "Err " & CStr(Err.Number) & ": " & Err.description
+    Err.Clear
+End Function
+
+Private Function RestoreShadowUnlockerInCurrentRealmsBestEffort() As Long
+    If socket_ Is Nothing Then Exit Function
+    If socket_.state <> StateConnected Then Exit Function
+
+    On Error GoTo TreeFailed
+
+    Dim params As New Dictionary
+    Dim raw As String
+    raw = ExecuteBiDiCommand("browsingContext.getTree", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
+
+    Dim tree As Object
+    Set tree = ValidateProtocolResponse(raw, "browsingContext.getTree")
+
+    Dim roots As Collection
+    Set roots = GetPathObject(tree, "result.contexts")
+    If roots Is Nothing Then Exit Function
+
+    Dim contexts As New Collection
+    CollectContextIdsForCleanup roots, contexts
+
+    Dim i As Long
+    Dim failure As String
+    For i = 1 To contexts.count
+        If Not TryRestoreShadowUnlockerInContext(CStr(contexts(i)), failure) Then
+            RestoreShadowUnlockerInCurrentRealmsBestEffort = _
+                RestoreShadowUnlockerInCurrentRealmsBestEffort + 1
+            If m_debugMode Then
+                Debug.Print "BiDi Warning: Shadow Unlocker runtime restoration failed for context " & _
+                            Left$(CStr(contexts(i)), 16) & "... | " & failure
+            End If
+        End If
+    Next i
+    Exit Function
+
+TreeFailed:
+    RestoreShadowUnlockerInCurrentRealmsBestEffort = 1
+    If m_debugMode Then
+        Debug.Print "BiDi Warning: Shadow Unlocker runtime restoration could not enumerate contexts. " & _
+                    "Err " & CStr(Err.Number) & ": " & Err.description
+    End If
+    Err.Clear
+End Function
+
+' Removes the tracked preload when possible, restores attachShadow in every current browsing
+' context, then leaves a higher-generation inert preload at the session boundary. This mirrors
+' the AutoClicker containment rule and covers older registrations whose response ID was lost.
+Private Function ReleaseGlobalShadowUnlockerBestEffort() As Long
+    Dim hadShadowState As Boolean
+    hadShadowState = m_shadowUnlockerRegistered Or _
+                     Len(m_shadowUnlockerScriptId) > 0 Or _
+                     Len(m_shadowUnlockerSuppressorScriptId) > 0 Or _
+                     m_shadowUnlockerContainmentRisk
+    If Not hadShadowState Then Exit Function
+
+    Dim containmentRequired As Boolean
+    containmentRequired = m_shadowUnlockerContainmentRisk
+
+    If Len(m_shadowUnlockerScriptId) > 0 Then
+        Dim removeErrNum As Long
+        Dim removeErrSource As String
+        Dim removeErrDesc As String
+        If TryRemovePreloadScript(m_shadowUnlockerScriptId, False, _
+                                  removeErrNum, removeErrSource, removeErrDesc) Then
+            m_shadowUnlockerRegistered = False
+            m_shadowUnlockerScriptId = vbNullString
+        Else
+            containmentRequired = True
+            ReleaseGlobalShadowUnlockerBestEffort = ReleaseGlobalShadowUnlockerBestEffort + 1
+            If m_debugMode Then
+                Debug.Print "BiDi CRITICAL: Shadow Unlocker tracked preload removal was not confirmed. " & _
+                            "ID=" & m_shadowUnlockerScriptId & AppendErrorDescription(removeErrDesc)
+            End If
+        End If
+    End If
+
+    Dim restoreFailures As Long
+    restoreFailures = RestoreShadowUnlockerInCurrentRealmsBestEffort()
+    ReleaseGlobalShadowUnlockerBestEffort = ReleaseGlobalShadowUnlockerBestEffort + restoreFailures
+
+    ' Always leave one newer inert generation at the session boundary, even when the tracked
+    ' active ID was removed successfully. This is deliberate hard-reset insurance for an older
+    ' addPreloadScript response that may have been lost by a previous wrapper instance.
+    Dim suppressorId As String
+    Dim suppressErrNum As Long
+    Dim suppressErrSource As String
+    Dim suppressErrDesc As String
+    If Not TryInstallShadowUnlockerSuppressor(suppressorId, suppressErrNum, _
+                                              suppressErrSource, suppressErrDesc) Then
+        ReleaseGlobalShadowUnlockerBestEffort = ReleaseGlobalShadowUnlockerBestEffort + 1
+        If m_debugMode Then
+            Debug.Print "BiDi CRITICAL: Shadow Unlocker session-boundary containment could not be confirmed." & _
+                        AppendErrorDescription(suppressErrDesc)
+        End If
+    ElseIf containmentRequired And m_debugMode Then
+        Debug.Print "BiDi: Shadow Unlocker ambiguous residual state contained for future realms."
+    End If
+End Function
+
+' Returns the registered preload script ID. Raises on protocol or malformed-response failure.
 Public Function ExecuteEnableGlobalShadowUnlocker() As String
     If m_shadowUnlockerRegistered And Len(m_shadowUnlockerScriptId) > 0 Then
         ExecuteEnableGlobalShadowUnlocker = m_shadowUnlockerScriptId
@@ -10059,41 +11614,80 @@ Public Function ExecuteEnableGlobalShadowUnlocker() As String
         m_shadowUnlockerRegistered = False
         m_shadowUnlockerScriptId = vbNullString
     End If
-    Dim params As New Dictionary, js As String
-    
-    ' The attachShadow hook forces mode:'open' while preserving other options; dropping
-    ' slotAssignment or delegatesFocus can break components.
-    js = "function() { "
-    js = js & "if (Element.prototype._attachShadow) return; "
-    js = js & "Element.prototype._attachShadow = Element.prototype.attachShadow; "
-    js = js & "Element.prototype.attachShadow = function(options) { "
-    js = js & "  return this._attachShadow(Object.assign({}, options || {}, { mode: 'open' })); "
-    js = js & "}; }"
-    
-    params.Add "functionDeclaration", js
 
-    Dim strRes As String
-    strRes = ExecuteBiDiCommand("script.addPreloadScript", params, True, _
-                               allowAmbiguousRetry:=False)
-
-    Dim json As Object
-    Set json = ValidateProtocolResponse(strRes, "script.addPreloadScript")
-
-    Dim scriptId As String
-    scriptId = GetPathString(json, "result.script")
-    If Len(scriptId) = 0 Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:script.addPreloadScript", _
-            "script.addPreloadScript succeeded without returning result.script."
+    ' A prior ambiguous add must first be covered by a newer inert generation. If containment
+    ' cannot be established, do not stack another state-changing preload on top of uncertainty.
+    If m_shadowUnlockerContainmentRisk Then
+        Dim riskSuppressorId As String
+        Dim riskErrNum As Long
+        Dim riskErrSource As String
+        Dim riskErrDesc As String
+        If Not TryInstallShadowUnlockerSuppressor(riskSuppressorId, riskErrNum, _
+                                                  riskErrSource, riskErrDesc) Then
+            Dim riskRaiseNum As Long
+            riskRaiseNum = riskErrNum
+            If riskRaiseNum = 0 Then riskRaiseNum = ERR_BIDI_PROTOCOL
+            Err.Raise riskRaiseNum, "BiDi:ExecuteEnableGlobalShadowUnlocker", _
+                      "Shadow Unlocker registration blocked because a prior ambiguous preload " & _
+                      "could not be contained." & AppendErrorDescription(riskErrDesc)
+        End If
     End If
 
-    ' Commit capability state only after full response validation. A later failed duplicate
-    ' registration must not erase a preload script that is already active in this session.
+    Dim generation As Double
+    generation = NextShadowUnlockerGuardGeneration()
+
+    Dim scriptId As String
+    Dim addErrNum As Long
+    Dim addErrSource As String
+    Dim addErrDesc As String
+    If Not TryAddShadowUnlockerPreload(generation, True, scriptId, _
+                                       addErrNum, addErrSource, addErrDesc) Then
+        Dim finalDesc As String
+        finalDesc = addErrDesc
+
+        If IsAmbiguousDispatchFailure(addErrNum, addErrSource, addErrDesc) Then
+            m_shadowUnlockerContainmentRisk = True
+
+            Dim containmentId As String
+            Dim containmentErrNum As Long
+            Dim containmentErrSource As String
+            Dim containmentErrDesc As String
+            If TryInstallShadowUnlockerSuppressor(containmentId, containmentErrNum, _
+                                                  containmentErrSource, containmentErrDesc) Then
+                finalDesc = finalDesc & vbCrLf & _
+                            "ShadowUnlockerAmbiguousContained: a higher-generation inert preload " & _
+                            "was installed, so any untracked registration cannot alter attachShadow " & _
+                            "in future realms."
+            Else
+                finalDesc = finalDesc & vbCrLf & _
+                            "ShadowUnlockerAmbiguousUncontained: browser-side preload state may " & _
+                            "remain active." & AppendErrorDescription(containmentErrDesc)
+            End If
+        End If
+
+        Dim addRaiseNum As Long
+        addRaiseNum = addErrNum
+        If addRaiseNum = 0 Then addRaiseNum = ERR_BIDI_PROTOCOL
+
+        Dim addRaiseSource As String
+        addRaiseSource = addErrSource
+        If Len(addRaiseSource) = 0 Then addRaiseSource = "BiDi:ExecuteEnableGlobalShadowUnlocker"
+
+        Err.Raise addRaiseNum, addRaiseSource, finalDesc
+    End If
+
     m_shadowUnlockerRegistered = True
     m_shadowUnlockerScriptId = scriptId
+    m_shadowUnlockerContainmentRisk = False
     ExecuteEnableGlobalShadowUnlocker = scriptId
+
+    ' A successful higher generation supersedes a previous containment preload in every future
+    ' realm, so removing the known inert preload is only resource cleanup, not a correctness gate.
+    BestEffortRemoveKnownShadowUnlockerSuppressor
     
     If m_debugMode Then
-        Debug.Print "BiDi: Global Shadow DOM Unlocker registered (ID: " & scriptId & ")"
+        Debug.Print "BiDi: Global Shadow DOM Unlocker registered (ID: " & scriptId & _
+                    ", generation=" & ShadowUnlockerGenerationLiteral(generation) & ")"
     End If
 End Function
 
@@ -10220,8 +11814,18 @@ Public Property Get AutoClickerRegistrationCount() As Long
 End Property
 Public Function GetAutoClickerScriptIdByXPath(ByVal xpath As String) As String
     EnsureAutoClickerRegistry
-    If m_autoClickerScriptIds.Exists(xpath) Then
-        GetAutoClickerScriptIdByXPath = CStr(m_autoClickerScriptIds(xpath))
+    Dim registrationKey As String
+    registrationKey = BuildAutoClickerXPathKey(xpath)
+    If m_autoClickerScriptIds.Exists(registrationKey) Then
+        GetAutoClickerScriptIdByXPath = CStr(m_autoClickerScriptIds(registrationKey))
+    End If
+End Function
+Public Function GetShadowAutoClickerScriptId(ByVal selectorPath As Variant) As String
+    EnsureAutoClickerRegistry
+    Dim registrationKey As String
+    registrationKey = BuildAutoClickerShadowKey(selectorPath, "GetShadowAutoClickerScriptId")
+    If m_autoClickerScriptIds.Exists(registrationKey) Then
+        GetShadowAutoClickerScriptId = CStr(m_autoClickerScriptIds(registrationKey))
     End If
 End Function
 Public Property Get LastSyncAttempted() As Boolean
@@ -10456,7 +12060,9 @@ Public Sub ExecuteWizSelectDropdown(ByVal triggerXPath As String, _
                                     Optional ByVal contextId As String = "")
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
 
-    Call Me.ExecuteClickByXPath(triggerXPath, searchTimeoutMs, False, , maxTimeoutMs, targetCtx)
+    Call Me.ExecuteElementActionByXPath( _
+        triggerXPath, ElementActionClick, searchTimeoutMs:=searchTimeoutMs, _
+        waitNetworkIdle:=False, maxTimeoutMs:=maxTimeoutMs, contextId:=targetCtx)
 
     Call ExecuteUniqueVisibleRoleOptionClick( _
         targetCtx, optionText, searchTimeoutMs, True, maxTimeoutMs, _
