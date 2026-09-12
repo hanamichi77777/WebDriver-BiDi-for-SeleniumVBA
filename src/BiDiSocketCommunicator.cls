@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "4.5"
+Private Const BIDI_SOCKET_VERSION As String = "4.6"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -276,6 +276,7 @@ Private Const WS_DEFAULT_MAX_PUMP_MS As Long = 10
 Private Const WS_DEFAULT_MAX_PUMP_BYTES As Long = 262144
 Private Const WS_DEFAULT_MAX_PUMP_CALLS As Long = 16
 Private Const WS_RECEIVE_CHUNK_SIZE As Long = 16384
+Private Const WS_FAST_DISCARD_CHUNK_SIZE As Long = 262144
 Private Const WS_PARSER_COPY_CHUNK_SIZE As Long = 4096
 Private Const WS_PARSER_COPY_GUARD_MS As Double = 1#
 Private Const WS_MAX_COMPLETED_MESSAGES_PER_PUMP As Long = 8
@@ -386,6 +387,7 @@ Private m_ws_messageDiagnosticPrefixCount As Long
 Private m_ws_messageIdentityResolved As Boolean
 Private m_ws_messageKnownAsyncEvent As Boolean
 Private m_ws_messageEarlyParsedOversizeDrop As Boolean
+Private m_ws_fastDiscardBuffer() As Byte
 Private m_ws_fragmentReservationDeferred As Boolean
 Private m_ws_pendingUtf8Rejection As Boolean
 Private m_ws_pendingUtf8RejectionText As String
@@ -3831,6 +3833,109 @@ Private Sub WsPumpSendInternal(ByVal pumpDeadline As Double, _
     Loop
 End Sub
 
+Private Function WsCanFastDrainDiscardedPayload() As Boolean
+    If m_ws_frameState <> WsFrameReadPayload Then Exit Function
+    If m_ws_framePayloadRemaining <= 0 Then Exit Function
+    If m_ws_frameOpcode >= WS_OPCODE_CLOSE Then Exit Function
+
+    ' Direct recv is safe only after all already-buffered bytes for this frame were consumed.
+    If WsRawAvailable > 0 Then Exit Function
+
+    If m_ws_messageOversized Then
+        ' Preserve the same bounded identity evidence used by the normal oversized-message path.
+        If m_ws_messageDiagnosticPrefixCount < OVERSIZED_DIAGNOSTIC_PREFIX_BYTES Then Exit Function
+        WsCanFastDrainDiscardedPayload = True
+        Exit Function
+    End If
+
+    If m_ws_messageEarlyParsedOversizeDrop Then
+        WsCanFastDrainDiscardedPayload = True
+    End If
+End Function
+
+Private Sub WsEnsureFastDiscardBuffer()
+    On Error GoTo Failed
+
+    If WsByteArrayCapacity(m_ws_fastDiscardBuffer) >= WS_FAST_DISCARD_CHUNK_SIZE Then Exit Sub
+    ReDim m_ws_fastDiscardBuffer(0 To WS_FAST_DISCARD_CHUNK_SIZE - 1)
+    Exit Sub
+
+Failed:
+    WsSetFailure 9241, "Unable to allocate fast-discard receive buffer."
+End Sub
+
+Private Sub WsFastDrainDiscardedPayload(ByVal pumpDeadline As Double, _
+                                        ByVal maxBytes As Long, _
+                                        ByVal maxCalls As Long, _
+                                        ByRef receivedBytes As Long, _
+                                        ByRef callCount As Long, _
+                                        ByRef stopReceiveLoop As Boolean)
+    If Not WsCanFastDrainDiscardedPayload Then Exit Sub
+
+    WsEnsureFastDiscardBuffer
+    If m_ws_state = WsTransportFailed Then
+        stopReceiveLoop = True
+        Exit Sub
+    End If
+
+    Do While callCount < maxCalls And receivedBytes < maxBytes
+        If WsMonotonicMs() >= pumpDeadline Then Exit Do
+        If m_ws_framePayloadRemaining <= 0 Then Exit Do
+
+        Dim allowed As Long
+        allowed = m_ws_framePayloadRemaining
+        If allowed > WS_FAST_DISCARD_CHUNK_SIZE Then _
+            allowed = WS_FAST_DISCARD_CHUNK_SIZE
+        If allowed > (maxBytes - receivedBytes) Then _
+            allowed = maxBytes - receivedBytes
+        If allowed <= 0 Then Exit Do
+
+        Dim result As Long
+        result = WsApi_recvSocket(m_ws_socket, m_ws_fastDiscardBuffer(0), allowed, 0)
+        callCount = callCount + 1
+
+        If result > 0 Then
+            receivedBytes = receivedBytes + result
+            m_ws_framePayloadRemaining = m_ws_framePayloadRemaining - result
+            m_ws_messageObservedBytes = m_ws_messageObservedBytes + CDbl(result)
+
+            If m_ws_framePayloadRemaining = 0 Then
+                m_ws_frameState = WsFrameFinalize
+                Exit Do
+            End If
+
+        ElseIf result = 0 Then
+            If m_ws_state = WsTransportClosing Then
+                WsForceClose
+            Else
+                WsSetFailure 9207, "Peer closed the socket."
+            End If
+            stopReceiveLoop = True
+            Exit Do
+
+        Else
+            Dim socketError As Long
+            socketError = WsApi_WSAGetLastError()
+
+            If socketError = WS_WSAEWOULDBLOCK Then
+                stopReceiveLoop = True
+                Exit Do
+            End If
+
+            If socketError = WS_WSAECONNRESET Or _
+               socketError = WS_WSAECONNABORTED Or _
+               socketError = WS_WSAENOTCONN Then
+                WsSetFailure socketError, "Connection lost during fast discard recv."
+            Else
+                WsSetFailure socketError, "fast discard recv failed."
+            End If
+
+            stopReceiveLoop = True
+            Exit Do
+        End If
+    Loop
+End Sub
+
 Private Sub WsPumpReceiveInternal(ByVal pumpDeadline As Double, _
                                 ByVal copyGuardDeadline As Double, _
                                 ByVal maxBytes As Long, _
@@ -3887,6 +3992,23 @@ Private Sub WsPumpReceiveInternal(ByVal pumpDeadline As Double, _
                 If identityBytesNeeded > 0 And allowed > identityBytesNeeded Then _
                     allowed = identityBytesNeeded
             End If
+        End If
+
+        If parseFrames And WsCanFastDrainDiscardedPayload Then
+            Dim stopFastReceive As Boolean
+            WsFastDrainDiscardedPayload pumpDeadline, maxBytes, maxCalls, _
+                                        receivedBytes, callCount, stopFastReceive
+            If m_ws_state = WsTransportFailed Then Exit Do
+
+            If m_ws_frameState = WsFrameFinalize And _
+               WsMonotonicMs() < pumpDeadline Then
+                WsParseAvailableFrames pumpDeadline, copyGuardDeadline
+                If m_ws_pendingUtf8Rejection Then Exit Do
+                If m_ws_state = WsTransportFailed Then Exit Do
+            End If
+
+            If stopFastReceive Then Exit Do
+            GoTo ContinueReceiveLoop
         End If
 
         If allowed <= 0 Then Exit Do

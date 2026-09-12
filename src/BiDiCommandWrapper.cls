@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.5"
+Private Const BIDI_WRAPPER_VERSION As String = "4.6"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -146,6 +146,12 @@ Private Const NAVIGATION_INTERACTIVE_TRANSPORT_FLOOR_MS As Long = 60000
 Private Const COMMAND_CORRELATION_TIMEOUT_MARGIN_MS As Long = 5000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
 Private Const SHORT_WAIT_MS As Long = 500
+
+' Internal non-blocking drains are fairness slices, not full FIFO flushes. Remaining events
+' stay queued for later passes; no event is discarded by these limits.
+Private Const NONBLOCKING_DRAIN_MAX_MESSAGES As Long = 32
+Private Const NONBLOCKING_DRAIN_BUDGET_MS As Long = 250
+
 ' Discovery Log ring-buffer limit.
 Private Const MAX_LOG_SIZE As Long = 5000
 ' Manual Discovery DOM sampling uses the existing SPA probe. Keep the normal cadence aligned
@@ -180,6 +186,9 @@ Private m_discoveryDomCaptureEnabled As Boolean ' manual Discovery: poll SPA pro
 Private m_discoveryManualPumpActive As Boolean  ' True only inside RecordEventsForSeconds
 Private m_discoveryDomContextId As String       ' current top-level context used by manual DOM sampling
 Private m_nextDiscoveryDomPollMs As Double      ' nowMs deadline; 0 = sample on next recorder pump
+' Recorder-owned responseCompleted is subscribed independently so it can be paused only during
+' URL-stability polling without disturbing request/lifecycle recording.
+Private m_recorderResponseCompletedSubscriptionId As String
 ' beforeRequestSent is recorder-only; no latency pairing is retained.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_recSuppOverflowCount As Long      ' suppressed events not keyed after the key cap
@@ -680,6 +689,12 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
             HandleNavigationResponseStartedEvent json
 
         Case "network.responseCompleted", "network.fetchError"
+            ' responseCompleted carries the same correlated navigation/response fields needed by
+            ' the one-shot HTTP-status capture. This permits early release of responseStarted.
+            If method = "network.responseCompleted" Then
+                HandleNavigationResponseStartedEvent json
+            End If
+
             ' Network-signal matching runs on every responseCompleted before noise filtering;
             ' an ignored endpoint may still be an explicitly armed completion signal.
             If method = "network.responseCompleted" And m_sigNetArmed And Not m_sigNetSeen Then
@@ -2587,16 +2602,13 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     Const METHOD_NAME As String = "ExecuteNavigateAndGetStatus"
     Const MAX_NAV_RETRIES As Long = 2
 
-    ' N6: Treat this whole navigation transaction as exclusive. Even navigate-only mode must not
-    ' re-enter while another one-shot capture owns class state, and it must not run inside an active
-    ' navigation-status capture whose expected navigation ID could otherwise be rebound.
+    ' Treat the whole navigation transaction as exclusive so one-shot capture state cannot be
+    ' rebound by nested navigation work.
     Dim exclusiveCaptureEntered As Boolean
     EnterExclusiveCaptureOperation METHOD_NAME
     exclusiveCaptureEntered = True
     On Error GoTo Failed
 
-    ' After acquiring exclusive ownership, a True flag can only be stale state from an abnormal
-    ' host interruption; no live navigation-status transaction can coexist with this owner.
     If m_navHttpCaptureInProgress Then
         Err.Raise ERR_REENTRANT_CAPTURE, "BiDi:" & METHOD_NAME, _
                   "ReentrantNavigationStatusBlocked: navigation HTTP-status capture state is already active."
@@ -2613,22 +2625,37 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     targetCtx = ResolveTargetContext(contextId)
 
     If requireHttpStatus Then
-        ' N1: responseStarted is transaction-scoped unless another owner already subscribed it.
-        ' Only a subscription created here is released during Cleanup.
+        ' responseStarted is transaction-scoped unless another owner already subscribed it.
         AcquireNavigationResponseStartedSubscription temporaryResponseStartedSubscriptionId
 
-        ' responseStarted carries response.status and the navigation id. Drain stale events before
-        ' arming so only events after the arm boundary can satisfy this transaction.
+        ' Drain stale events before arming so only events after the arm boundary can satisfy this
+        ' transaction.
         ProcessRecorderQueue
         ArmNavigationHttpCapture targetCtx
     Else
-        ' N2: navigate-only mode performs the existing navigation + optional SPA settlement without
-        ' creating any responseStarted subscription and without fabricating an HTTP status.
         ResetNavigationHttpCaptureState
     End If
 
+    Dim responseCompletedAvailableForStatus As Boolean
+    Dim deferSettlementForEarlyResponseStartedRelease As Boolean
+    Dim recorderResponseCompletedPaused As Boolean
+    Dim recorderResponseCompletedReleasedId As String
+
+    If Not (m_activeSubscriptions Is Nothing) Then
+        responseCompletedAvailableForStatus = _
+            m_activeSubscriptions.Exists("network.responseCompleted")
+    End If
+
+    ' If this transaction created responseStarted and responseCompleted is already available, the
+    ' protocol-level navigation can stop at interactive. Settlement is then performed explicitly
+    ' after responseStarted is released, avoiding duplicate network event payloads during the wait.
+    deferSettlementForEarlyResponseStartedRelease = _
+        (waitNetworkIdle And requireHttpStatus And _
+         Len(temporaryResponseStartedSubscriptionId) > 0 And _
+         responseCompletedAvailableForStatus)
+
     Dim modeStr As String
-    If waitNetworkIdle Then
+    If waitNetworkIdle And Not deferSettlementForEarlyResponseStartedRelease Then
         modeStr = "complete"
     Else
         modeStr = "none"
@@ -2660,19 +2687,19 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
             Exit For
         End If
 
-        ' N7: Chromium can reject the original browsingContext.navigate after the page itself
-        ' starts another navigation. Re-sending targetUrl would create a real duplicate navigation.
-        ' Instead, prove a successor navigationStarted event in this context and adopt it.
+        ' Chromium can reject the original browsingContext.navigate after the page itself starts
+        ' another navigation. Adopt a proven successor instead of re-sending the target URL.
         If IsConcurrentNavigationSupersession(navErr, navSrc, navDesc) Then
-            If TryAdoptConcurrentNavigation(targetCtx, targetUrl, waitNetworkIdle, vMinStable, vMaxTimeout) Then
+            If TryAdoptConcurrentNavigation( _
+                   targetCtx, targetUrl, _
+                   (waitNetworkIdle And Not deferSettlementForEarlyResponseStartedRelease), _
+                   vMinStable, vMaxTimeout) Then
                 navigationAccepted = True
                 navigationAcceptedViaSupersession = True
                 Exit For
             End If
         End If
 
-        ' Preserve the existing ordinary-navigation retry policy. A retry happens only for the
-        ' explicitly classified Chromium network errors; ambiguous/post-commit failures stop.
         If IsRetryableNavFailure(navDesc) And attempt < MAX_NAV_RETRIES Then
             WaitHeartbeat 1000
         Else
@@ -2687,6 +2714,44 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         Err.Raise navErr, navSrc, navDesc
     End If
 
+    If deferSettlementForEarlyResponseStartedRelease Then
+        ' The browser has reached interactive. Release only the responseStarted subscription owned
+        ' by this transaction; responseCompleted remains available for status capture.
+        ReleaseNavigationResponseStartedSubscriptionBestEffort _
+            temporaryResponseStartedSubscriptionId
+
+        If Not (m_activeSubscriptions Is Nothing) Then
+            If Not m_activeSubscriptions.Exists("network.responseStarted") Then
+                temporaryResponseStartedSubscriptionId = vbNullString
+            End If
+        End If
+
+        ' Prime already-buffered main-document response events before pausing responseCompleted.
+        ' The bounded drain prevents a large event burst from monopolizing the VBA thread.
+        DrainNonBlockingRecorderQueue
+
+        If IsFinalNavigationStatusReadyForPause() Then
+            recorderResponseCompletedPaused = _
+                PauseRecorderResponseCompletedBestEffort( _
+                    recorderResponseCompletedReleasedId)
+        End If
+
+        If recorderResponseCompletedPaused Then
+            SettleAfterNavigationWithResponseCompletedPause _
+                targetCtx, vMinStable, vMaxTimeout, recorderResponseCompletedPaused
+        Else
+            SettleAfterNavigation targetCtx, vMinStable, vMaxTimeout
+        End If
+
+        ' Defensive fallback: the settlement helper normally restores before SPA idle begins.
+        If recorderResponseCompletedPaused Then
+            If RestoreRecorderResponseCompletedBestEffort(True) Then
+                recorderResponseCompletedPaused = False
+                recorderResponseCompletedReleasedId = vbNullString
+            End If
+        End If
+    End If
+
     Dim resultText As String
 
     If Not requireHttpStatus Then
@@ -2694,8 +2759,7 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         GoTo succeeded
     End If
 
-    ' ExecuteBrowsingContextNavigate binds the navigation id before any optional settlement wait.
-    ' For waitMode=none, drain now so buffered responseStarted events can satisfy the capture.
+    ' Drain buffered correlated network response events before deciding status availability.
     ProcessRecorderQueue
 
     If m_navHttpCaptureStatusKnown Then
@@ -2742,11 +2806,17 @@ Failed:
     Resume Cleanup
 
 Cleanup:
-    ' Cleanup must never replace an already-determined navigation outcome. In particular,
-    ' temporary unsubscribe, capture reset, or deferred-reset logging may fail secondarily.
+    ' Cleanup must never replace an already-determined navigation outcome.
     On Error Resume Next
 
-    ReleaseNavigationResponseStartedSubscriptionBestEffort temporaryResponseStartedSubscriptionId
+    If recorderResponseCompletedPaused Then
+        Call RestoreRecorderResponseCompletedBestEffort(True)
+        recorderResponseCompletedPaused = False
+        recorderResponseCompletedReleasedId = vbNullString
+    End If
+
+    ReleaseNavigationResponseStartedSubscriptionBestEffort _
+        temporaryResponseStartedSubscriptionId
     ResetNavigationSupersessionWatch
     ResetNavigationHttpCaptureState
     m_navHttpCaptureInProgress = False
@@ -3215,6 +3285,97 @@ Failed:
     Err.Clear
 End Sub
 
+Private Function IsFinalNavigationStatusReadyForPause() As Boolean
+    IsFinalNavigationStatusReadyForPause = False
+    If Not m_navHttpCaptureStatusKnown Then Exit Function
+
+    Dim statusCode As Long
+    statusCode = m_navHttpCaptureStatus
+    If statusCode >= 300 And statusCode <= 399 Then Exit Function
+    If statusCode < 100 Or statusCode > 599 Then Exit Function
+
+    IsFinalNavigationStatusReadyForPause = True
+End Function
+
+Private Function PauseRecorderResponseCompletedBestEffort( _
+    ByRef releasedSubscriptionId As String) As Boolean
+
+    Const SUB_KEY As String = "network.responseCompleted"
+    releasedSubscriptionId = vbNullString
+    PauseRecorderResponseCompletedBestEffort = False
+
+    If Not m_isRecording Then Exit Function
+    If Len(m_recorderResponseCompletedSubscriptionId) = 0 Then Exit Function
+    If m_activeSubscriptions Is Nothing Then Exit Function
+    If Not m_activeSubscriptions.Exists(SUB_KEY) Then Exit Function
+    If StrComp(CStr(m_activeSubscriptions(SUB_KEY)), _
+               m_recorderResponseCompletedSubscriptionId, vbBinaryCompare) <> 0 Then
+        Exit Function
+    End If
+    If socket_ Is Nothing Then Exit Function
+    If socket_.state <> StateConnected Then Exit Function
+
+    On Error GoTo Failed
+
+    Dim ownedId As String
+    ownedId = m_recorderResponseCompletedSubscriptionId
+
+    Dim ids(0 To 0) As String
+    ids(0) = ownedId
+
+    Dim params As New Dictionary
+    params.Add "subscriptions", ids
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand( _
+              "session.unsubscribe", params, True, _
+              allowAmbiguousRetry:=False, allowRecoveryRetry:=False)
+    Call ValidateProtocolResponse(raw, "session.unsubscribe")
+
+    If m_activeSubscriptions.Exists(SUB_KEY) Then
+        If StrComp(CStr(m_activeSubscriptions(SUB_KEY)), ownedId, vbBinaryCompare) = 0 Then
+            m_activeSubscriptions.Remove SUB_KEY
+        End If
+    End If
+
+    m_recorderResponseCompletedSubscriptionId = vbNullString
+    releasedSubscriptionId = ownedId
+    PauseRecorderResponseCompletedBestEffort = True
+    Exit Function
+
+Failed:
+    Err.Clear
+End Function
+
+Private Function RestoreRecorderResponseCompletedBestEffort( _
+    ByVal shouldRestore As Boolean) As Boolean
+
+    Const SUB_KEY As String = "network.responseCompleted"
+    RestoreRecorderResponseCompletedBestEffort = False
+    If Not shouldRestore Then Exit Function
+    If Not m_isRecording Then Exit Function
+    If socket_ Is Nothing Then Exit Function
+    If socket_.state <> StateConnected Then Exit Function
+
+    On Error GoTo Failed
+
+    If m_activeSubscriptions Is Nothing Then Set m_activeSubscriptions = New Dictionary
+
+    If Not m_activeSubscriptions.Exists(SUB_KEY) Then
+        Call Me.ExecuteSessionSubscribe(Array(SUB_KEY), Silent:=True)
+    End If
+
+    If m_activeSubscriptions.Exists(SUB_KEY) Then
+        m_recorderResponseCompletedSubscriptionId = CStr(m_activeSubscriptions(SUB_KEY))
+        RestoreRecorderResponseCompletedBestEffort = _
+            (Len(m_recorderResponseCompletedSubscriptionId) > 0)
+    End If
+    Exit Function
+
+Failed:
+    Err.Clear
+End Function
+
 ' browsingContext.navigate waits to interactive at the protocol layer. waitMode controls
 ' only the additional bounded wrapper-side settlement after the command returns. A5 caps command
 ' correlation ownership independently from the browser-side operation timeout.
@@ -3490,6 +3651,58 @@ Private Sub HandleNavigationResponseStartedEvent(ByVal json As Object)
     End If
 
     m_navHttpCaptureResponseUrl = responseUrl
+End Sub
+
+Private Sub SettleAfterNavigationWithResponseCompletedPause( _
+    ByVal contextId As String, _
+    ByVal minStableMs As Long, _
+    ByVal maxTimeoutMs As Long, _
+    ByRef responseCompletedPaused As Boolean)
+
+    m_lastSyncAttempted = True
+    On Error GoTo Failed
+
+    Dim urlStable As Boolean
+    urlStable = WaitForUrlStability(contextId, 1000, maxTimeoutMs)
+
+    ' Restore full response recording before context reconciliation and SPA network-idle logic.
+    If responseCompletedPaused Then
+        If RestoreRecorderResponseCompletedBestEffort(True) Then
+            responseCompletedPaused = False
+        End If
+    End If
+
+    UpdateMainContextId True, True
+    WaitForNetworkIdleSpa minStableMs, maxTimeoutMs, contextId
+
+    m_lastSyncSucceeded = urlStable
+    If Not urlStable Then
+        RecordSyncFailure 504, "LogicalTimeout", _
+            "URL and readyState did not remain stable within " & maxTimeoutMs & "ms."
+        If m_debugMode Then Debug.Print "BiDi: navigate URL-stability timeout (best-effort)."
+    End If
+    Exit Sub
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+
+    If responseCompletedPaused Then
+        If RestoreRecorderResponseCompletedBestEffort(True) Then
+            responseCompletedPaused = False
+        End If
+    End If
+
+    RecordSyncFailure errorNumber, errorSource, errorDescription
+    On Error GoTo 0
+    If errorNumber = ERR_CONSENSUS_HALT Then
+        Err.Raise errorNumber, errorSource, errorDescription
+    End If
+    If m_debugMode Then
+        Debug.Print "BiDi: navigate responseCompleted-pause settle best-effort skip: " & _
+                    errorDescription
+    End If
 End Sub
 
 Private Sub SettleAfterNavigation(ByVal contextId As String, _
@@ -7384,22 +7597,43 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Dim stagedLogs As New Collection
     Dim stagedSuppByKey As New Dictionary
     Dim stagedStartTime As Double
-    Dim events(4) As String
+    Dim stagedResponseCompletedSubscriptionId As String
+    Dim events(3) As String
 
     On Error GoTo StartFailed
 
     ' Recorder timestamps are seconds; NowMs values are divided by 1000 consistently.
     stagedStartTime = socket_.nowMs() / 1000
 
-    events(0) = "network.responseCompleted"
-    events(1) = "network.fetchError"
-    events(2) = "browsingContext.load"
-    events(3) = "browsingContext.domContentLoaded"
-    events(4) = "network.beforeRequestSent"
+    events(0) = "network.fetchError"
+    events(1) = "browsingContext.load"
+    events(2) = "browsingContext.domContentLoaded"
+    events(3) = "network.beforeRequestSent"
 
-    ' Subscribe before committing recorder state. ExecuteSessionSubscribe raises on failure;
-    ' in that case all fields below remain exactly as they were on entry.
+    ' responseCompleted is kept on its own recorder-owned subscription. This lets navigation
+    ' temporarily pause only that payload-heavy event during URL stability while preserving [REQ]
+    ' and lifecycle coverage.
     Me.ExecuteSessionSubscribe events
+
+    If m_activeSubscriptions Is Nothing Then Set m_activeSubscriptions = New Dictionary
+
+    If m_activeSubscriptions.Exists("network.responseCompleted") Then
+        ' Borrowed subscriptions are never treated as recorder-owned. Reuse ownership only when a
+        ' previous recorder start in this same wrapper created the exact current subscription.
+        If Len(m_recorderResponseCompletedSubscriptionId) > 0 Then
+            If StrComp(CStr(m_activeSubscriptions("network.responseCompleted")), _
+                       m_recorderResponseCompletedSubscriptionId, vbBinaryCompare) = 0 Then
+                stagedResponseCompletedSubscriptionId = _
+                    m_recorderResponseCompletedSubscriptionId
+            End If
+        End If
+    Else
+        Call Me.ExecuteSessionSubscribe(Array("network.responseCompleted"), Silent:=True)
+        If m_activeSubscriptions.Exists("network.responseCompleted") Then
+            stagedResponseCompletedSubscriptionId = _
+                CStr(m_activeSubscriptions("network.responseCompleted"))
+        End If
+    End If
 
     ' Commit the staged recorder as one logical transaction. Publish m_isRecording last so
     ' guarded append paths never observe an enabled recorder with uninitialized collections.
@@ -7410,6 +7644,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_excludeResources = excludeImagesAndCss
     m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
+    m_recorderResponseCompletedSubscriptionId = stagedResponseCompletedSubscriptionId
     m_discoveryDomCaptureEnabled = captureDomActivity
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
@@ -7490,7 +7725,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                           " event(s) are shown. Earlier events existed but were evicted (ring buffer)." & vbCrLf
         End If
         stm.WriteText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
-        stm.WriteText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). [REQ] pairs with [RES] on the shared id. Per-request latency (dur=) is not computed." & vbCrLf
+        stm.WriteText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During navigation URL-stability polling, recorder-owned responseCompleted may be temporarily paused and is restored before SPA idle wait; [REQ] remains live, so some [REQ] lines in that narrow window may have no [RES] pair. Per-request latency (dur=) is not computed." & vbCrLf
         stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst (manual RecordEventsForSeconds samples this by default)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
         stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
         stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HITs are event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag. dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
@@ -7820,24 +8055,28 @@ End Sub
 
 Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
     If m_isProcessingQueue Then Exit Sub
-    
+
     m_isProcessingQueue = True
     Dim json As Object
     Dim processedCount As Long
     Dim consecutiveErrors As Long
     Dim droppedCount As Long
     Dim dropLogCount As Long
+    Dim batchStartMs As Double
     Const MAX_MESSAGES_PER_BATCH As Long = 1000
     Const MAX_DROP_LOGS_PER_BATCH As Long = 5
-    
+
+    batchStartMs = socket_.nowMs()
     On Error GoTo Cleanup
-    
+
     Do While processedCount < MAX_MESSAGES_PER_BATCH
         Set json = Nothing
 
         Dim dropReason As String
         Dim messageConsumed As Boolean
-        messageConsumed = socket_.TryGetParsedEvent(json, dropReason, MIN_MSG_SIZE, socket_.ParsedAsyncEventMaxChars, nonBlocking)
+        messageConsumed = socket_.TryGetParsedEvent( _
+                              json, dropReason, MIN_MSG_SIZE, _
+                              socket_.ParsedAsyncEventMaxChars, nonBlocking)
         If Not messageConsumed Then Exit Do
 
         ' Count valid and dropped messages alike so malformed traffic cannot bypass the batch cap.
@@ -7872,16 +8111,18 @@ Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
             Else
                 consecutiveErrors = 0
             End If
-            On Error GoTo Cleanup ' Restore main handler
+            On Error GoTo Cleanup
 
-            ' Repeated dispatch failures trip a circuit breaker rather than looping indefinitely.
             If consecutiveErrors >= 10 Then
                 Debug.Print "BiDi Critical: 10 consecutive dispatch errors. Abandoning queue."
                 Exit Do
             End If
         End If
 
-        If Not nonBlocking Then
+        If nonBlocking Then
+            If processedCount >= NONBLOCKING_DRAIN_MAX_MESSAGES Then Exit Do
+            If (socket_.nowMs() - batchStartMs) >= NONBLOCKING_DRAIN_BUDGET_MS Then Exit Do
+        Else
             If (processedCount Mod 100) = 0 Then socket_.PumpMessages 100
         End If
     Loop
@@ -7893,7 +8134,7 @@ Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
 
 Cleanup:
     m_isProcessingQueue = False
-    
+
     If Err.Number <> 0 Then
         Debug.Print "BiDi Critical Error in ProcessRecorderQueueCore: " & Err.description
     End If
@@ -9231,8 +9472,9 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     ValidateSignalWaitContext targetCtx
-    
-    ProcessRecorderQueue
+
+    ' Do not let a large navigation burst monopolize the caller before SPA consensus begins.
+    DrainNonBlockingRecorderQueue
 
     Dim waitCtx As New Dictionary
     waitCtx.Add "contextId", targetCtx
@@ -10124,6 +10366,18 @@ End Sub
 
 Private Sub WaitHeartbeat(Optional ByVal sleepMs As Long = 50)
     ProcessRecorderQueue
+
+    socket_.PumpMessages 100
+
+    Dim vSleep As Long: vSleep = sleepMs
+    If vSleep < 50 Then vSleep = 50
+
+    socket_.YieldExecution vSleep, False
+End Sub
+
+' URL-stability polling needs queue fairness, while other waits retain the historical full drain.
+Private Sub WaitHeartbeatBounded(Optional ByVal sleepMs As Long = 50)
+    DrainNonBlockingRecorderQueue
 
     socket_.PumpMessages 100
 
@@ -11083,7 +11337,7 @@ Public Function WaitForUrlStability(Optional ByVal contextId As String = "", _
         If (socket_.nowMs() - startMs) > CDbl(vTimeoutMs) Then Exit Do
         
         If m_isRecording Then
-            WaitHeartbeat 50
+            WaitHeartbeatBounded 50
         Else
             socket_.YieldExecution 50, True
         End If
