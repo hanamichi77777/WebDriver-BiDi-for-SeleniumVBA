@@ -27,6 +27,20 @@ The structured log can also be provided to an AI assistant for analysis. By exam
 
 The Discovery Log is therefore more than an execution log. It is a diagnostic and discovery tool for investigating how an unfamiliar third-party SPA behaves—and for discovering what should actually be waited for before reliable automation can be built.
 
+
+### AI-Assisted SPA Automation Tutorial
+
+A practical walkthrough is available on Medium showing how to combine the Discovery Log with AI-assisted analysis when automating a dynamic third-party SPA.
+
+The article uses **Google Flights** as a working example and follows the full workflow from manual observation to verified automation:
+
+`Manual operation → Discovery Log → AI analysis → semantic locators → Network / Visibility signals → automated re-run → SIGNAL-HIT / STABLE verification`
+
+It also demonstrates why an API response alone may not be enough to determine that the UI is ready, and how `ArmNetworkSignal` and `ArmVisibilitySignal` can be combined to wait for both backend completion and visible results.
+
+**Read the article:**  
+[Using AI to Automate Dynamic SPA Websites with WebDriver BiDi for SeleniumVBA](https://medium.com/@hanamichi77777/using-ai-to-automate-dynamic-spa-websites-with-webdriver-bidi-for-seleniumvba-e700b76f7219)
+
 ## Validation Benchmarks
 
 For validation, this project uses two challenging automation benchmarks: entering text into the ServiceNow login form and performing a flight search on Google Flights.
