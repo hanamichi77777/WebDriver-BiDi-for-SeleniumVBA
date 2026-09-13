@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "4.7"
+Private Const BIDI_SOCKET_VERSION As String = "4.8"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -3592,7 +3592,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
     Dim algorithmHandle As LongPtr
     Dim hashHandle As LongPtr
     Dim status As Long
-    Dim completed As Boolean
+    Dim Completed As Boolean
 
     Dim algorithmId As String
     algorithmId = WS_BCRYPT_SHA1_ALGORITHM
@@ -3684,7 +3684,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
         GoTo Cleanup
     End If
 
-    completed = True
+    Completed = True
 
 Cleanup:
     On Error Resume Next
@@ -3701,7 +3701,7 @@ Cleanup:
 
     On Error GoTo 0
 
-    WsTrySha1 = completed
+    WsTrySha1 = Completed
 End Function
 
 Private Function WsBase64EncodeBytes(ByRef Bytes() As Byte) As String

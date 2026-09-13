@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.7"
+Private Const BIDI_WRAPPER_VERSION As String = "4.8"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -154,6 +154,13 @@ Private Const NONBLOCKING_DRAIN_BUDGET_MS As Long = 250
 
 ' Discovery Log ring-buffer limit.
 Private Const MAX_LOG_SIZE As Long = 5000
+' Optional Discovery response-body capture. The collector-side limit is a per-item eligibility
+' threshold (NOT truncation); the logged-character limit is a separate AI/token-size guard.
+Private Const DEFAULT_MAX_COLLECTED_BODY_SIZE As Long = 262144   ' 256 KiB encoded-size eligibility
+Private Const DEFAULT_MAX_LOGGED_BODY_CHARS As Long = 32768      ' 32 Ki characters written per body
+Private Const MAX_BODY_CAPTURE_COUNT As Long = 25
+Private Const MAX_BODY_PER_KEY As Long = 1
+Private Const BODY_GETDATA_TIMEOUT_MS As Long = 5000
 ' Manual Discovery DOM sampling uses the existing SPA probe. Keep the normal cadence aligned
 ' with the probe/recorder's ~100ms granularity, but back off after a failed probe recovery so
 ' navigation/realm churn cannot become a tight script.evaluate retry loop.
@@ -193,6 +200,33 @@ Private m_recorderResponseCompletedSubscriptionId As String
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_recSuppOverflowCount As Long      ' suppressed events not keyed after the key cap
 Private m_droppedHeadCount As Long          ' count of oldest timeline lines evicted by the MAX_LOG_SIZE ring buffer (0 = none)
+
+
+' Optional response-body capture is deliberately separate from the 5000-line timeline ring.
+' The browser-side collector may retain data even before getData is called, so body capture is
+' opt-in and context-scoped. BODY STORE output is written directly to the file stream at Stop.
+Private m_bodyCaptureRequested As Boolean
+Private m_bodyCaptureActive As Boolean
+Private m_bodyCaptureUnavailableReason As String
+Private m_bodyCollectorId As String
+Private m_bodyCollectorContextId As String
+Private m_bodyCollectorCleanupRequired As Boolean
+Private m_bodyCandidates As Collection              ' ordered Dictionaries; full request id retained internally
+Private m_bodyCandidateCountByKey As Dictionary     ' method + normalized key + MIME -> accepted count
+Private m_bodySkipSummary As Dictionary             ' compact skip aggregation; never enters timeline ring
+Private m_bodyCapturePatterns As Collection         ' user patterns matched against NormalizeEndpointKey output
+
+' Request-body capture is a separate, explicit opt-in. It reuses the same endpoint-pattern list
+' but owns a distinct collector because request/response retention and support can differ by browser.
+Private m_requestBodyCaptureRequested As Boolean
+Private m_requestBodyCaptureActive As Boolean
+Private m_requestBodyCaptureUnavailableReason As String
+Private m_requestBodyCollectorId As String
+Private m_requestBodyCollectorContextId As String
+Private m_requestBodyCollectorCleanupRequired As Boolean
+Private m_requestBodyCandidates As Collection
+Private m_requestBodyCandidateCountByKey As Dictionary
+Private m_requestBodySkipSummary As Dictionary
 
 ' Critical forensic incidents are retained even when Discovery Log recording is OFF.
 ' This ring is intentionally low-volume and survives recorder start/stop and ClearState/FatalReset;
@@ -449,6 +483,7 @@ Private Sub Class_Initialize()
     Set m_blockingPatterns = New Collection
     Set m_newContextBaseline = New Dictionary
     Set m_forensicIncidentLogs = New Collection
+    Set m_bodyCapturePatterns = New Collection
     m_mainContextState = MainContextUnbound
 
     ResetSignalState
@@ -6327,6 +6362,25 @@ Private Sub RecoverPendingSubscriptionCleanupOnConnect(ByVal requestedSessionIde
 End Sub
 
 Private Sub ClearStateCore(ByVal releaseRemoteSubscriptions As Boolean)
+    If releaseRemoteSubscriptions Then
+        Dim bodyCleanupFailure As String
+        If Not ReleaseBodyDataCollectorBestEffort(bodyCleanupFailure) Then
+            If m_debugMode Then Debug.Print "BiDi Warning: ClearState could not confirm body collector cleanup. " & bodyCleanupFailure
+        End If
+        If m_bodyCaptureRequested Then
+            m_bodyCaptureActive = False
+            If Len(m_bodyCaptureUnavailableReason) = 0 Then m_bodyCaptureUnavailableReason = "clear-state"
+        End If
+        Dim requestBodyCleanupFailure As String
+        If Not ReleaseRequestBodyDataCollectorBestEffort(requestBodyCleanupFailure) Then
+            If m_debugMode Then Debug.Print "BiDi Warning: ClearState could not confirm request body collector cleanup. " & requestBodyCleanupFailure
+        End If
+        If m_requestBodyCaptureRequested Then
+            m_requestBodyCaptureActive = False
+            If Len(m_requestBodyCaptureUnavailableReason) = 0 Then m_requestBodyCaptureUnavailableReason = "clear-state"
+        End If
+    End If
+
     Dim subscriptionsReleased As Boolean
     subscriptionsReleased = True
 
@@ -6393,6 +6447,27 @@ Private Sub ResetSessionBoundaryState()
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+
+    ' A session boundary makes any remote collector id meaningless. User capture patterns are
+    ' wrapper preferences and intentionally survive reconnects, like the existing idle filters.
+    m_bodyCaptureRequested = False
+    m_bodyCaptureActive = False
+    m_bodyCaptureUnavailableReason = vbNullString
+    m_bodyCollectorId = vbNullString
+    m_bodyCollectorContextId = vbNullString
+    m_bodyCollectorCleanupRequired = False
+    Set m_bodyCandidates = Nothing
+    Set m_bodyCandidateCountByKey = Nothing
+    Set m_bodySkipSummary = Nothing
+    m_requestBodyCaptureRequested = False
+    m_requestBodyCaptureActive = False
+    m_requestBodyCaptureUnavailableReason = vbNullString
+    m_requestBodyCollectorId = vbNullString
+    m_requestBodyCollectorContextId = vbNullString
+    m_requestBodyCollectorCleanupRequired = False
+    Set m_requestBodyCandidates = Nothing
+    Set m_requestBodyCandidateCountByKey = Nothing
+    Set m_requestBodySkipSummary = Nothing
 
     m_navigationDetected = False
     m_navigationContextId = ""
@@ -7589,8 +7664,953 @@ Private Function BuildShadowSelectorArg(ByVal selectorsArray As Variant) As Dict
     Set BuildShadowSelectorArg = arg
 End Function
 
+Private Sub ResetDiscoveryBodyRunState()
+    m_bodyCaptureRequested = False
+    m_bodyCaptureActive = False
+    m_bodyCaptureUnavailableReason = vbNullString
+    m_bodyCollectorContextId = vbNullString
+    Set m_bodyCandidates = Nothing
+    Set m_bodyCandidateCountByKey = Nothing
+    Set m_bodySkipSummary = Nothing
+
+    m_requestBodyCaptureRequested = False
+    m_requestBodyCaptureActive = False
+    m_requestBodyCaptureUnavailableReason = vbNullString
+    m_requestBodyCollectorContextId = vbNullString
+    Set m_requestBodyCandidates = Nothing
+    Set m_requestBodyCandidateCountByKey = Nothing
+    Set m_requestBodySkipSummary = Nothing
+End Sub
+
+Public Sub AddBodyCapturePattern(ByVal keyPattern As String)
+    If Len(Trim$(keyPattern)) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:AddBodyCapturePattern", "keyPattern is empty."
+    End If
+
+    If m_bodyCapturePatterns Is Nothing Then Set m_bodyCapturePatterns = New Collection
+    m_bodyCapturePatterns.Add keyPattern
+End Sub
+
+Public Sub ClearBodyCapturePatterns()
+    Set m_bodyCapturePatterns = New Collection
+End Sub
+
+Private Function BodyCapturePatternsSummary() As String
+    If m_bodyCapturePatterns Is Nothing Then
+        BodyCapturePatternsSummary = "(all-json)"
+        Exit Function
+    End If
+    If m_bodyCapturePatterns.count = 0 Then
+        BodyCapturePatternsSummary = "(all-json)"
+        Exit Function
+    End If
+
+    Dim result As String
+    Dim pat As Variant
+    For Each pat In m_bodyCapturePatterns
+        If Len(result) > 0 Then result = result & ";"
+        result = result & CStr(pat)
+        If Len(result) > 400 Then
+            result = Left$(result, 400) & "..."
+            Exit For
+        End If
+    Next pat
+    BodyCapturePatternsSummary = result
+End Function
+
+Private Function BodyCapturePatternMatches(ByVal normalizedKey As String) As Boolean
+    If m_bodyCapturePatterns Is Nothing Then
+        BodyCapturePatternMatches = True
+        Exit Function
+    End If
+    If m_bodyCapturePatterns.count = 0 Then
+        BodyCapturePatternMatches = True
+        Exit Function
+    End If
+
+    Dim pat As Variant
+    For Each pat In m_bodyCapturePatterns
+        If UrlMatchesPattern(normalizedKey, CStr(pat)) Then
+            BodyCapturePatternMatches = True
+            Exit Function
+        End If
+    Next pat
+End Function
+
+Private Function TryCreateNetworkDataCollector(ByVal dataType As String, _
+                                               ByVal contextId As String, _
+                                               ByRef collectorId As String, _
+                                               ByRef failureReason As String) As Boolean
+    collectorId = vbNullString
+    failureReason = vbNullString
+
+    Dim params As New Dictionary
+    Dim dataTypes As New Collection
+    Dim contexts As New Collection
+    dataTypes.Add dataType
+    contexts.Add contextId
+    params.Add "dataTypes", dataTypes
+    params.Add "maxEncodedDataSize", DEFAULT_MAX_COLLECTED_BODY_SIZE
+    params.Add "contexts", contexts
+
+    Dim rawRes As String
+    Dim parsed As Object
+    Dim errNum As Long
+    Dim errDesc As String
+
+    On Error Resume Next
+    rawRes = ExecuteBiDiCommand("network.addDataCollector", params, True, _
+                                allowAmbiguousRetry:=False, _
+                                allowRecoveryRetry:=False, _
+                                allowContextRetarget:=False, _
+                                commandTimeoutMs:=BODY_GETDATA_TIMEOUT_MS)
+    errNum = Err.Number
+    errDesc = Err.description
+    Err.Clear
+    If errNum = 0 Then Set parsed = ValidateProtocolResponse(rawRes, "network.addDataCollector")
+    If Err.Number <> 0 Then
+        errNum = Err.Number
+        errDesc = Err.description
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    If errNum <> 0 Or parsed Is Nothing Then
+        If Len(errDesc) = 0 Then errDesc = "network.addDataCollector did not return a usable response."
+        failureReason = CompactBodyDiagnostic(errDesc)
+        Exit Function
+    End If
+
+    collectorId = GetPathString(parsed, "result.collector")
+    If Len(collectorId) = 0 Then
+        failureReason = "network.addDataCollector returned no collector id."
+        Exit Function
+    End If
+
+    TryCreateNetworkDataCollector = True
+End Function
+
+Private Function TryRemoveDataCollectorById(ByVal collectorId As String, _
+                                            ByRef failureReason As String) As Boolean
+    failureReason = vbNullString
+    If Len(collectorId) = 0 Then
+        TryRemoveDataCollectorById = True
+        Exit Function
+    End If
+
+    If socket_ Is Nothing Then
+        failureReason = "socket unavailable"
+        Exit Function
+    End If
+    If socket_.state <> StateConnected Then
+        failureReason = "socket not connected"
+        Exit Function
+    End If
+
+    Dim params As New Dictionary
+    params.Add "collector", collectorId
+
+    Dim rawRes As String
+    Dim parsed As Object
+    Dim errNum As Long
+    Dim errDesc As String
+
+    On Error Resume Next
+    rawRes = ExecuteBiDiCommand("network.removeDataCollector", params, True, _
+                                allowAmbiguousRetry:=False, _
+                                allowRecoveryRetry:=False, _
+                                allowContextRetarget:=False, _
+                                commandTimeoutMs:=BODY_GETDATA_TIMEOUT_MS)
+    errNum = Err.Number
+    errDesc = Err.description
+    Err.Clear
+    If errNum = 0 Then Set parsed = ValidateProtocolResponse(rawRes, "network.removeDataCollector")
+    If Err.Number <> 0 Then
+        errNum = Err.Number
+        errDesc = Err.description
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    If errNum = 0 And Not parsed Is Nothing Then
+        TryRemoveDataCollectorById = True
+        Exit Function
+    End If
+
+    ' If the remote end already forgot the collector, cleanup is effectively complete.
+    If InStr(1, LCase$(errDesc), "no such network collector", vbBinaryCompare) > 0 Then
+        TryRemoveDataCollectorById = True
+        Exit Function
+    End If
+
+    If Len(errDesc) = 0 Then errDesc = "network.removeDataCollector cleanup was not confirmed."
+    failureReason = CompactBodyDiagnostic(errDesc)
+End Function
+
+Private Function ReleaseBodyDataCollectorBestEffort(ByRef failureReason As String) As Boolean
+    failureReason = vbNullString
+    ReleaseBodyDataCollectorBestEffort = True
+
+    If Len(m_bodyCollectorId) = 0 Then
+        m_bodyCollectorCleanupRequired = False
+        m_bodyCaptureActive = False
+        Exit Function
+    End If
+
+    If TryRemoveDataCollectorById(m_bodyCollectorId, failureReason) Then
+        m_bodyCollectorId = vbNullString
+        m_bodyCollectorContextId = vbNullString
+        m_bodyCollectorCleanupRequired = False
+        m_bodyCaptureActive = False
+        Exit Function
+    End If
+
+    m_bodyCollectorCleanupRequired = True
+    m_bodyCaptureActive = False
+    ReleaseBodyDataCollectorBestEffort = False
+End Function
+
+Private Function ReleaseRequestBodyDataCollectorBestEffort(ByRef failureReason As String) As Boolean
+    failureReason = vbNullString
+    ReleaseRequestBodyDataCollectorBestEffort = True
+
+    If Len(m_requestBodyCollectorId) = 0 Then
+        m_requestBodyCollectorCleanupRequired = False
+        m_requestBodyCaptureActive = False
+        Exit Function
+    End If
+
+    If TryRemoveDataCollectorById(m_requestBodyCollectorId, failureReason) Then
+        m_requestBodyCollectorId = vbNullString
+        m_requestBodyCollectorContextId = vbNullString
+        m_requestBodyCollectorCleanupRequired = False
+        m_requestBodyCaptureActive = False
+        Exit Function
+    End If
+
+    m_requestBodyCollectorCleanupRequired = True
+    m_requestBodyCaptureActive = False
+    ReleaseRequestBodyDataCollectorBestEffort = False
+End Function
+
+
+Public Function ProbeNetworkDataCollection(ByVal dataType As String, _
+                                           Optional ByVal contextId As String = "") As Boolean
+    dataType = LCase$(Trim$(dataType))
+    If dataType <> "response" And dataType <> "request" Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ProbeNetworkDataCollection", _
+                  "dataType must be 'response' or 'request'."
+    End If
+
+    If m_isProcessingQueue Or m_waitStackDepth > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ProbeNetworkDataCollection", _
+                  "Run the probe only outside event dispatch and SPA waits."
+    End If
+
+    Dim targetCtx As String
+    targetCtx = ResolveTargetContext(contextId)
+
+    Dim collectorId As String
+    Dim failureReason As String
+    If Not TryCreateNetworkDataCollector(dataType, targetCtx, collectorId, failureReason) Then
+        If m_debugMode Then Debug.Print "BiDi Body Probe: " & dataType & " collector unavailable. " & failureReason
+        Exit Function
+    End If
+
+    Dim cleanupFailure As String
+    If Not TryRemoveDataCollectorById(collectorId, cleanupFailure) Then
+        ' Preserve the issued id so Shutdown/next start can retry cleanup rather than leaking it.
+        If dataType = "request" Then
+            m_requestBodyCollectorId = collectorId
+            m_requestBodyCollectorContextId = targetCtx
+            m_requestBodyCollectorCleanupRequired = True
+        Else
+            m_bodyCollectorId = collectorId
+            m_bodyCollectorContextId = targetCtx
+            m_bodyCollectorCleanupRequired = True
+        End If
+        If m_debugMode Then Debug.Print "BiDi Body Probe: " & dataType & " collector created, cleanup unconfirmed. " & cleanupFailure
+        Exit Function
+    End If
+
+    ProbeNetworkDataCollection = True
+    If m_debugMode Then Debug.Print "BiDi Body Probe: network.addDataCollector(" & dataType & ") supported."
+End Function
+
+Private Sub BumpBodySkipSummary(ByVal reason As String, _
+                                ByVal method As String, _
+                                ByVal normalizedKey As String, _
+                                ByVal mime As String, _
+                                ByVal requestId As String)
+    If m_bodySkipSummary Is Nothing Then Set m_bodySkipSummary = New Dictionary
+
+    Dim summaryKey As String
+    summaryKey = LCase$(reason) & "|" & UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(mime)
+
+    Dim item As Dictionary
+    If m_bodySkipSummary.Exists(summaryKey) Then
+        Set item = m_bodySkipSummary(summaryKey)
+        item("count") = CLng(item("count")) + 1
+        Exit Sub
+    End If
+
+    Set item = New Dictionary
+    item.Add "reason", reason
+    item.Add "method", method
+    item.Add "key", normalizedKey
+    item.Add "mime", mime
+    item.Add "firstId", requestId
+    item.Add "count", 1
+    m_bodySkipSummary.Add summaryKey, item
+End Sub
+
+Private Sub ConsiderResponseBodyCandidate(ByVal params As Object, _
+                                          ByVal responseObj As Object, _
+                                          ByVal mime As String, _
+                                          ByVal responseUrl As String, _
+                                          ByVal requestId As String, _
+                                          ByVal statusText As String)
+    If Not m_bodyCaptureActive Then Exit Sub
+    If InStr(1, LCase$(mime), "json", vbBinaryCompare) = 0 Then Exit Sub
+
+    Dim normalizedKey As String
+    normalizedKey = NormalizeEndpointKey(responseUrl)
+    If Not BodyCapturePatternMatches(normalizedKey) Then Exit Sub
+
+    Dim method As String
+    method = GetPathString(params, "request.method")
+    If Len(method) = 0 Then method = "?"
+
+    Dim redirectCount As Long
+    Dim redirectText As String
+    redirectText = GetPathString(params, "redirectCount")
+    If Len(redirectText) > 0 And IsNumeric(redirectText) Then redirectCount = CLng(redirectText)
+    If redirectCount > 0 Then
+        BumpBodySkipSummary "redirect", method, normalizedKey, mime, requestId
+        Exit Sub
+    End If
+
+    Dim bodySizeKnown As Boolean
+    Dim bodySize As Double
+    If responseObj.Exists("bodySize") Then
+        If Not IsObject(responseObj("bodySize")) And Not IsNull(responseObj("bodySize")) Then
+            If IsNumeric(responseObj("bodySize")) Then
+                bodySize = CDbl(responseObj("bodySize"))
+                bodySizeKnown = True
+            End If
+        End If
+    End If
+
+    If bodySizeKnown Then
+        If bodySize > CDbl(DEFAULT_MAX_COLLECTED_BODY_SIZE) Then
+            BumpBodySkipSummary "oversize", method, normalizedKey, mime, requestId
+            Exit Sub
+        End If
+    End If
+
+    If m_bodyCandidates Is Nothing Then Set m_bodyCandidates = New Collection
+    If m_bodyCandidateCountByKey Is Nothing Then Set m_bodyCandidateCountByKey = New Dictionary
+
+    Dim candidateKey As String
+    candidateKey = UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(mime)
+
+    Dim acceptedForKey As Long
+    If m_bodyCandidateCountByKey.Exists(candidateKey) Then acceptedForKey = CLng(m_bodyCandidateCountByKey(candidateKey))
+    If acceptedForKey >= MAX_BODY_PER_KEY Then
+        BumpBodySkipSummary "cap", method, normalizedKey, mime, requestId
+        Exit Sub
+    End If
+
+    If m_bodyCandidates.count >= MAX_BODY_CAPTURE_COUNT Then
+        BumpBodySkipSummary "cap", method, normalizedKey, mime, requestId
+        Exit Sub
+    End If
+
+    Dim candidate As New Dictionary
+    candidate.Add "requestId", requestId
+    candidate.Add "method", method
+    candidate.Add "key", normalizedKey
+    candidate.Add "mime", mime
+    candidate.Add "status", statusText
+    candidate.Add "bodySizeKnown", bodySizeKnown
+    candidate.Add "bodySize", bodySize
+    m_bodyCandidates.Add candidate
+
+    If m_bodyCandidateCountByKey.Exists(candidateKey) Then
+        m_bodyCandidateCountByKey(candidateKey) = CLng(m_bodyCandidateCountByKey(candidateKey)) + 1
+    Else
+        m_bodyCandidateCountByKey.Add candidateKey, 1
+    End If
+End Sub
+
+Private Function GetRequestContentType(ByVal reqObj As Object) As String
+    On Error GoTo CleanFail
+    If reqObj Is Nothing Then Exit Function
+    If Not reqObj.Exists("headers") Then Exit Function
+    If Not IsObject(reqObj("headers")) Then Exit Function
+
+    Dim hdr As Variant
+    For Each hdr In reqObj("headers")
+        If IsObject(hdr) Then
+            Dim headerName As String
+            headerName = GetPathString(hdr, "name")
+            If StrComp(headerName, "content-type", vbTextCompare) = 0 Then
+                Dim valObj As Object
+                Set valObj = GetPathObject(hdr, "value")
+                If Not valObj Is Nothing Then
+                    GetRequestContentType = GetPathString(valObj, "value")
+                End If
+                Exit Function
+            End If
+        End If
+    Next hdr
+CleanFail:
+End Function
+
+Private Sub BumpRequestBodySkipSummary(ByVal reason As String, _
+                                       ByVal method As String, _
+                                       ByVal normalizedKey As String, _
+                                       ByVal contentType As String, _
+                                       ByVal requestId As String)
+    If m_requestBodySkipSummary Is Nothing Then Set m_requestBodySkipSummary = New Dictionary
+
+    Dim summaryKey As String
+    summaryKey = LCase$(reason) & "|" & UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(contentType)
+
+    Dim item As Dictionary
+    If m_requestBodySkipSummary.Exists(summaryKey) Then
+        Set item = m_requestBodySkipSummary(summaryKey)
+        item("count") = CLng(item("count")) + 1
+        Exit Sub
+    End If
+
+    Set item = New Dictionary
+    item.Add "reason", reason
+    item.Add "method", method
+    item.Add "key", normalizedKey
+    item.Add "mime", contentType
+    item.Add "firstId", requestId
+    item.Add "count", 1
+    m_requestBodySkipSummary.Add summaryKey, item
+End Sub
+
+Private Sub ConsiderRequestBodyCandidate(ByVal params As Object, _
+                                         ByVal reqObj As Object, _
+                                         ByVal reqUrl As String, _
+                                         ByVal requestId As String, _
+                                         ByVal method As String)
+    If Not m_requestBodyCaptureActive Then Exit Sub
+
+    Dim normalizedKey As String
+    normalizedKey = NormalizeEndpointKey(reqUrl)
+    If Not BodyCapturePatternMatches(normalizedKey) Then Exit Sub
+
+    Dim contentType As String
+    contentType = GetRequestContentType(reqObj)
+    If InStr(1, LCase$(contentType), "json", vbBinaryCompare) = 0 Then Exit Sub
+
+    Dim redirectCount As Long
+    Dim redirectText As String
+    redirectText = GetPathString(params, "redirectCount")
+    If Len(redirectText) > 0 And IsNumeric(redirectText) Then redirectCount = CLng(redirectText)
+    If redirectCount > 0 Then
+        BumpRequestBodySkipSummary "redirect", method, normalizedKey, contentType, requestId
+        Exit Sub
+    End If
+
+    Dim bodySizeKnown As Boolean
+    Dim bodySize As Double
+    If reqObj.Exists("bodySize") Then
+        If Not IsObject(reqObj("bodySize")) And Not IsNull(reqObj("bodySize")) Then
+            If IsNumeric(reqObj("bodySize")) Then
+                bodySize = CDbl(reqObj("bodySize"))
+                bodySizeKnown = True
+            End If
+        End If
+    End If
+
+    If bodySizeKnown Then
+        If bodySize <= 0 Then Exit Sub
+        If bodySize > CDbl(DEFAULT_MAX_COLLECTED_BODY_SIZE) Then
+            BumpRequestBodySkipSummary "oversize", method, normalizedKey, contentType, requestId
+            Exit Sub
+        End If
+    End If
+
+    If m_requestBodyCandidates Is Nothing Then Set m_requestBodyCandidates = New Collection
+    If m_requestBodyCandidateCountByKey Is Nothing Then Set m_requestBodyCandidateCountByKey = New Dictionary
+
+    Dim candidateKey As String
+    candidateKey = UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(contentType)
+
+    Dim acceptedForKey As Long
+    If m_requestBodyCandidateCountByKey.Exists(candidateKey) Then acceptedForKey = CLng(m_requestBodyCandidateCountByKey(candidateKey))
+    If acceptedForKey >= MAX_BODY_PER_KEY Then
+        BumpRequestBodySkipSummary "cap", method, normalizedKey, contentType, requestId
+        Exit Sub
+    End If
+
+    If m_requestBodyCandidates.count >= MAX_BODY_CAPTURE_COUNT Then
+        BumpRequestBodySkipSummary "cap", method, normalizedKey, contentType, requestId
+        Exit Sub
+    End If
+
+    Dim candidate As New Dictionary
+    candidate.Add "requestId", requestId
+    candidate.Add "method", method
+    candidate.Add "key", normalizedKey
+    candidate.Add "mime", contentType
+    candidate.Add "status", "-"
+    candidate.Add "bodySizeKnown", bodySizeKnown
+    candidate.Add "bodySize", bodySize
+    m_requestBodyCandidates.Add candidate
+
+    If m_requestBodyCandidateCountByKey.Exists(candidateKey) Then
+        m_requestBodyCandidateCountByKey(candidateKey) = CLng(m_requestBodyCandidateCountByKey(candidateKey)) + 1
+    Else
+        m_requestBodyCandidateCountByKey.Add candidateKey, 1
+    End If
+End Sub
+
+Private Function CompactBodyDiagnostic(ByVal value As String) As String
+    Dim s As String
+    s = Replace(value, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    s = Trim$(s)
+    If Len(s) > 240 Then s = Left$(s, 240) & "..."
+    CompactBodyDiagnostic = s
+End Function
+
+Private Function TryGetCapturedResponseBody(ByVal candidate As Dictionary, _
+                                            ByRef bodyText As String, _
+                                            ByRef failureReason As String, _
+                                            ByRef failureDetail As String) As Boolean
+    bodyText = vbNullString
+    failureReason = vbNullString
+    failureDetail = vbNullString
+
+    If Len(m_bodyCollectorId) = 0 Then
+        failureReason = "collector-unavailable"
+        Exit Function
+    End If
+
+    Dim params As New Dictionary
+    params.Add "dataType", "response"
+    params.Add "collector", m_bodyCollectorId
+    params.Add "disown", True
+    params.Add "request", CStr(candidate("requestId"))
+
+    Dim rawRes As String
+    Dim parsed As Object
+    Dim errNum As Long
+    Dim errDesc As String
+
+    On Error Resume Next
+    rawRes = ExecuteBiDiCommand("network.getData", params, True, _
+                                allowAmbiguousRetry:=False, _
+                                allowRecoveryRetry:=False, _
+                                allowContextRetarget:=False, _
+                                commandTimeoutMs:=BODY_GETDATA_TIMEOUT_MS)
+    errNum = Err.Number
+    errDesc = Err.description
+    Err.Clear
+    If errNum = 0 Then Set parsed = ValidateProtocolResponse(rawRes, "network.getData")
+    If Err.Number <> 0 Then
+        errNum = Err.Number
+        errDesc = Err.description
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    If errNum <> 0 Or parsed Is Nothing Then
+        failureDetail = CompactBodyDiagnostic(errDesc)
+        If errNum = 608 Then
+            failureReason = "transport-oversize"
+        ElseIf InStr(1, errDesc, "CommandCorrelationTimeout:", vbBinaryCompare) > 0 Then
+            failureReason = "timeout"
+        ElseIf InStr(1, LCase$(errDesc), "unavailable network data", vbBinaryCompare) > 0 Or _
+               InStr(1, LCase$(errDesc), "no such network data", vbBinaryCompare) > 0 Then
+            failureReason = "unavailable"
+        Else
+            failureReason = "protocol"
+        End If
+        Exit Function
+    End If
+
+    Dim bytesObj As Object
+    Set bytesObj = GetPathObject(parsed, "result.bytes")
+    If bytesObj Is Nothing Then
+        failureReason = "invalid-result"
+        failureDetail = "network.getData returned no result.bytes object."
+        Exit Function
+    End If
+
+    Dim bytesType As String
+    bytesType = GetPathString(bytesObj, "type")
+    If StrComp(bytesType, "string", vbBinaryCompare) <> 0 Then
+        failureReason = "non-text"
+        failureDetail = "BytesValue type=" & IIf(Len(bytesType) > 0, bytesType, "(missing)")
+        Exit Function
+    End If
+
+    If bytesObj.Exists("value") Then
+        If Not IsObject(bytesObj("value")) And Not IsNull(bytesObj("value")) Then
+            bodyText = CStr(bytesObj("value"))
+        End If
+    End If
+
+    TryGetCapturedResponseBody = True
+End Function
+
+Private Function TryGetCapturedRequestBody(ByVal candidate As Dictionary, _
+                                           ByRef bodyText As String, _
+                                           ByRef failureReason As String, _
+                                           ByRef failureDetail As String) As Boolean
+    bodyText = vbNullString
+    failureReason = vbNullString
+    failureDetail = vbNullString
+
+    If Len(m_requestBodyCollectorId) = 0 Then
+        failureReason = "collector-unavailable"
+        Exit Function
+    End If
+
+    Dim params As New Dictionary
+    params.Add "dataType", "request"
+    params.Add "collector", m_requestBodyCollectorId
+    params.Add "disown", True
+    params.Add "request", CStr(candidate("requestId"))
+
+    Dim rawRes As String
+    Dim parsed As Object
+    Dim errNum As Long
+    Dim errDesc As String
+
+    On Error Resume Next
+    rawRes = ExecuteBiDiCommand("network.getData", params, True, _
+                                allowAmbiguousRetry:=False, _
+                                allowRecoveryRetry:=False, _
+                                allowContextRetarget:=False, _
+                                commandTimeoutMs:=BODY_GETDATA_TIMEOUT_MS)
+    errNum = Err.Number
+    errDesc = Err.description
+    Err.Clear
+    If errNum = 0 Then Set parsed = ValidateProtocolResponse(rawRes, "network.getData")
+    If Err.Number <> 0 Then
+        errNum = Err.Number
+        errDesc = Err.description
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    If errNum <> 0 Or parsed Is Nothing Then
+        failureDetail = CompactBodyDiagnostic(errDesc)
+        If errNum = 608 Then
+            failureReason = "transport-oversize"
+        ElseIf InStr(1, errDesc, "CommandCorrelationTimeout:", vbBinaryCompare) > 0 Then
+            failureReason = "timeout"
+        ElseIf InStr(1, LCase$(errDesc), "unavailable network data", vbBinaryCompare) > 0 Or _
+               InStr(1, LCase$(errDesc), "no such network data", vbBinaryCompare) > 0 Then
+            failureReason = "unavailable"
+        Else
+            failureReason = "protocol"
+        End If
+        Exit Function
+    End If
+
+    Dim bytesObj As Object
+    Set bytesObj = GetPathObject(parsed, "result.bytes")
+    If bytesObj Is Nothing Then
+        failureReason = "invalid-result"
+        failureDetail = "network.getData returned no result.bytes object."
+        Exit Function
+    End If
+
+    Dim bytesType As String
+    bytesType = GetPathString(bytesObj, "type")
+    If StrComp(bytesType, "string", vbBinaryCompare) <> 0 Then
+        failureReason = "non-text"
+        failureDetail = "BytesValue type=" & IIf(Len(bytesType) > 0, bytesType, "(missing)")
+        Exit Function
+    End If
+
+    If bytesObj.Exists("value") Then
+        If Not IsObject(bytesObj("value")) And Not IsNull(bytesObj("value")) Then
+            bodyText = CStr(bytesObj("value"))
+        End If
+    End If
+
+    TryGetCapturedRequestBody = True
+End Function
+
+
+Private Function BodyStoreSkipCount(ByVal lineText As String) As Long
+    Const COUNT_MARKER As String = " | count="
+    Dim startPos As Long
+    Dim endPos As Long
+    Dim token As String
+
+    startPos = InStr(1, lineText, COUNT_MARKER, vbBinaryCompare)
+    If startPos = 0 Then
+        BodyStoreSkipCount = 1
+        Exit Function
+    End If
+
+    startPos = startPos + Len(COUNT_MARKER)
+    endPos = InStr(startPos, lineText, " | ", vbBinaryCompare)
+    If endPos = 0 Then
+        token = Mid$(lineText, startPos)
+    Else
+        token = Mid$(lineText, startPos, endPos - startPos)
+    End If
+
+    If IsNumeric(token) Then
+        BodyStoreSkipCount = CLng(token)
+    Else
+        BodyStoreSkipCount = 1
+    End If
+End Function
+
+Private Sub AppendBodyStoreStats(ByVal output As Collection)
+    If output Is Nothing Then Exit Sub
+
+    Dim captured As Long
+    Dim responseCaptured As Long
+    Dim requestCaptured As Long
+    Dim truncated As Long
+    Dim miss As Long
+    Dim missUnavailable As Long
+    Dim skipCap As Long
+    Dim skipRedirect As Long
+    Dim skipOversize As Long
+    Dim skipOther As Long
+    Dim disabled As Long
+    Dim inBody As Boolean
+    Dim item As Variant
+    Dim lineText As String
+    Dim skipCount As Long
+
+    For Each item In output
+        lineText = CStr(item)
+
+        If inBody Then
+            If StrComp(lineText, "[/BODY]", vbBinaryCompare) = 0 Then inBody = False
+        ElseIf InStr(1, lineText, "[BODY] RESPONSE |", vbBinaryCompare) = 1 Then
+            captured = captured + 1
+            responseCaptured = responseCaptured + 1
+            If InStr(1, lineText, " | truncated=true", vbTextCompare) > 0 Then truncated = truncated + 1
+            inBody = True
+        ElseIf InStr(1, lineText, "[BODY] REQUEST |", vbBinaryCompare) = 1 Then
+            captured = captured + 1
+            requestCaptured = requestCaptured + 1
+            If InStr(1, lineText, " | truncated=true", vbTextCompare) > 0 Then truncated = truncated + 1
+            inBody = True
+        ElseIf InStr(1, lineText, "[BODY-MISS]", vbBinaryCompare) = 1 Then
+            miss = miss + 1
+            If InStr(1, lineText, "reason=unavailable", vbTextCompare) > 0 Then _
+                missUnavailable = missUnavailable + 1
+        ElseIf InStr(1, lineText, "[BODY-SKIP]", vbBinaryCompare) = 1 Then
+            skipCount = BodyStoreSkipCount(lineText)
+            If InStr(1, lineText, "reason=cap", vbTextCompare) > 0 Then
+                skipCap = skipCap + skipCount
+            ElseIf InStr(1, lineText, "reason=redirect", vbTextCompare) > 0 Then
+                skipRedirect = skipRedirect + skipCount
+            ElseIf InStr(1, lineText, "reason=oversize", vbTextCompare) > 0 Then
+                skipOversize = skipOversize + skipCount
+            Else
+                skipOther = skipOther + skipCount
+            End If
+        ElseIf InStr(1, lineText, "[BODY-DISABLED]", vbBinaryCompare) = 1 Then
+            disabled = disabled + 1
+        End If
+    Next item
+
+    output.Add "[BODY-STATS] captured=" & CStr(captured) & _
+               " | response=" & CStr(responseCaptured) & _
+               " | request=" & CStr(requestCaptured) & _
+               " | truncated=" & CStr(truncated) & _
+               " | miss=" & CStr(miss) & _
+               " | missUnavailable=" & CStr(missUnavailable) & _
+               " | skipCap=" & CStr(skipCap) & _
+               " | skipRedirect=" & CStr(skipRedirect) & _
+               " | skipOversize=" & CStr(skipOversize) & _
+               " | skipOther=" & CStr(skipOther) & _
+               " | disabled=" & CStr(disabled)
+End Sub
+
+Private Function BuildDiscoveryBodyStoreOutput() As Collection
+    Dim output As New Collection
+    Set BuildDiscoveryBodyStoreOutput = output
+
+    If Not m_bodyCaptureRequested And Not m_requestBodyCaptureRequested Then Exit Function
+
+    output.Add "=== BODY STORE (Optional Network Bodies) ==="
+    output.Add "BODY-SECURITY | Request/response bodies may contain credentials, personal, authentication, or confidential data. Review before sharing with AI or public forums."
+    If m_bodyCaptureRequested Then
+        output.Add "BODY-CONFIG | dataType=response | mime=json-only | patterns=" & _
+                   BodyCapturePatternsSummary() & " | collectorMaxEncodedDataSize=" & _
+                   CStr(DEFAULT_MAX_COLLECTED_BODY_SIZE) & " | maxLoggedChars=" & _
+                   CStr(DEFAULT_MAX_LOGGED_BODY_CHARS) & " | maxCount=" & _
+                   CStr(MAX_BODY_CAPTURE_COUNT) & " | maxPerMethodKeyMime=" & CStr(MAX_BODY_PER_KEY)
+    End If
+    If m_requestBodyCaptureRequested Then
+        output.Add "BODY-CONFIG | dataType=request | mime=json-only | patterns=" & _
+                   BodyCapturePatternsSummary() & " | collectorMaxEncodedDataSize=" & _
+                   CStr(DEFAULT_MAX_COLLECTED_BODY_SIZE) & " | maxLoggedChars=" & _
+                   CStr(DEFAULT_MAX_LOGGED_BODY_CHARS) & " | maxCount=" & _
+                   CStr(MAX_BODY_CAPTURE_COUNT) & " | maxPerMethodKeyMime=" & CStr(MAX_BODY_PER_KEY)
+    End If
+
+    ' Never introduce synchronous getData round-trips while a SPA wait is measuring quietness or
+    ' while the async event FIFO is being dispatched. Stop normally satisfies both conditions.
+    If m_waitStackDepth > 0 Or m_isProcessingQueue Then
+        output.Add "[BODY-DISABLED] reason=unsafe-recovery-boundary | waitDepth=" & _
+                   CStr(m_waitStackDepth) & " | processingQueue=" & LCase$(CStr(m_isProcessingQueue))
+    Else
+        If m_bodyCaptureRequested Then
+            If Not m_bodyCaptureActive Then
+                Dim unavailable As String
+                unavailable = m_bodyCaptureUnavailableReason
+                If Len(unavailable) = 0 Then unavailable = "collector unavailable"
+                output.Add "[BODY-DISABLED] RESPONSE | reason=" & CompactBodyDiagnostic(unavailable)
+            ElseIf Not m_bodyCandidates Is Nothing Then
+                Dim candidate As Variant
+                For Each candidate In m_bodyCandidates
+                    Dim bodyText As String
+                    Dim missReason As String
+                    Dim missDetail As String
+                    Dim idText As String
+                    idText = ShortId(CStr(candidate("requestId")))
+
+                    If TryGetCapturedResponseBody(candidate, bodyText, missReason, missDetail) Then
+                        Dim wasTruncated As Boolean
+                        wasTruncated = False
+                        If Len(bodyText) > DEFAULT_MAX_LOGGED_BODY_CHARS Then
+                            bodyText = Left$(bodyText, DEFAULT_MAX_LOGGED_BODY_CHARS)
+                            wasTruncated = True
+                        End If
+
+                        Dim sizeText As String
+                        If CBool(candidate("bodySizeKnown")) Then
+                            sizeText = CStr(candidate("bodySize"))
+                        Else
+                            sizeText = "unknown"
+                        End If
+
+                        output.Add "[BODY] RESPONSE | id=" & idText & _
+                                   " | method=" & CStr(candidate("method")) & _
+                                   " | status=" & CStr(candidate("status")) & _
+                                   " | mime=" & CStr(candidate("mime")) & _
+                                   " | key=" & CStr(candidate("key")) & _
+                                   " | bodySize=" & sizeText & _
+                                   " | truncated=" & LCase$(CStr(wasTruncated))
+                        output.Add bodyText
+                        output.Add "[/BODY]"
+                    Else
+                        Dim missLine As String
+                        missLine = "[BODY-MISS] RESPONSE | reason=" & missReason & _
+                                   " | id=" & idText & _
+                                   " | method=" & CStr(candidate("method")) & _
+                                   " | key=" & CStr(candidate("key"))
+                        If Len(missDetail) > 0 Then missLine = missLine & " | detail=" & missDetail
+                        output.Add missLine
+                    End If
+                Next candidate
+            End If
+        End If
+
+        If m_requestBodyCaptureRequested Then
+            If Not m_requestBodyCaptureActive Then
+                Dim reqUnavailable As String
+                reqUnavailable = m_requestBodyCaptureUnavailableReason
+                If Len(reqUnavailable) = 0 Then reqUnavailable = "collector unavailable"
+                output.Add "[BODY-DISABLED] REQUEST | reason=" & CompactBodyDiagnostic(reqUnavailable)
+            ElseIf Not m_requestBodyCandidates Is Nothing Then
+                Dim reqCandidate As Variant
+                For Each reqCandidate In m_requestBodyCandidates
+                    Dim reqBodyText As String
+                    Dim reqMissReason As String
+                    Dim reqMissDetail As String
+                    Dim reqIdText As String
+                    reqIdText = ShortId(CStr(reqCandidate("requestId")))
+
+                    If TryGetCapturedRequestBody(reqCandidate, reqBodyText, reqMissReason, reqMissDetail) Then
+                        Dim reqWasTruncated As Boolean
+                        reqWasTruncated = False
+                        If Len(reqBodyText) > DEFAULT_MAX_LOGGED_BODY_CHARS Then
+                            reqBodyText = Left$(reqBodyText, DEFAULT_MAX_LOGGED_BODY_CHARS)
+                            reqWasTruncated = True
+                        End If
+
+                        Dim reqSizeText As String
+                        If CBool(reqCandidate("bodySizeKnown")) Then
+                            reqSizeText = CStr(reqCandidate("bodySize"))
+                        Else
+                            reqSizeText = "unknown"
+                        End If
+
+                        output.Add "[BODY] REQUEST | id=" & reqIdText & _
+                                   " | method=" & CStr(reqCandidate("method")) & _
+                                   " | mime=" & CStr(reqCandidate("mime")) & _
+                                   " | key=" & CStr(reqCandidate("key")) & _
+                                   " | bodySize=" & reqSizeText & _
+                                   " | truncated=" & LCase$(CStr(reqWasTruncated))
+                        output.Add reqBodyText
+                        output.Add "[/BODY]"
+                    Else
+                        Dim reqMissLine As String
+                        reqMissLine = "[BODY-MISS] REQUEST | id=" & reqIdText & _
+                                      " | reason=" & reqMissReason & _
+                                      " | method=" & CStr(reqCandidate("method")) & _
+                                      " | mime=" & CStr(reqCandidate("mime")) & _
+                                      " | key=" & CStr(reqCandidate("key"))
+                        If Len(reqMissDetail) > 0 Then reqMissLine = reqMissLine & " | detail=" & reqMissDetail
+                        output.Add reqMissLine
+                    End If
+                Next reqCandidate
+            End If
+        End If
+    End If
+
+    If Not m_bodySkipSummary Is Nothing Then
+        Dim summaryKey As Variant
+        Dim summary As Dictionary
+        For Each summaryKey In m_bodySkipSummary.keys
+            Set summary = m_bodySkipSummary(summaryKey)
+            output.Add "[BODY-SKIP] reason=" & CStr(summary("reason")) & _
+                       " | count=" & CStr(summary("count")) & _
+                       " | firstId=" & ShortId(CStr(summary("firstId"))) & _
+                       " | method=" & CStr(summary("method")) & _
+                       " | mime=" & CStr(summary("mime")) & _
+                       " | key=" & CStr(summary("key"))
+        Next summaryKey
+    End If
+
+    If Not m_requestBodySkipSummary Is Nothing Then
+        Dim reqSummaryKey As Variant
+        For Each reqSummaryKey In m_requestBodySkipSummary.keys
+            Dim reqSummary As Dictionary
+            Set reqSummary = m_requestBodySkipSummary(CStr(reqSummaryKey))
+            output.Add "[BODY-SKIP] REQUEST | reason=" & CStr(reqSummary("reason")) & _
+                       " | count=" & CStr(reqSummary("count")) & _
+                       " | firstId=" & ShortId(CStr(reqSummary("firstId"))) & _
+                       " | method=" & CStr(reqSummary("method")) & _
+                       " | mime=" & CStr(reqSummary("mime")) & _
+                       " | key=" & CStr(reqSummary("key"))
+        Next reqSummaryKey
+    End If
+
+    AppendBodyStoreStats output
+
+End Function
+
 Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = True, _
-                             Optional ByVal captureDomActivity As Boolean = True)
+                             Optional ByVal captureDomActivity As Boolean = True, _
+                             Optional ByVal captureResponseBodies As Boolean = True, _
+                             Optional ByVal captureRequestBodies As Boolean = False)
     ' Stage all recorder-owned objects and scalars locally. No live recorder state is changed
     ' until session.subscribe succeeds, so a failed start leaves an existing recorder intact
     ' and never creates a half-enabled new recorder.
@@ -7598,6 +8618,20 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Dim stagedSuppByKey As New Dictionary
     Dim stagedStartTime As Double
     Dim stagedResponseCompletedSubscriptionId As String
+    Dim stagedBodyCollectorId As String
+    Dim stagedBodyContextId As String
+    Dim stagedBodyCaptureActive As Boolean
+    Dim stagedBodyUnavailableReason As String
+    Dim stagedBodyCandidates As New Collection
+    Dim stagedBodyCandidateCountByKey As New Dictionary
+    Dim stagedBodySkipSummary As New Dictionary
+    Dim stagedRequestBodyCollectorId As String
+    Dim stagedRequestBodyContextId As String
+    Dim stagedRequestBodyCaptureActive As Boolean
+    Dim stagedRequestBodyUnavailableReason As String
+    Dim stagedRequestBodyCandidates As New Collection
+    Dim stagedRequestBodyCandidateCountByKey As New Dictionary
+    Dim stagedRequestBodySkipSummary As New Dictionary
     Dim events(3) As String
 
     On Error GoTo StartFailed
@@ -7635,6 +8669,63 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
         End If
     End If
 
+    ' Body capture is opt-in and capability-probed by attempting the collector once. Failure does
+    ' not disable the ordinary Discovery recorder. A previous unconfirmed collector cleanup blocks
+    ' creation of another collector so we never accumulate browser-side collectors blindly.
+    If m_bodyCollectorCleanupRequired Or Len(m_bodyCollectorId) > 0 Then
+        Dim priorCleanupFailure As String
+        If Not ReleaseBodyDataCollectorBestEffort(priorCleanupFailure) Then
+            If captureResponseBodies Then _
+                stagedBodyUnavailableReason = "previous collector cleanup pending: " & priorCleanupFailure
+        End If
+    End If
+
+    If m_requestBodyCollectorCleanupRequired Or Len(m_requestBodyCollectorId) > 0 Then
+        Dim priorRequestCleanupFailure As String
+        If Not ReleaseRequestBodyDataCollectorBestEffort(priorRequestCleanupFailure) Then
+            If captureRequestBodies Then _
+                stagedRequestBodyUnavailableReason = "previous request collector cleanup pending: " & priorRequestCleanupFailure
+        End If
+    End If
+
+    If captureResponseBodies Then
+        If Len(stagedBodyUnavailableReason) = 0 Then
+            Dim bodyCtxErr As Long
+            Dim bodyCtxErrDesc As String
+            On Error Resume Next
+            stagedBodyContextId = GetMainContextId()
+            bodyCtxErr = Err.Number
+            bodyCtxErrDesc = Err.description
+            Err.Clear
+            On Error GoTo StartFailed
+
+            If bodyCtxErr <> 0 Or Len(stagedBodyContextId) = 0 Then
+                stagedBodyUnavailableReason = "unable to resolve top-level context: " & CompactBodyDiagnostic(bodyCtxErrDesc)
+            ElseIf TryCreateNetworkDataCollector("response", stagedBodyContextId, stagedBodyCollectorId, stagedBodyUnavailableReason) Then
+                stagedBodyCaptureActive = True
+            End If
+        End If
+    End If
+
+    If captureRequestBodies Then
+        If Len(stagedRequestBodyUnavailableReason) = 0 Then
+            Dim reqBodyCtxErr As Long
+            Dim reqBodyCtxErrDesc As String
+            On Error Resume Next
+            stagedRequestBodyContextId = GetMainContextId()
+            reqBodyCtxErr = Err.Number
+            reqBodyCtxErrDesc = Err.description
+            Err.Clear
+            On Error GoTo StartFailed
+
+            If reqBodyCtxErr <> 0 Or Len(stagedRequestBodyContextId) = 0 Then
+                stagedRequestBodyUnavailableReason = "unable to resolve top-level context: " & CompactBodyDiagnostic(reqBodyCtxErrDesc)
+            ElseIf TryCreateNetworkDataCollector("request", stagedRequestBodyContextId, stagedRequestBodyCollectorId, stagedRequestBodyUnavailableReason) Then
+                stagedRequestBodyCaptureActive = True
+            End If
+        End If
+    End If
+
     ' Commit the staged recorder as one logical transaction. Publish m_isRecording last so
     ' guarded append paths never observe an enabled recorder with uninitialized collections.
     m_isRecording = False
@@ -7645,6 +8736,24 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
     m_recorderResponseCompletedSubscriptionId = stagedResponseCompletedSubscriptionId
+    m_bodyCaptureRequested = captureResponseBodies
+    m_bodyCaptureActive = stagedBodyCaptureActive
+    m_bodyCaptureUnavailableReason = stagedBodyUnavailableReason
+    m_bodyCollectorId = stagedBodyCollectorId
+    m_bodyCollectorContextId = stagedBodyContextId
+    m_bodyCollectorCleanupRequired = (Len(stagedBodyCollectorId) > 0)
+    Set m_bodyCandidates = stagedBodyCandidates
+    Set m_bodyCandidateCountByKey = stagedBodyCandidateCountByKey
+    Set m_bodySkipSummary = stagedBodySkipSummary
+    m_requestBodyCaptureRequested = captureRequestBodies
+    m_requestBodyCaptureActive = stagedRequestBodyCaptureActive
+    m_requestBodyCaptureUnavailableReason = stagedRequestBodyUnavailableReason
+    m_requestBodyCollectorId = stagedRequestBodyCollectorId
+    m_requestBodyCollectorContextId = stagedRequestBodyContextId
+    m_requestBodyCollectorCleanupRequired = (Len(stagedRequestBodyCollectorId) > 0)
+    Set m_requestBodyCandidates = stagedRequestBodyCandidates
+    Set m_requestBodyCandidateCountByKey = stagedRequestBodyCandidateCountByKey
+    Set m_requestBodySkipSummary = stagedRequestBodySkipSummary
     m_discoveryDomCaptureEnabled = captureDomActivity
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
@@ -7671,14 +8780,31 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     End If
 
     Debug.Print "BiDi Recorder: Started. (Filter Resources: " & excludeImagesAndCss & _
-                ", DOM Activity: " & captureDomActivity & ")"
+                ", DOM Activity: " & captureDomActivity & _
+                ", Response Bodies: " & IIf(m_bodyCaptureActive, "On", IIf(captureResponseBodies, "Unavailable", "Off")) & _
+                ", Request Bodies: " & IIf(m_requestBodyCaptureActive, "On", IIf(captureRequestBodies, "Unavailable", "Off")) & ")"
     Exit Sub
 
 StartFailed:
     Dim errNum As Long: errNum = Err.Number
     Dim errSrc As String: errSrc = Err.source
     Dim errDesc As String: errDesc = Err.description
-    On Error GoTo 0
+
+    ' If staging created a remote collector but a later start step failed, remove it before
+    ' surfacing the original recorder-start error. Cleanup failure is diagnostic only here.
+    If Len(stagedBodyCollectorId) > 0 Then
+        Dim stagedCleanupFailure As String
+        On Error Resume Next
+        Call TryRemoveDataCollectorById(stagedBodyCollectorId, stagedCleanupFailure)
+        On Error GoTo 0
+    End If
+    If Len(stagedRequestBodyCollectorId) > 0 Then
+        Dim stagedRequestCleanupFailure As String
+        On Error Resume Next
+        Call TryRemoveDataCollectorById(stagedRequestBodyCollectorId, stagedRequestCleanupFailure)
+        On Error GoTo 0
+    End If
+
     Err.Raise errNum, errSrc, errDesc
 End Sub
 
@@ -7690,17 +8816,56 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
 
     m_isRecording = False
 
+    Dim bodyCaptureWasActive As Boolean
+    bodyCaptureWasActive = m_bodyCaptureActive
+    Dim requestBodyCaptureWasActive As Boolean
+    requestBodyCaptureWasActive = m_requestBodyCaptureActive
+
+    Dim bodyStoreOutput As Collection
+    Set bodyStoreOutput = BuildDiscoveryBodyStoreOutput()
+
+    Dim bodyCleanupFailure As String
+    If Not ReleaseBodyDataCollectorBestEffort(bodyCleanupFailure) Then
+        If Not bodyStoreOutput Is Nothing Then
+            If m_bodyCaptureRequested Then _
+                bodyStoreOutput.Add "[BODY-CLEANUP-WARN] collector cleanup unconfirmed | detail=" & _
+                                    CompactBodyDiagnostic(bodyCleanupFailure)
+        End If
+    End If
+    Dim requestBodyCleanupFailure As String
+    If Not ReleaseRequestBodyDataCollectorBestEffort(requestBodyCleanupFailure) Then
+        If Not bodyStoreOutput Is Nothing Then
+            If m_requestBodyCaptureRequested Then _
+                bodyStoreOutput.Add "[BODY-CLEANUP-WARN] REQUEST collector cleanup unconfirmed | detail=" & _
+                                    CompactBodyDiagnostic(requestBodyCleanupFailure)
+        End If
+    End If
+    If (m_bodyCaptureRequested Or m_requestBodyCaptureRequested) And Not bodyStoreOutput Is Nothing Then _
+        bodyStoreOutput.Add "=== END BODY STORE ==="
+
     If m_recorderLogs Is Nothing Then
         m_discoveryDomCaptureEnabled = False
         m_discoveryManualPumpActive = False
         m_discoveryDomContextId = vbNullString
         m_nextDiscoveryDomPollMs = 0#
+        ResetDiscoveryBodyRunState
         Exit Sub
     End If
 
     AppendSuppressedSummary
-    
-    If m_recorderLogs.count > 0 Then
+
+    ' Save when either the timeline has entries OR BODY STORE has diagnostic output.
+    ' This matters for guard tests where an oversized request can be classified before
+    ' any ordinary timeline line survives into the recorder collection.
+    Dim shouldWriteDiscoveryOutput As Boolean
+    shouldWriteDiscoveryOutput = (m_recorderLogs.count > 0)
+    If Not shouldWriteDiscoveryOutput Then
+        If Not bodyStoreOutput Is Nothing Then
+            shouldWriteDiscoveryOutput = (bodyStoreOutput.count > 0)
+        End If
+    End If
+
+    If shouldWriteDiscoveryOutput Then
         ' Resolve relative paths against the folder of the document that owns the active VBA project.
         filePath = WebShared.getFullLocalPath(filePath, targetExists:=False)
 
@@ -7717,6 +8882,22 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                       " | maxTimeoutMs(default)=" & DEFAULT_IDLE_TIMEOUT_MS & _
                       " | excludeResources=" & m_excludeResources & _
                       " | manualDomCapture=" & m_discoveryDomCaptureEnabled & vbCrLf
+        If m_bodyCaptureRequested Then
+            stm.WriteText "BODY-CONFIG | requested=True | active=" & bodyCaptureWasActive & _
+                          " | dataType=response | mime=json-only | patterns=" & BodyCapturePatternsSummary() & _
+                          " | collectorMaxEncodedDataSize=" & DEFAULT_MAX_COLLECTED_BODY_SIZE & _
+                          " | maxLoggedChars=" & DEFAULT_MAX_LOGGED_BODY_CHARS & _
+                          " | maxCount=" & MAX_BODY_CAPTURE_COUNT & _
+                          " | maxPerMethodKeyMime=" & MAX_BODY_PER_KEY & vbCrLf
+        End If
+        If m_requestBodyCaptureRequested Then
+            stm.WriteText "BODY-CONFIG | requested=True | active=" & requestBodyCaptureWasActive & _
+                          " | dataType=request | mime=json-only | patterns=" & BodyCapturePatternsSummary() & _
+                          " | collectorMaxEncodedDataSize=" & DEFAULT_MAX_COLLECTED_BODY_SIZE & _
+                          " | maxLoggedChars=" & DEFAULT_MAX_LOGGED_BODY_CHARS & _
+                          " | maxCount=" & MAX_BODY_CAPTURE_COUNT & _
+                          " | maxPerMethodKeyMime=" & MAX_BODY_PER_KEY & vbCrLf
+        End If
         ' Ring-buffer head eviction is reported so a truncated timeline is never mistaken for
         ' a complete capture.
         If m_droppedHeadCount > 0 Then
@@ -7731,6 +8912,11 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HITs are event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag. dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
         stm.WriteText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
         stm.WriteText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
+        If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
+            stm.WriteText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. [BODY] may be REQUEST or RESPONSE; truncated=True means only the first maxLoggedChars characters were written." & vbCrLf
+            stm.WriteText "LEGEND | [BODY-SKIP] means getData was deliberately not called (redirect, oversize, or capture cap). [BODY-MISS] means a selected getData pull failed; unavailable commonly means data was not retained/was evicted. Missing body data must NOT be interpreted as an empty response body." & vbCrLf
+            stm.WriteText "LEGEND | [BODY-STATS] summarizes captured/truncated/miss/skip outcomes for quick review; detailed [BODY], [BODY-SKIP], and [BODY-MISS] lines remain authoritative." & vbCrLf
+        End If
         stm.WriteText vbCrLf
         stm.WriteText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
         stm.WriteText "Using ONLY the data in this log, produce three things for THIS site:" & vbCrLf
@@ -7785,6 +8971,10 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.WriteText vbCrLf
         stm.WriteText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
         stm.WriteText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
+        If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
+            stm.WriteText "If BODY STORE is present, correlate RESPONSE to [RES] and REQUEST to [REQ] by the same ShortId + key. Treat [BODY-SKIP]/[BODY-MISS] as capture outcomes, not evidence that the HTTP body was empty." & vbCrLf
+            stm.WriteText "Use [BODY-STATS] as the quick outcome summary before inspecting individual BODY records." & vbCrLf
+        End If
         stm.WriteText "=== END REQUEST ===" & vbCrLf
         stm.WriteText "--------------------------------------------------------" & vbCrLf
 
@@ -7792,6 +8982,16 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         For Each logItem In m_recorderLogs
             stm.WriteText logItem & vbCrLf
         Next logItem
+
+        If (m_bodyCaptureRequested Or m_requestBodyCaptureRequested) And Not bodyStoreOutput Is Nothing Then
+            If bodyStoreOutput.count > 0 Then
+                stm.WriteText vbCrLf
+                Dim bodyItem As Variant
+                For Each bodyItem In bodyStoreOutput
+                    stm.WriteText CStr(bodyItem) & vbCrLf
+                Next bodyItem
+            End If
+        End If
 
         stm.position = 0
         stm.Type = 1                      ' adTypeBinary
@@ -7817,6 +9017,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    ResetDiscoveryBodyRunState
 End Sub
 
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
@@ -8191,6 +9392,12 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             LogLine = "[" & relTime & "] [RES] " & resStatus & " [" & mime & "] | id=" & ShortId(resId) & _
                       " | key=" & resKey & " | idle=" & IIf(IsIdleIgnored(resUrl), "skip", "track")
 
+            ' Never call network.getData from event dispatch. Only classify/store the full request id;
+            ' actual synchronous pulls happen later after recording is stopped (or a future safe point).
+            If m_bodyCaptureActive Then
+                ConsiderResponseBodyCandidate params, res, mime, resUrl, resId, resStatus
+            End If
+
             ' Only tracked API responses arriving during an active wait can create this wait's
             ' unresolved-render hint.
             If m_isRecording And m_waitStackDepth > 0 And Not IsIdleIgnored(resUrl) Then
@@ -8219,6 +9426,12 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             LogLine = "[" & relTime & "] [REQ] " & reqMethod & " | id=" & ShortId(reqId) & _
                       " | key=" & NormalizeEndpointKey(reqUrl) & _
                       " | idle=" & IIf(IsIdleIgnored(reqUrl), "skip", "track")
+
+            ' Request bodies are only classified here; the synchronous network.getData pull is
+            ' deferred until Stop (or a future explicitly safe recovery point).
+            If m_requestBodyCaptureActive Then
+                ConsiderRequestBodyCandidate params, reqObj, reqUrl, reqId, reqMethod
+            End If
 
         Case "network.fetchError"
             ' Log blocker matches as [BLOCK] and all other fetch failures as [ERR], even when
@@ -9815,6 +11028,27 @@ Private Sub ApplyDeferredFatalReset()
 End Sub
 
 Private Sub ApplyFatalResetNow()
+    If m_bodyCollectorCleanupRequired Or Len(m_bodyCollectorId) > 0 Then
+        Dim bodyCleanupFailure As String
+        If Not ReleaseBodyDataCollectorBestEffort(bodyCleanupFailure) Then
+            If m_debugMode Then Debug.Print "BiDi Warning: Fatal Reset could not confirm body collector cleanup. " & bodyCleanupFailure
+        End If
+        If m_bodyCaptureRequested Then
+            m_bodyCaptureActive = False
+            If Len(m_bodyCaptureUnavailableReason) = 0 Then m_bodyCaptureUnavailableReason = "fatal-reset"
+        End If
+    End If
+    If m_requestBodyCollectorCleanupRequired Or Len(m_requestBodyCollectorId) > 0 Then
+        Dim requestBodyCleanupFailure As String
+        If Not ReleaseRequestBodyDataCollectorBestEffort(requestBodyCleanupFailure) Then
+            If m_debugMode Then Debug.Print "BiDi Warning: Fatal Reset could not confirm request body collector cleanup. " & requestBodyCleanupFailure
+        End If
+        If m_requestBodyCaptureRequested Then
+            m_requestBodyCaptureActive = False
+            If Len(m_requestBodyCaptureUnavailableReason) = 0 Then m_requestBodyCaptureUnavailableReason = "fatal-reset"
+        End If
+    End If
+
     ResetVolatileContextState
     m_consecutiveCdpFailures = 0
 
@@ -11438,6 +12672,21 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
                 Debug.Print "BiDi CRITICAL: Shutdown could not confirm native file chooser " & _
                             "interception cleanup. Reconnect before further chooser use."
             End If
+        End If
+    End If
+
+    ' Discovery body collectors are browser/session-side state and can retain response data.
+    ' Release them before subscription/transport teardown while a correlated command can still run.
+    If m_bodyCollectorCleanupRequired Or Len(m_bodyCollectorId) > 0 Then
+        Dim bodyShutdownCleanupFailure As String
+        If Not ReleaseBodyDataCollectorBestEffort(bodyShutdownCleanupFailure) Then
+            If m_debugMode Then Debug.Print "BiDi Warning: Shutdown could not confirm body collector cleanup. " & bodyShutdownCleanupFailure
+        End If
+    End If
+    If m_requestBodyCollectorCleanupRequired Or Len(m_requestBodyCollectorId) > 0 Then
+        Dim requestBodyShutdownCleanupFailure As String
+        If Not ReleaseRequestBodyDataCollectorBestEffort(requestBodyShutdownCleanupFailure) Then
+            If m_debugMode Then Debug.Print "BiDi Warning: Shutdown could not confirm request body collector cleanup. " & requestBodyShutdownCleanupFailure
         End If
     End If
 
