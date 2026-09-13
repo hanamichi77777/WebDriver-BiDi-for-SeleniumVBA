@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.6"
+Private Const BIDI_WRAPPER_VERSION As String = "4.7"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -10219,14 +10219,15 @@ Private Function GetActionJs(ByVal actionType As String) As String
    
         Case "input_keys"
 
-            js = js & "try{let e=arguments[0],v=arguments[1];const da=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement){a=a.shadowRoot.activeElement;}return a;};if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
-            js = js & "e.scrollIntoView({block:'center',inline:'center'});if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');e.click();e.focus();"
+            js = js & "try{let e=arguments[0],v=arguments[1];const da=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement){a=a.shadowRoot.activeElement;}return a;};"
+            js = js & "const isTextTarget=(a)=>!!(a&&a.isConnected&&typeof a.selectionStart==='number'&&(a.tagName==='TEXTAREA'||(a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type))));"
+            js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');e.scrollIntoView({block:'center',inline:'center'});if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');e.click();e.focus();"
             js = js & "if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');let prev=null,stb=0;for(let t=performance.now();performance.now()-t<3000;){hb();let a=da();"
-            js = js & "if(a&&a.isConnected&&a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type)&&typeof a.selectionStart==='number'){if(a===prev){stb++;if(stb>=2){e=a;break;}}else{prev=a;stb=1;}}else{prev=null;stb=0;}await new Promise(r=>setTimeout(r,15));}"
+            js = js & "if(isTextTarget(a)){if(a===prev){stb++;if(stb>=2){e=a;break;}}else{prev=a;stb=1;}}else{prev=null;stb=0;}await new Promise(r=>setTimeout(r,15));}"
             js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');(e.select?e.select():document.execCommand('selectAll'));await new Promise(r=>setTimeout(r,80));document.execCommand('delete');await new Promise(r=>setTimeout(r,80));"
             js = js & "if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(e.value){if(e.select)e.select();document.execCommand('forwardDelete');await new Promise(r=>setTimeout(r,80));}if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');"
             js = js & "if(e.value){e.value='';e.dispatchEvent(new Event('input',{bubbles:true}));await new Promise(r=>setTimeout(r,80));}if(!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');" & rp & "await new Promise(r=>setTimeout(r,40));"
-            js = js & "for(let c of v){hb();if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');let s=(typeof e.selectionStart==='number'?e.selectionStart:0);document.execCommand('insertText',false,c);for(let k=0;k<80;k++){let a=da();if(a&&a.isConnected&&a!==e&&a.tagName==='INPUT'&&(a.type==='text'||!a.type))e=a;if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(da()===e&&typeof e.selectionStart==='number'&&e.selectionStart>=s+1)break;await new Promise(r=>setTimeout(r,10));}}"
+            js = js & "for(let c of v){hb();if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');let s=(typeof e.selectionStart==='number'?e.selectionStart:0);document.execCommand('insertText',false,c);for(let k=0;k<80;k++){let a=da();if(a&&a!==e&&isTextTarget(a))e=a;if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(da()===e&&typeof e.selectionStart==='number'&&e.selectionStart>=s+1)break;await new Promise(r=>setTimeout(r,10));}}"
             js = js & "if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(v.length>0&&(!e.value||e.value.length<v.length))throw new Error('Wiz Input Validation Failed: '+e.value);return true;}catch(err){throw err;}"
 
         Case "autoclicker"

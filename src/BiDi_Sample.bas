@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 4.6 / MIT License / Copyright (c) hanamichi77777
+' Version 4.7 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -130,7 +130,6 @@ Public Sub Main03()
     bidi.StartDiscoveryLog
     bidi.ExecuteInputValueByXPath "//input[@id='from_value']", "Tokyo"
     bidi.ExecuteInputValueByXPath "//input[@id='to_value']", "Shinjuku"
-    ' These two selectors may resolve to the same button; keep only one when adapting.
     bidi.ExecuteClickByXPath "//button[starts-with(@id, 'search_button_main')]"
     bidi.ExecuteClickByXPath "//button[@id='search_button_main']"
     Dim logPath As String

@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "4.6"
+Private Const BIDI_SOCKET_VERSION As String = "4.7"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -630,23 +630,23 @@ End Sub
 
 Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boolean
     If m_isConnectUiYielding Then
-        Trace ">>> [Lifecycle] Connect rejected during connection-wait UI yield."
+        trace ">>> [Lifecycle] Connect rejected during connection-wait UI yield."
         Exit Function
     End If
 
     If m_isCommandUiYielding Then
-        Trace ">>> [Lifecycle] Connect rejected during command-correlation UI yield."
+        trace ">>> [Lifecycle] Connect rejected during command-correlation UI yield."
         Exit Function
     End If
 
     If m_isRaisingStateChanged Then
-        Trace ">>> [Lifecycle] Connect rejected during StateChanged notification. " & _
+        trace ">>> [Lifecycle] Connect rejected during StateChanged notification. " & _
               "Schedule the connection attempt after the event handler returns.", True
         Exit Function
     End If
 
     If m_isRecovering And Not m_recoveryConnectAuthorized Then
-        Trace ">>> [Lifecycle] Connect rejected while recovery owns the connection lifecycle.", True
+        trace ">>> [Lifecycle] Connect rejected while recovery owns the connection lifecycle.", True
         Exit Function
     End If
 
@@ -656,7 +656,7 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
     End If
 
     If LenB(wsUrl) = 0 Or localPort < 1 Or localPort > 65535 Then
-        Trace "[Security] Blocked: WebSocket URL is empty or localPort is outside 1..65535.", True
+        trace "[Security] Blocked: WebSocket URL is empty or localPort is outside 1..65535.", True
         SetState StateError
         Exit Function
     End If
@@ -670,7 +670,7 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
     m_RegExp.IgnoreCase = True
 
     If Not m_RegExp.Test(wsUrl) Then
-        Trace "[Security] Blocked: endpoint must be a ws:// loopback URL " & _
+        trace "[Security] Blocked: endpoint must be a ws:// loopback URL " & _
               "using localhost, 127.0.0.1, or [::1].", True
         SetState StateError
         Exit Function
@@ -679,7 +679,7 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
     Dim effectiveWsUrl As String
     Dim normalizeError As String
     If Not NormalizeLoopbackWsUrlPort(wsUrl, localPort, effectiveWsUrl, normalizeError) Then
-        Trace "[Security] Blocked: " & normalizeError, True
+        trace "[Security] Blocked: " & normalizeError, True
         SetState StateError
         Exit Function
     End If
@@ -777,7 +777,7 @@ Private Function ConnectWithWinsock(ByVal wsUrl As String) As Boolean
 
     If Len(fallbackUrl) > 0 Then
         m_WinsockPrimaryFailureText = GetWinsockFailureText()
-        Trace "BiDi Winsock: IPv6 loopback failed before OPEN; trying IPv4 fallback. " & _
+        trace "BiDi Winsock: IPv6 loopback failed before OPEN; trying IPv4 fallback. " & _
               m_WinsockPrimaryFailureText, True
 
         If TryConnectWithWinsockUrl(fallbackUrl) Then
@@ -828,7 +828,7 @@ Private Function TryConnectWithWinsockUrl(ByVal candidateUrl As String) As Boole
         If WsIsOpen Then
             m_WinsockEffectiveWsUrl = candidateUrl
             FinalizeConnectedState
-            Trace "BiDi Winsock: OPEN via " & WinsockEndpointFamily(candidateUrl) & _
+            trace "BiDi Winsock: OPEN via " & WinsockEndpointFamily(candidateUrl) & _
                   " loopback. Effective URL: " & candidateUrl
             TryConnectWithWinsockUrl = True
             Exit Function
@@ -1047,7 +1047,7 @@ Public Function SendMessage(ByVal msg As String, Optional ByVal allowRecovery As
     If m_isRaisingStateChanged Or m_isRecovering Then Exit Function
     If LenB(msg) = 0 Then Exit Function
 
-    Trace ">>> [Socket] Attempting to send message..."
+    trace ">>> [Socket] Attempting to send message..."
 
     If m_state = StateError Then
         If Not allowRecovery Then Exit Function
@@ -1055,7 +1055,7 @@ Public Function SendMessage(ByVal msg As String, Optional ByVal allowRecovery As
     End If
 
     If m_state <> StateConnected Then
-        Trace ">>> [Socket] Send aborted. Not connected.", True
+        trace ">>> [Socket] Send aborted. Not connected.", True
         Exit Function
     End If
 
@@ -1064,7 +1064,7 @@ Public Function SendMessage(ByVal msg As String, Optional ByVal allowRecovery As
         Exit Function
     End If
 
-    Trace ">>> [Socket] Winsock send failed. " & GetWinsockFailureText(), True
+    trace ">>> [Socket] Winsock send failed. " & GetWinsockFailureText(), True
     SetState StateError
     Disconnect keepErrorState:=True
 
@@ -1080,7 +1080,7 @@ Public Sub PostScript(ByVal msg As String)
     On Error Resume Next
 
     If Len(msg) > MAX_MSG_SIZE Then
-        Trace ">>> [PostScript] Outgoing payload dropped. Size=" & _
+        trace ">>> [PostScript] Outgoing payload dropped. Size=" & _
               CStr(Len(msg)) & " chars; Max=" & CStr(MAX_MSG_SIZE) & ".", True
         Exit Sub
     End If
@@ -1180,7 +1180,7 @@ Private Sub TraceSessionDropSummary()
        m_TransportDiscontinuityCount = 0 And _
        m_SalvagedDeferredMessageCount = 0 Then Exit Sub
 
-    Trace ">>> [Session Summary] Connection closing. Dropped asynchronous events=" & _
+    trace ">>> [Session Summary] Connection closing. Dropped asynchronous events=" & _
           m_DroppedEventsCount & "; dropped late/unknown command responses=" & _
           m_DroppedLateResponsesCount & "; parsed-event oversize drops=" & _
           m_DroppedParsedOversizeCount & "; malformed drops=" & _
@@ -1235,7 +1235,7 @@ Private Sub MarkUnexpectedTransportDiscontinuity(ByVal reason As String)
     hadPartial = HasPartialTransportReceiveState()
     If hadPartial Then IncrementLossCounter m_TransportPartialDiscardCount
 
-    Trace ">>> [Transport Continuity] Unexpected stream discontinuity recorded. " & _
+    trace ">>> [Transport Continuity] Unexpected stream discontinuity recorded. " & _
           "Reason=" & reason & "; partialReceive=" & CStr(hadPartial) & _
           "; deferredDepth=" & CStr(WsDeferredTextQueueDepth()) & _
           "; deferredBytes=" & CStr(m_ws_deferredTextQueueBytes) & ".", True
@@ -1277,7 +1277,7 @@ Private Sub SalvageDeferredMessagesAfterTransportFailure(ByVal reason As String)
     Loop
 
     If salvaged > 0 Then
-        Trace ">>> [Transport Continuity] Salvaged " & CStr(salvaged) & _
+        trace ">>> [Transport Continuity] Salvaged " & CStr(salvaged) & _
               " complete deferred message(s) before cleanup. Reason=" & reason & ".", True
     End If
     Exit Sub
@@ -1557,19 +1557,19 @@ End Function
 
 Public Sub Disconnect(Optional ByVal keepErrorState As Boolean = False)
     If m_isCommandUiYielding Then
-        Trace ">>> [Lifecycle] Disconnect rejected during command-correlation UI yield."
+        trace ">>> [Lifecycle] Disconnect rejected during command-correlation UI yield."
         Exit Sub
     End If
 
     If m_isRaisingStateChanged Then
-        Trace ">>> [Lifecycle] Disconnect rejected during StateChanged notification. " & _
+        trace ">>> [Lifecycle] Disconnect rejected during StateChanged notification. " & _
               "Schedule teardown after the event handler returns.", True
         Exit Sub
     End If
 
     If m_isRecovering Then
         m_recoveryCancelRequested = True
-        Trace ">>> [Recovery] Disconnect requested; cancelling the active recovery attempt.", True
+        trace ">>> [Recovery] Disconnect requested; cancelling the active recovery attempt.", True
     End If
 
     If m_state = StateDisconnecting Or m_state = StateDisconnected Then Exit Sub
@@ -1866,21 +1866,21 @@ Private Function AttemptRecovery() As Boolean
 
     If Not m_AutoReconnect Then GoTo CleanExit
     If m_RetryCount >= m_MaxRetryAttempts Then
-        Trace ">>> [Recovery] Max retry attempts reached.", True
+        trace ">>> [Recovery] Max retry attempts reached.", True
         GoTo CleanExit
     End If
 
     m_RetryCount = m_RetryCount + 1
     
     Dim waitTime As Long: waitTime = (2 ^ (m_RetryCount - 1)) * 1000
-    Trace ">>> [Recovery] Attempt #" & m_RetryCount & " (Waiting " & waitTime & "ms)", True
+    trace ">>> [Recovery] Attempt #" & m_RetryCount & " (Waiting " & waitTime & "ms)", True
     
     ' Recovery backoff stays interactive. Public I/O entries reject re-entry while
     ' lifecycle teardown requests cancel the connection rebuild.
     YieldExecution waitTime, True
 
     If m_recoveryCancelRequested Then
-        Trace ">>> [Recovery] Attempt cancelled by a lifecycle teardown request.", True
+        trace ">>> [Recovery] Attempt cancelled by a lifecycle teardown request.", True
         GoTo CleanExit
     End If
 
@@ -1890,11 +1890,11 @@ Private Function AttemptRecovery() As Boolean
     m_recoveryConnectAuthorized = False
 
     If recoveryConnected Then
-        Trace ">>> [Recovery] Success.", True
+        trace ">>> [Recovery] Success.", True
         m_RetryCount = 0
         AttemptRecovery = True
     Else
-        Trace ">>> [Recovery] Failed to reconnect.", True
+        trace ">>> [Recovery] Failed to reconnect.", True
         AttemptRecovery = False
     End If
     
@@ -1921,7 +1921,7 @@ Private Sub ObserveWinsockMessage(ByVal rawMsg As String)
     ' Do not scan every payload for an "error" token: response semantics belong to callers,
     ' and the hot receive path must not turn ordinary BiDi errors into synchronous file I/O.
     m_consecutiveApplicationHeartbeatTimeouts = 0
-    Trace ">>> [Winsock] Message assembled. Length: " & Len(rawMsg)
+    trace ">>> [Winsock] Message assembled. Length: " & Len(rawMsg)
 End Sub
 
 Private Sub ProcessReservedSystemResponse(ByVal inId As String, _
@@ -2002,7 +2002,7 @@ DrainCompleted:
         ' IMPORTANT: a single bounded Pump may enqueue a complete text message and then observe
         ' EOF/reset on the next recv. Drain every completed message BEFORE StateError/recovery.
         SalvageDeferredMessagesAfterTransportFailure "event polling pump observed transport failure"
-        Trace ">>> [Socket] Winsock transport failed during event polling. " & _
+        trace ">>> [Socket] Winsock transport failed during event polling. " & _
               GetWinsockFailureText(), True
         SetState StateError
 
@@ -2014,7 +2014,7 @@ DrainCompleted:
 
     If Not WsIsOpen Then
         SalvageDeferredMessagesAfterTransportFailure "event polling pump closed transport"
-        Trace ">>> [Socket] Winsock transport is no longer open during event polling. " & _
+        trace ">>> [Socket] Winsock transport is no longer open during event polling. " & _
               GetWinsockFailureText(), True
         SetState StateError
 
@@ -2109,7 +2109,7 @@ Public Function GetMessage() As String
             m_consecutiveApplicationHeartbeatTimeouts = m_consecutiveApplicationHeartbeatTimeouts + 1
         End If
 
-        Trace ">>> [Heartbeat] session.status reply timeout. Consecutive=" & _
+        trace ">>> [Heartbeat] session.status reply timeout. Consecutive=" & _
               m_consecutiveApplicationHeartbeatTimeouts & _
               "/" & MAX_CONSECUTIVE_APPLICATION_HEARTBEAT_TIMEOUTS & _
               "; retiring ID=" & m_applicationHeartbeatId & ".", True
@@ -2119,7 +2119,7 @@ Public Function GetMessage() As String
 
         If m_consecutiveApplicationHeartbeatTimeouts >= _
            MAX_CONSECUTIVE_APPLICATION_HEARTBEAT_TIMEOUTS Then
-            Trace ">>> [Heartbeat] Application liveness failure. " & _
+            trace ">>> [Heartbeat] Application liveness failure. " & _
                   "Consecutive session.status timeouts reached the limit.", True
             SetState StateError
             Exit Function
@@ -2302,14 +2302,14 @@ Private Function ReadFromWinsock(Optional ByVal deadline As Double = 0) As Strin
         End If
 
         If Wsstate = WsTransportFailed Then
-            Trace ">>> [Socket] Winsock transport failed while awaiting a response. " & _
+            trace ">>> [Socket] Winsock transport failed while awaiting a response. " & _
                   GetWinsockFailureText(), True
             SetState StateError
             Exit Do
         End If
 
         If Not WsIsOpen Then
-            Trace ">>> [Socket] Winsock transport is no longer open while awaiting a response. " & _
+            trace ">>> [Socket] Winsock transport is no longer open while awaiting a response. " & _
                   GetWinsockFailureText(), True
             SetState StateError
             Exit Do
@@ -2541,7 +2541,7 @@ End Sub
 ' COMMUNICATOR_DEBUG_ENABLED controls outer-communicator Immediate output and
 ' keyword-based file detection. In production, file logging is driven only by
 ' the caller's explicit isCritical classification.
-Public Sub Trace(ByVal msg As String, Optional ByVal isCritical As Boolean = False)
+Public Sub trace(ByVal msg As String, Optional ByVal isCritical As Boolean = False)
     If Not COMMUNICATOR_DEBUG_ENABLED And Not isCritical Then Exit Sub
     
     Dim logMsg As String: logMsg = "[" & Format(Now, "hh:mm:ss") & "] " & msg
@@ -2768,19 +2768,19 @@ End Sub
 ' ForceClose skips the close handshake and performs non-raising emergency teardown.
 Public Sub ForceClose()
     If m_isCommandUiYielding Then
-        Trace ">>> [Lifecycle] ForceClose rejected during command-correlation UI yield."
+        trace ">>> [Lifecycle] ForceClose rejected during command-correlation UI yield."
         Exit Sub
     End If
 
     If m_isRaisingStateChanged Then
-        Trace ">>> [Lifecycle] ForceClose rejected during StateChanged notification. " & _
+        trace ">>> [Lifecycle] ForceClose rejected during StateChanged notification. " & _
               "Schedule emergency teardown after the event handler returns.", True
         Exit Sub
     End If
 
     If m_isRecovering Then
         m_recoveryCancelRequested = True
-        Trace ">>> [Recovery] ForceClose requested; cancelling the active recovery attempt.", True
+        trace ">>> [Recovery] ForceClose requested; cancelling the active recovery attempt.", True
     End If
 
     ' Clear I/O guards before closing native transport so interrupted operations do not
@@ -5147,7 +5147,7 @@ Private Sub WsRecordOversizedMessage()
 End Sub
 
 Private Sub WsTraceOversizedMessageDiagnostic()
-    Trace ">>> [Winsock] OVERSIZED MESSAGE DISCARDED. observedBytes=" & _
+    trace ">>> [Winsock] OVERSIZED MESSAGE DISCARDED. observedBytes=" & _
           Format$(m_ws_messageObservedBytes, "0") & _
           " limitBytes=" & CStr(m_ws_maxIncomingSize) & _
           " retainedBytes=" & CStr(m_ws_messageDiagnosticPrefixCount) & _
