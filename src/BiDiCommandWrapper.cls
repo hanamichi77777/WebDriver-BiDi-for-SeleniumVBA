@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.8"
+Private Const BIDI_WRAPPER_VERSION As String = "4.9"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -293,6 +293,8 @@ Private Const DEFAULT_DOWNLOAD_TIMEOUT_MS As Long = 30000
 Private m_downloadArmed As Boolean
 Private m_downloadOwnerContextId As String
 Private m_downloadContextMissWarned As Boolean
+Private m_downloadAllowCrossContext As Boolean
+Private m_downloadAcceptedContextId As String
 Private m_downloadDroppedEventsAtArm As Long
 Private m_downloadStartedCount As Long
 Private m_downloadUncorrelatableCount As Long
@@ -1222,6 +1224,32 @@ Private Function FindDownloadBatchCorrelationKeyBySuggestedFilename( _
     Next key
 End Function
 
+Private Function AcceptDownloadBatchContext(ByVal eventCtx As String, _
+                                            ByVal isStartEvent As Boolean) As Boolean
+    ' Strict mode preserves the historical behavior: only the trigger context is accepted.
+    If Not m_downloadAllowCrossContext Then
+        AcceptDownloadBatchContext = _
+            (StrComp(eventCtx, m_downloadOwnerContextId, vbBinaryCompare) = 0)
+        Exit Function
+    End If
+
+    ' Cross-context mode latches the context of the first accepted download start.
+    ' Terminal events must then come from that same context.
+    If Len(m_downloadAcceptedContextId) = 0 Then
+        If Not isStartEvent Then Exit Function
+
+        m_downloadAcceptedContextId = eventCtx
+        LogSignalLine "[DOWNLOAD-BATCH-CROSS-CTX-LATCH] triggerCtx=" & _
+                      m_downloadOwnerContextId & _
+                      " | downloadCtx=" & m_downloadAcceptedContextId
+        AcceptDownloadBatchContext = True
+        Exit Function
+    End If
+
+    AcceptDownloadBatchContext = _
+        (StrComp(eventCtx, m_downloadAcceptedContextId, vbBinaryCompare) = 0)
+End Function
+
 Private Sub HandleDownloadBatchWillBeginEvent(ByVal json As Object, ByVal p As Object)
     If Not m_downloadBatchActive Or Not m_downloadArmed Then Exit Sub
 
@@ -1232,10 +1260,11 @@ Private Sub HandleDownloadBatchWillBeginEvent(ByVal json As Object, ByVal p As O
         Exit Sub
     End If
 
-    If StrComp(eventCtx, m_downloadOwnerContextId, vbBinaryCompare) <> 0 Then
+    If Not AcceptDownloadBatchContext(eventCtx, True) Then
         If Not m_downloadContextMissWarned Then
             m_downloadContextMissWarned = True
             LogSignalLine "[DOWNLOAD-BATCH-CTX-MISS] expectedCtx=" & m_downloadOwnerContextId & _
+                          " | acceptedCtx=" & m_downloadAcceptedContextId & _
                           " | actualCtx=" & eventCtx
         End If
         Exit Sub
@@ -1325,8 +1354,9 @@ Private Sub HandleDownloadBatchEndEvent(ByVal json As Object, ByVal p As Object)
         Exit Sub
     End If
 
-    If StrComp(eventCtx, m_downloadOwnerContextId, vbBinaryCompare) <> 0 Then
+    If Not AcceptDownloadBatchContext(eventCtx, False) Then
         LogSignalLine "[DOWNLOAD-BATCH-END-CTX-MISS] expectedCtx=" & m_downloadOwnerContextId & _
+                      " | acceptedCtx=" & m_downloadAcceptedContextId & _
                       " | actualCtx=" & eventCtx
         Exit Sub
     End If
@@ -1418,9 +1448,13 @@ Private Sub ResetDownloadBatchState()
     Set m_downloadBatchTransactions = Nothing
 End Sub
 
-Private Sub ArmDownloadBatch(ByVal contextId As String, ByVal expectedCount As Long)
+Private Sub ArmDownloadBatch(ByVal contextId As String, _
+                             ByVal expectedCount As Long, _
+                             Optional ByVal allowCrossContext As Boolean = False)
     ResetDownloadCaptureState
     m_downloadOwnerContextId = contextId
+    m_downloadAllowCrossContext = allowCrossContext
+    m_downloadAcceptedContextId = vbNullString
     m_downloadBatchExpectedCount = expectedCount
     Set m_downloadBatchTransactions = New Dictionary
     m_downloadDroppedEventsAtArm = CurrentDownloadRelevantLossCount()
@@ -1429,6 +1463,7 @@ Private Sub ArmDownloadBatch(ByVal contextId As String, ByVal expectedCount As L
 
     LogSignalLine "[DOWNLOAD-BATCH-ARM] ctx=" & contextId & _
                   " | expected=" & CStr(expectedCount) & _
+                  " | allowCrossContext=" & CStr(allowCrossContext) & _
                   " | droppedBase=" & CStr(m_downloadDroppedEventsAtArm)
 End Sub
 
@@ -1719,6 +1754,8 @@ Private Sub ResetDownloadCaptureState()
     m_downloadArmed = False
     m_downloadOwnerContextId = vbNullString
     m_downloadContextMissWarned = False
+    m_downloadAllowCrossContext = False
+    m_downloadAcceptedContextId = vbNullString
     m_downloadDroppedEventsAtArm = 0
     m_downloadStartedCount = 0
     m_downloadUncorrelatableCount = 0
@@ -1801,6 +1838,8 @@ Private Sub CaptureLastDownloadFailureDiagnostic(ByVal errNum As Long, _
     d.Add "failureKind", ClassifyDownloadFailureKind(errNum, errDesc, captureInitialized)
     d.Add "captureInitialized", captureInitialized
     d.Add "ownerContext", m_downloadOwnerContextId
+    d.Add "allowCrossContext", m_downloadAllowCrossContext
+    d.Add "acceptedDownloadContext", m_downloadAcceptedContextId
     d.Add "uncorrelatableStarts", m_downloadUncorrelatableCount
     d.Add "firstUncorrelatableContext", m_downloadFirstUncorrelatableContext
     d.Add "asyncEventsDroppedSinceArm", droppedSinceArm
@@ -1968,13 +2007,14 @@ End Function
 Public Function ExecuteDownloadsByXPath(ByVal triggerXpaths As Variant, _
                                         Optional ByVal searchTimeoutMs As Long = 10000, _
                                         Optional ByVal timeoutMs As Long = DEFAULT_DOWNLOAD_TIMEOUT_MS, _
-                                        Optional ByVal contextId As String = "") As Dictionary
+                                        Optional ByVal contextId As String = "", _
+                                        Optional ByVal allowCrossContext As Boolean = False) As Dictionary
     Dim triggers As Collection
     Set triggers = NormalizeDownloadTriggerXpaths(triggerXpaths, "ExecuteDownloadsByXPath")
 
     Set ExecuteDownloadsByXPath = ExecuteDownloadsCore( _
         ElementLocatorXPath, triggers, searchTimeoutMs, timeoutMs, contextId, _
-        "ExecuteDownloadsByXPath")
+        "ExecuteDownloadsByXPath", allowCrossContext)
 End Function
 
 ' Executes one or more Shadow DOM download triggers through the same transaction engine.
@@ -2011,7 +2051,8 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
                                       ByVal searchTimeoutMs As Long, _
                                       ByVal timeoutMs As Long, _
                                       ByVal contextId As String, _
-                                      ByVal callerName As String) As Dictionary
+                                      ByVal callerName As String, _
+                                      Optional ByVal allowCrossContext As Boolean = False) As Dictionary
     Dim methodName As String
     methodName = callerName
 
@@ -2056,7 +2097,7 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
     Next trigger
 
     ProcessRecorderQueue
-    ArmDownloadBatch targetCtx, resolvedTriggerIds.count
+    ArmDownloadBatch targetCtx, resolvedTriggerIds.count, allowCrossContext
     downloadCaptureInitialized = True
 
     Dim triggerSharedId As Variant
@@ -8876,14 +8917,14 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.Charset = "utf-8"
         stm.Open
 
-        stm.WriteText "=== BiDi Discovery Log (Optimized for AI Analysis) ===" & vbCrLf
-        stm.WriteText "Timestamp | Type | Method/Status | MIME | URL/Detail" & vbCrLf
-        stm.WriteText "CONFIG | minStableMs(default)=" & DEFAULT_IDLE_STABLE_MS & _
+        stm.writeText "=== BiDi Discovery Log (Optimized for AI Analysis) ===" & vbCrLf
+        stm.writeText "Timestamp | Type | Method/Status | MIME | URL/Detail" & vbCrLf
+        stm.writeText "CONFIG | minStableMs(default)=" & DEFAULT_IDLE_STABLE_MS & _
                       " | maxTimeoutMs(default)=" & DEFAULT_IDLE_TIMEOUT_MS & _
                       " | excludeResources=" & m_excludeResources & _
                       " | manualDomCapture=" & m_discoveryDomCaptureEnabled & vbCrLf
         If m_bodyCaptureRequested Then
-            stm.WriteText "BODY-CONFIG | requested=True | active=" & bodyCaptureWasActive & _
+            stm.writeText "BODY-CONFIG | requested=True | active=" & bodyCaptureWasActive & _
                           " | dataType=response | mime=json-only | patterns=" & BodyCapturePatternsSummary() & _
                           " | collectorMaxEncodedDataSize=" & DEFAULT_MAX_COLLECTED_BODY_SIZE & _
                           " | maxLoggedChars=" & DEFAULT_MAX_LOGGED_BODY_CHARS & _
@@ -8891,7 +8932,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                           " | maxPerMethodKeyMime=" & MAX_BODY_PER_KEY & vbCrLf
         End If
         If m_requestBodyCaptureRequested Then
-            stm.WriteText "BODY-CONFIG | requested=True | active=" & requestBodyCaptureWasActive & _
+            stm.writeText "BODY-CONFIG | requested=True | active=" & requestBodyCaptureWasActive & _
                           " | dataType=request | mime=json-only | patterns=" & BodyCapturePatternsSummary() & _
                           " | collectorMaxEncodedDataSize=" & DEFAULT_MAX_COLLECTED_BODY_SIZE & _
                           " | maxLoggedChars=" & DEFAULT_MAX_LOGGED_BODY_CHARS & _
@@ -8901,94 +8942,94 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         ' Ring-buffer head eviction is reported so a truncated timeline is never mistaken for
         ' a complete capture.
         If m_droppedHeadCount > 0 Then
-            stm.WriteText "TRUNCATED | dropped " & m_droppedHeadCount & _
+            stm.writeText "TRUNCATED | dropped " & m_droppedHeadCount & _
                           " oldest timeline line(s); only the most recent " & MAX_LOG_SIZE & _
                           " event(s) are shown. Earlier events existed but were evicted (ring buffer)." & vbCrLf
         End If
-        stm.WriteText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
-        stm.WriteText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During navigation URL-stability polling, recorder-owned responseCompleted may be temporarily paused and is restored before SPA idle wait; [REQ] remains live, so some [REQ] lines in that narrow window may have no [RES] pair. Per-request latency (dur=) is not computed." & vbCrLf
-        stm.WriteText "LEGEND | [SPA-ACT]=DOM mutation burst (manual RecordEventsForSeconds samples this by default)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
-        stm.WriteText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
-        stm.WriteText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HITs are event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag. dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
-        stm.WriteText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
-        stm.WriteText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
+        stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
+        stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During navigation URL-stability polling, recorder-owned responseCompleted may be temporarily paused and is restored before SPA idle wait; [REQ] remains live, so some [REQ] lines in that narrow window may have no [RES] pair. Per-request latency (dur=) is not computed." & vbCrLf
+        stm.writeText "LEGEND | [SPA-ACT]=DOM mutation burst (manual RecordEventsForSeconds samples this by default)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
+        stm.writeText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
+        stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HITs are event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag. dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
+        stm.writeText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
+        stm.writeText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
-            stm.WriteText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. [BODY] may be REQUEST or RESPONSE; truncated=True means only the first maxLoggedChars characters were written." & vbCrLf
-            stm.WriteText "LEGEND | [BODY-SKIP] means getData was deliberately not called (redirect, oversize, or capture cap). [BODY-MISS] means a selected getData pull failed; unavailable commonly means data was not retained/was evicted. Missing body data must NOT be interpreted as an empty response body." & vbCrLf
-            stm.WriteText "LEGEND | [BODY-STATS] summarizes captured/truncated/miss/skip outcomes for quick review; detailed [BODY], [BODY-SKIP], and [BODY-MISS] lines remain authoritative." & vbCrLf
+            stm.writeText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. [BODY] may be REQUEST or RESPONSE; truncated=True means only the first maxLoggedChars characters were written." & vbCrLf
+            stm.writeText "LEGEND | [BODY-SKIP] means getData was deliberately not called (redirect, oversize, or capture cap). [BODY-MISS] means a selected getData pull failed; unavailable commonly means data was not retained/was evicted. Missing body data must NOT be interpreted as an empty response body." & vbCrLf
+            stm.writeText "LEGEND | [BODY-STATS] summarizes captured/truncated/miss/skip outcomes for quick review; detailed [BODY], [BODY-SKIP], and [BODY-MISS] lines remain authoritative." & vbCrLf
         End If
-        stm.WriteText vbCrLf
-        stm.WriteText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
-        stm.WriteText "Using ONLY the data in this log, produce three things for THIS site:" & vbCrLf
-        stm.WriteText vbCrLf
-        stm.WriteText "1) Network config suggestions" & vbCrLf
-        stm.WriteText "   - IGNORE (bidi.AddIdleIgnoreNetworkPattern): background telemetry / high-freq APIs that" & vbCrLf
-        stm.WriteText "     should NOT gate the SPA idle wait. IGNORE is non-destructive (the request still fires)," & vbCrLf
-        stm.WriteText "     so it is the safe default for first-party telemetry (e.g. /log, generate_204, autocomplete)." & vbCrLf
-        stm.WriteText "   - BLOCK (bidi.ExecuteEnableResourceBlocking): ONLY requests safe to kill (third-party" & vbCrLf
-        stm.WriteText "     ads/analytics/trackers, or bulk resources not needed). BLOCK is page-altering. NEVER block" & vbCrLf
-        stm.WriteText "     hosts that also serve app code/content (e.g. a CDN serving the page's JS), auth/SSO" & vbCrLf
-        stm.WriteText "     endpoints, or anything page logic depends on. If unsure -> IGNORE, not BLOCK." & vbCrLf
-        stm.WriteText "   - Derive patterns from URLs ACTUALLY seen below (do not guess). '*' = wildcard ""contains"";" & vbCrLf
-        stm.WriteText "     no '*' = literal substring. Do not over-broaden (use ""/log?"" literal, NOT ""*/log*"", which" & vbCrLf
-        stm.WriteText "     would also match /login). Match what was observed (e.g. generate_204, not gen_204)." & vbCrLf
-        stm.WriteText vbCrLf
-        stm.WriteText "2) Wait-time assessment" & vbCrLf
-        stm.WriteText "   - Per [SPA-WAIT-END]: slackMs = domQuietMs - minStableMs (margin over the stability gate)." & vbCrLf
-        stm.WriteText "     Flag any wait with slack < ~100ms as marginal -> consider raising minStableMs, especially" & vbCrLf
-        stm.WriteText "     if that action is capture/timing-sensitive." & vbCrLf
-        stm.WriteText "   - Check maxElapsed vs maxTimeoutMs (headroom). Any TIMEOUT/HALT = wait too short or a real stall." & vbCrLf
-        stm.WriteText "   - Long elapsed caused by slow server responses is NOT a threshold problem; do not raise" & vbCrLf
-        stm.WriteText "     minStableMs for that. Infer server latency from the timestamp gaps between consecutive" & vbCrLf
-        stm.WriteText "     [RES]/[NAV] lines (per-request dur is not recorded; see LEGEND)." & vbCrLf
-        stm.WriteText "   - Gated waits ([SPA-WAIT-BEGIN] carries signal=): a TIMEOUT with signal=..:miss is NOT a" & vbCrLf
-        stm.WriteText "     threshold problem -- do not suggest raising minStableMs for it; fix the armed selector/" & vbCrLf
-        stm.WriteText "     pattern or the action instead. quietAtHit > minStableMs on a net/vis HIT is a settle-to-" & vbCrLf
-        stm.WriteText "     render gap the gate absorbed; for dom HITs use section 3 instead (a dom HIT is itself a" & vbCrLf
-        stm.WriteText "     mutation, so its quietAtHit is structurally near zero and proves nothing)." & vbCrLf
-        stm.WriteText vbCrLf
-        stm.WriteText "3) Settle-to-render suspicion check (early-STABLE warning; the tool pre-computes this)" & vbCrLf
-        stm.WriteText "   - The tool already emits two advisory markers; you do NOT re-derive them by pairing:" & vbCrLf
-        stm.WriteText "     [SPA-CONSENSUS-SUSPECT] = this wait hit STABLE while a tracked json/API it saw produced" & vbCrLf
-        stm.WriteText "       no content render -> treat that STABLE as possibly premature (NOT clean for capture)." & vbCrLf
-        stm.WriteText "     [SPA-CARRYOVER-NOTE] = the immediately next wait then showed a content render that MAY be" & vbCrLf
-        stm.WriteText "       the previous action's delayed paint. It is a heads-up, not an attribution." & vbCrLf
-        stm.WriteText "   - Deliberately NOT provided (do not attempt to compute or demand them): an exact settle-to-" & vbCrLf
-        stm.WriteText "     render gap, an owner pairing (which json produced which render), or an AMBIGUOUS/CONFIRMED" & vbCrLf
-        stm.WriteText "     verdict. The markers only assert 'this run is not clean', never 'this render belongs to X'." & vbCrLf
-        stm.WriteText "   - The check is adjacent-wait only: a hint lives for exactly ONE following wait, so a SUSPECT" & vbCrLf
-        stm.WriteText "     with no NOTE in the very next wait is not chased further. Absence of a NOTE is not 'safe'." & vbCrLf
-        stm.WriteText "   - What to do with a SUSPECT/NOTE (do NOT just raise minStableMs on an ungated wait):" & vbCrLf
-        stm.WriteText "     re-run with an explicit gate from observed lines to confirm and to get the real timing --" & vbCrLf
-        stm.WriteText "       bidi.ArmContentSignal ""<a targeted xpath seen in [SPA-ACT], e.g. //*[@id='table-body']>""" & vbCrLf
-        stm.WriteText "       and/or bidi.ArmNetworkSignal ""<substring of the SUSPECT's firstJson key>""." & vbCrLf
-        stm.WriteText "     With net+content armed, the HITs give a much cleaner measurement than ungated inference" & vbCrLf
-        stm.WriteText "     (net HIT is event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
-        stm.WriteText "     without guessing. Fallback: on a net-armed wait with no stable dom" & vbCrLf
-        stm.WriteText "     selector, raising THAT action's minStableMs to (measured gap + margin) is valid per-action." & vbCrLf
-        stm.WriteText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
-        stm.WriteText "     PREVIOUS action's late paint. Prefer a value-identifying selector for the expected content." & vbCrLf
-        stm.WriteText vbCrLf
-        stm.WriteText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
-        stm.WriteText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
+        stm.writeText vbCrLf
+        stm.writeText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
+        stm.writeText "Using ONLY the data in this log, produce three things for THIS site:" & vbCrLf
+        stm.writeText vbCrLf
+        stm.writeText "1) Network config suggestions" & vbCrLf
+        stm.writeText "   - IGNORE (bidi.AddIdleIgnoreNetworkPattern): background telemetry / high-freq APIs that" & vbCrLf
+        stm.writeText "     should NOT gate the SPA idle wait. IGNORE is non-destructive (the request still fires)," & vbCrLf
+        stm.writeText "     so it is the safe default for first-party telemetry (e.g. /log, generate_204, autocomplete)." & vbCrLf
+        stm.writeText "   - BLOCK (bidi.ExecuteEnableResourceBlocking): ONLY requests safe to kill (third-party" & vbCrLf
+        stm.writeText "     ads/analytics/trackers, or bulk resources not needed). BLOCK is page-altering. NEVER block" & vbCrLf
+        stm.writeText "     hosts that also serve app code/content (e.g. a CDN serving the page's JS), auth/SSO" & vbCrLf
+        stm.writeText "     endpoints, or anything page logic depends on. If unsure -> IGNORE, not BLOCK." & vbCrLf
+        stm.writeText "   - Derive patterns from URLs ACTUALLY seen below (do not guess). '*' = wildcard ""contains"";" & vbCrLf
+        stm.writeText "     no '*' = literal substring. Do not over-broaden (use ""/log?"" literal, NOT ""*/log*"", which" & vbCrLf
+        stm.writeText "     would also match /login). Match what was observed (e.g. generate_204, not gen_204)." & vbCrLf
+        stm.writeText vbCrLf
+        stm.writeText "2) Wait-time assessment" & vbCrLf
+        stm.writeText "   - Per [SPA-WAIT-END]: slackMs = domQuietMs - minStableMs (margin over the stability gate)." & vbCrLf
+        stm.writeText "     Flag any wait with slack < ~100ms as marginal -> consider raising minStableMs, especially" & vbCrLf
+        stm.writeText "     if that action is capture/timing-sensitive." & vbCrLf
+        stm.writeText "   - Check maxElapsed vs maxTimeoutMs (headroom). Any TIMEOUT/HALT = wait too short or a real stall." & vbCrLf
+        stm.writeText "   - Long elapsed caused by slow server responses is NOT a threshold problem; do not raise" & vbCrLf
+        stm.writeText "     minStableMs for that. Infer server latency from the timestamp gaps between consecutive" & vbCrLf
+        stm.writeText "     [RES]/[NAV] lines (per-request dur is not recorded; see LEGEND)." & vbCrLf
+        stm.writeText "   - Gated waits ([SPA-WAIT-BEGIN] carries signal=): a TIMEOUT with signal=..:miss is NOT a" & vbCrLf
+        stm.writeText "     threshold problem -- do not suggest raising minStableMs for it; fix the armed selector/" & vbCrLf
+        stm.writeText "     pattern or the action instead. quietAtHit > minStableMs on a net/vis HIT is a settle-to-" & vbCrLf
+        stm.writeText "     render gap the gate absorbed; for dom HITs use section 3 instead (a dom HIT is itself a" & vbCrLf
+        stm.writeText "     mutation, so its quietAtHit is structurally near zero and proves nothing)." & vbCrLf
+        stm.writeText vbCrLf
+        stm.writeText "3) Settle-to-render suspicion check (early-STABLE warning; the tool pre-computes this)" & vbCrLf
+        stm.writeText "   - The tool already emits two advisory markers; you do NOT re-derive them by pairing:" & vbCrLf
+        stm.writeText "     [SPA-CONSENSUS-SUSPECT] = this wait hit STABLE while a tracked json/API it saw produced" & vbCrLf
+        stm.writeText "       no content render -> treat that STABLE as possibly premature (NOT clean for capture)." & vbCrLf
+        stm.writeText "     [SPA-CARRYOVER-NOTE] = the immediately next wait then showed a content render that MAY be" & vbCrLf
+        stm.writeText "       the previous action's delayed paint. It is a heads-up, not an attribution." & vbCrLf
+        stm.writeText "   - Deliberately NOT provided (do not attempt to compute or demand them): an exact settle-to-" & vbCrLf
+        stm.writeText "     render gap, an owner pairing (which json produced which render), or an AMBIGUOUS/CONFIRMED" & vbCrLf
+        stm.writeText "     verdict. The markers only assert 'this run is not clean', never 'this render belongs to X'." & vbCrLf
+        stm.writeText "   - The check is adjacent-wait only: a hint lives for exactly ONE following wait, so a SUSPECT" & vbCrLf
+        stm.writeText "     with no NOTE in the very next wait is not chased further. Absence of a NOTE is not 'safe'." & vbCrLf
+        stm.writeText "   - What to do with a SUSPECT/NOTE (do NOT just raise minStableMs on an ungated wait):" & vbCrLf
+        stm.writeText "     re-run with an explicit gate from observed lines to confirm and to get the real timing --" & vbCrLf
+        stm.writeText "       bidi.ArmContentSignal ""<a targeted xpath seen in [SPA-ACT], e.g. //*[@id='table-body']>""" & vbCrLf
+        stm.writeText "       and/or bidi.ArmNetworkSignal ""<substring of the SUSPECT's firstJson key>""." & vbCrLf
+        stm.writeText "     With net+content armed, the HITs give a much cleaner measurement than ungated inference" & vbCrLf
+        stm.writeText "     (net HIT is event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
+        stm.writeText "     without guessing. Fallback: on a net-armed wait with no stable dom" & vbCrLf
+        stm.writeText "     selector, raising THAT action's minStableMs to (measured gap + margin) is valid per-action." & vbCrLf
+        stm.writeText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
+        stm.writeText "     PREVIOUS action's late paint. Prefer a value-identifying selector for the expected content." & vbCrLf
+        stm.writeText vbCrLf
+        stm.writeText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
+        stm.writeText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
-            stm.WriteText "If BODY STORE is present, correlate RESPONSE to [RES] and REQUEST to [REQ] by the same ShortId + key. Treat [BODY-SKIP]/[BODY-MISS] as capture outcomes, not evidence that the HTTP body was empty." & vbCrLf
-            stm.WriteText "Use [BODY-STATS] as the quick outcome summary before inspecting individual BODY records." & vbCrLf
+            stm.writeText "If BODY STORE is present, correlate RESPONSE to [RES] and REQUEST to [REQ] by the same ShortId + key. Treat [BODY-SKIP]/[BODY-MISS] as capture outcomes, not evidence that the HTTP body was empty." & vbCrLf
+            stm.writeText "Use [BODY-STATS] as the quick outcome summary before inspecting individual BODY records." & vbCrLf
         End If
-        stm.WriteText "=== END REQUEST ===" & vbCrLf
-        stm.WriteText "--------------------------------------------------------" & vbCrLf
+        stm.writeText "=== END REQUEST ===" & vbCrLf
+        stm.writeText "--------------------------------------------------------" & vbCrLf
 
         Dim logItem As Variant
         For Each logItem In m_recorderLogs
-            stm.WriteText logItem & vbCrLf
+            stm.writeText logItem & vbCrLf
         Next logItem
 
         If (m_bodyCaptureRequested Or m_requestBodyCaptureRequested) And Not bodyStoreOutput Is Nothing Then
             If bodyStoreOutput.count > 0 Then
-                stm.WriteText vbCrLf
+                stm.writeText vbCrLf
                 Dim bodyItem As Variant
                 For Each bodyItem In bodyStoreOutput
-                    stm.WriteText CStr(bodyItem) & vbCrLf
+                    stm.writeText CStr(bodyItem) & vbCrLf
                 Next bodyItem
             End If
         End If
