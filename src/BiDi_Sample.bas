@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 5.2 / MIT License / Copyright (c) hanamichi77777
+' Version 5.3 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -278,6 +278,10 @@ Public Sub Main07()
     bidi.StopAndSaveDiscoveryLog
     
     bidi.Shutdown: Set bidi = Nothing
+    
+    ' Modern SPA pages may still have background activity when VBA-side work has completed.
+    ' CloseBrowser/Shutdown can therefore take a few seconds while the browser exits cleanly.
+    ' Do not add an artificial wait just to make shutdown appear faster.
     .CloseBrowser: .Shutdown
            
     End With
@@ -363,6 +367,10 @@ Public Sub Main08()
         bidi.StopAndSaveDiscoveryLog
         
         bidi.Shutdown: Set bidi = Nothing
+        
+        ' Modern SPA pages may still have background activity when VBA-side work has completed.
+        ' CloseBrowser/Shutdown can therefore take a few seconds while the browser exits cleanly.
+        ' Do not add an artificial wait just to make shutdown appear faster.
         .CloseBrowser: .Shutdown
         
         MsgBox "Google Flights Test Completed"
