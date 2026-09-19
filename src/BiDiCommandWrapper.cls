@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.0"
+Private Const BIDI_WRAPPER_VERSION As String = "5.1"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -157,10 +157,23 @@ Private Const MAX_LOG_SIZE As Long = 5000
 ' Optional Discovery response-body capture. The collector-side limit is a per-item eligibility
 ' threshold (NOT truncation); the logged-character limit is a separate AI/token-size guard.
 Private Const DEFAULT_MAX_COLLECTED_BODY_SIZE As Long = 262144   ' 256 KiB encoded-size eligibility
-Private Const DEFAULT_MAX_LOGGED_BODY_CHARS As Long = 32768      ' 32 Ki characters written per body
+Private Const DEFAULT_MAX_LOGGED_BODY_CHARS As Long = 8192       ' 8 Ki characters written per body after AI compaction
 Private Const MAX_BODY_CAPTURE_COUNT As Long = 25
 Private Const MAX_BODY_PER_KEY As Long = 1
 Private Const BODY_GETDATA_TIMEOUT_MS As Long = 5000
+
+' AI-oriented JSON body compaction. Keep structural evidence while avoiding token-heavy payloads.
+' Parseable XSSI/length-framed envelopes and JSON strings nested inside JSON are normalized first.
+' Normal pass preserves a useful sample; strict pass is retried only when the result still exceeds
+' DEFAULT_MAX_LOGGED_BODY_CHARS. Any remaining excess is finally truncated by the existing guard.
+Private Const BODY_AI_MAX_STRING_CHARS As Long = 256
+Private Const BODY_AI_MAX_ARRAY_ITEMS As Long = 3
+Private Const BODY_AI_MAX_OBJECT_MEMBERS As Long = 24
+Private Const BODY_AI_STRICT_MAX_STRING_CHARS As Long = 128
+Private Const BODY_AI_STRICT_MAX_ARRAY_ITEMS As Long = 2
+Private Const BODY_AI_STRICT_MAX_OBJECT_MEMBERS As Long = 10
+Private Const BODY_AI_MAX_RECURSION_DEPTH As Long = 16
+Private Const BODY_AI_LOSSLESS_SOURCE_MAX_CHARS As Long = 4096   ' half of log cap: normalize small framed JSON without lossy sampling
 ' Manual Discovery DOM sampling uses the existing SPA probe. Keep the normal cadence aligned
 ' with the probe/recorder's ~100ms granularity, but back off after a failed probe recovery so
 ' navigation/realm churn cannot become a tight script.evaluate retry loop.
@@ -183,6 +196,7 @@ Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
 Private m_idleFilterRevision As Long          ' increments whenever VBA-side ignore filters change
 Private m_probeFilterRevisions As Dictionary ' context ID -> last filter revision pushed into that probe
+Private m_probeKnownReadyContexts As Dictionary ' context ID -> True after this document has had a verified healthy probe
 Private m_reportedInvalidSelectors As Dictionary ' selector -> one-shot diagnostic emitted this session
 
 Private m_recorderLogs As Collection
@@ -198,6 +212,8 @@ Private m_nextDiscoveryDomPollMs As Double      ' nowMs deadline; 0 = sample on 
 Private m_recorderResponseCompletedSubscriptionId As String
 ' beforeRequestSent is recorder-only; no latency pairing is retained.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
+Private m_recRequestUrlById As Dictionary   ' full request id -> latest raw URL, including suppressed requests
+Private m_recRequestKeyById As Dictionary   ' full request id -> latest normalized key, including suppressed requests
 Private m_recSuppOverflowCount As Long      ' suppressed events not keyed after the key cap
 Private m_droppedHeadCount As Long          ' count of oldest timeline lines evicted by the MAX_LOG_SIZE ring buffer (0 = none)
 
@@ -247,7 +263,12 @@ Private m_sigVisSeen As Boolean             ' latched: target became visible
 Private m_sigVisXPath As String             ' armed target (diagnostics only)
 Private m_sigLostWarned As Boolean          ' one-shot [SPA-SIGNAL-LOST] warning guard
 Private m_sigNetContextMissWarned As Boolean ' one-shot foreign/empty-context match diagnostic
-Private m_lastProbeQuietMs As Double        ' last polled domQuiet; quietAtHit for net hits
+Private m_lastProbeQuietMs As Double        ' last polled DOM-quiet diagnostic only
+Private m_lastProbeSampleMs As Double       ' VBA monotonic time of the last SPA-probe poll
+Private m_lastProbeContextId As String      ' context associated with the last SPA-probe poll
+Private m_sigNetHitMs As Double             ' VBA monotonic time when the armed network signal matched
+Private m_sigNetHitKey As String            ' normalized key for the matched armed network response
+Private m_sigNetContentObserved As Boolean  ' first post-hit content render diagnostic already emitted
 
 ' Short-lived file-input capture. input.fileDialogOpened is subscribed persistently;
 ' this local arm is one-shot and owned by exactly one browsing context.
@@ -475,6 +496,7 @@ Private Sub Class_Initialize()
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
     Set m_probeFilterRevisions = New Dictionary
+    Set m_probeKnownReadyContexts = New Dictionary
     Set m_reportedInvalidSelectors = New Dictionary
     Set m_autoClickerScriptIds = New Dictionary
     Set m_autoClickerTimeouts = New Dictionary
@@ -714,6 +736,9 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
             If Not m_probeFilterRevisions Is Nothing Then
                 If m_probeFilterRevisions.Exists(m_navigationContextId) Then m_probeFilterRevisions.Remove m_navigationContextId
             End If
+            If Not m_probeKnownReadyContexts Is Nothing Then
+                If m_probeKnownReadyContexts.Exists(m_navigationContextId) Then m_probeKnownReadyContexts.Remove m_navigationContextId
+            End If
 
             If m_debugMode Then
                 If m_navigationContextId = m_mainContextId Then
@@ -740,11 +765,27 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
                 If Len(sigUrl) > 0 And UrlMatchesPattern(sigUrl, m_sigNetPattern) Then
                     If StrComp(sigContext, m_signalOwnerContextId, vbBinaryCompare) = 0 Then
                         m_sigNetSeen = True
+                        m_sigNetHitMs = socket_.nowMs()
+                        m_sigNetHitKey = NormalizeEndpointKey(sigUrl)
+                        m_sigNetContentObserved = False
                         Dim sigStatus As String: sigStatus = GetPathString(json, "params.response.status")
+                        Dim netQuietDiag As String
+                        netQuietDiag = " | quietAtHit=unknown"
+                        If m_lastProbeSampleMs > 0 And _
+                           StrComp(sigContext, m_lastProbeContextId, vbBinaryCompare) = 0 Then
+                            Dim probeSampleAgeMs As Double
+                            probeSampleAgeMs = socket_.nowMs() - m_lastProbeSampleMs
+                            If probeSampleAgeMs < 0 Then probeSampleAgeMs = 0
+                            netQuietDiag = netQuietDiag & _
+                                           " | lastPolledQuietMs=" & Format(m_lastProbeQuietMs, "0") & "ms" & _
+                                           " | sampleAgeMs=" & Format(probeSampleAgeMs, "0")
+                        Else
+                            netQuietDiag = netQuietDiag & " | lastPolledQuietMs=unknown"
+                        End If
                         LogSignalLine "[SPA-SIGNAL-HIT] type=net | key=" & NormalizeEndpointKey(sigUrl) & _
                                       " | status=" & sigStatus & _
                                       " | ctx=" & sigContext & _
-                                      " | quietAtHit=" & Format(m_lastProbeQuietMs, "0") & "ms"
+                                      netQuietDiag
                     ElseIf Not m_sigNetContextMissWarned Then
                         m_sigNetContextMissWarned = True
                         Dim actualSigContext As String: actualSigContext = sigContext
@@ -933,6 +974,9 @@ Private Sub InvalidateContextState(ByVal contextId As String, _
 
     If Not m_probeFilterRevisions Is Nothing Then
         If m_probeFilterRevisions.Exists(contextId) Then m_probeFilterRevisions.Remove contextId
+    End If
+    If Not m_probeKnownReadyContexts Is Nothing Then
+        If m_probeKnownReadyContexts.Exists(contextId) Then m_probeKnownReadyContexts.Remove contextId
     End If
 
     If StrComp(m_lastHudCtx, contextId, vbBinaryCompare) = 0 Then
@@ -6155,6 +6199,7 @@ Private Sub ResetVolatileContextState()
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
     Set m_probeFilterRevisions = New Dictionary
+    Set m_probeKnownReadyContexts = New Dictionary
     Set m_reportedInvalidSelectors = New Dictionary
 
     ResetSignalState
@@ -6510,6 +6555,8 @@ Private Sub ResetSessionBoundaryState()
 
     Set m_recorderLogs = Nothing
     Set m_recSuppByKey = Nothing
+    Set m_recRequestUrlById = Nothing
+    Set m_recRequestKeyById = Nothing
     m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
     m_recorderStartTime = 0
@@ -6539,6 +6586,7 @@ Private Sub ResetSessionBoundaryState()
     Set m_requestBodyCandidateCountByKey = Nothing
     Set m_requestBodySkipSummary = Nothing
 
+    Set m_probeKnownReadyContexts = New Dictionary
     m_navigationDetected = False
     m_navigationContextId = ""
     ResetNavigationSupersessionWatch
@@ -7765,13 +7813,14 @@ Public Sub ClearBodyCapturePatterns()
     Set m_bodyCapturePatterns = New Collection
 End Sub
 
+Private Function HasExplicitBodyCapturePatterns() As Boolean
+    If m_bodyCapturePatterns Is Nothing Then Exit Function
+    HasExplicitBodyCapturePatterns = (m_bodyCapturePatterns.count > 0)
+End Function
+
 Private Function BodyCapturePatternsSummary() As String
-    If m_bodyCapturePatterns Is Nothing Then
-        BodyCapturePatternsSummary = "(all-json)"
-        Exit Function
-    End If
-    If m_bodyCapturePatterns.count = 0 Then
-        BodyCapturePatternsSummary = "(all-json)"
+    If Not HasExplicitBodyCapturePatterns() Then
+        BodyCapturePatternsSummary = "(top-context same-site-json default)"
         Exit Function
     End If
 
@@ -7789,14 +7838,7 @@ Private Function BodyCapturePatternsSummary() As String
 End Function
 
 Private Function BodyCapturePatternMatches(ByVal normalizedKey As String) As Boolean
-    If m_bodyCapturePatterns Is Nothing Then
-        BodyCapturePatternMatches = True
-        Exit Function
-    End If
-    If m_bodyCapturePatterns.count = 0 Then
-        BodyCapturePatternMatches = True
-        Exit Function
-    End If
+    If Not HasExplicitBodyCapturePatterns() Then Exit Function
 
     Dim pat As Variant
     For Each pat In m_bodyCapturePatterns
@@ -7805,6 +7847,84 @@ Private Function BodyCapturePatternMatches(ByVal normalizedKey As String) As Boo
             Exit Function
         End If
     Next pat
+End Function
+
+Private Function GetRequestHeaderValue(ByVal reqObj As Object, _
+                                       ByVal headerNameWanted As String) As String
+    On Error GoTo CleanFail
+    If reqObj Is Nothing Then Exit Function
+    If Not reqObj.Exists("headers") Then Exit Function
+    If Not IsObject(reqObj("headers")) Then Exit Function
+
+    Dim hdr As Variant
+    For Each hdr In reqObj("headers")
+        If IsObject(hdr) Then
+            Dim headerName As String
+            headerName = GetPathString(hdr, "name")
+            If StrComp(headerName, headerNameWanted, vbTextCompare) = 0 Then
+                Dim valObj As Object
+                Set valObj = GetPathObject(hdr, "value")
+                If Not valObj Is Nothing Then
+                    GetRequestHeaderValue = GetPathString(valObj, "value")
+                End If
+                Exit Function
+            End If
+        End If
+    Next hdr
+CleanFail:
+End Function
+
+Private Function DefaultBodySiteScopeAllows(ByVal reqObj As Object, _
+                                            ByVal eventContext As String, _
+                                            ByVal expectedTopContext As String, _
+                                            ByRef scopeReason As String) As Boolean
+    ' Sec-Fetch-Site is relative to the initiator, not to the top-level page. A third-party iframe
+    ' can therefore make a same-origin request to itself. Default BODY STORE capture also requires
+    ' the network event to belong to the recorder's top-level browsing context.
+    If Len(eventContext) = 0 Or Len(expectedTopContext) = 0 Then
+        scopeReason = "context-unknown"
+        Exit Function
+    End If
+    If StrComp(eventContext, expectedTopContext, vbBinaryCompare) <> 0 Then
+        scopeReason = "child-context"
+        Exit Function
+    End If
+
+    Dim secFetchSite As String
+    secFetchSite = LCase$(Trim$(GetRequestHeaderValue(reqObj, "sec-fetch-site")))
+
+    Select Case secFetchSite
+        Case "same-origin", "same-site", "none"
+            DefaultBodySiteScopeAllows = True
+        Case "cross-site"
+            scopeReason = "cross-site"
+        Case Else
+            ' Privacy-safe fallback: missing Fetch Metadata must not silently broaden capture.
+            ' Users can intentionally opt in with AddBodyCapturePattern.
+            scopeReason = "site-unknown"
+    End Select
+End Function
+
+Private Function BodyCaptureScopeAllows(ByVal reqObj As Object, _
+                                        ByVal normalizedKey As String, _
+                                        ByVal eventContext As String, _
+                                        ByVal expectedTopContext As String, _
+                                        ByRef scopeReason As String) As Boolean
+    scopeReason = vbNullString
+
+    ' Explicit patterns intentionally bypass the default log-side scope check; actual getData
+    ' availability still depends on what the browser-side collector retained. With no patterns,
+    ' require top-level context + Fetch Metadata.
+    If HasExplicitBodyCapturePatterns() Then
+        If BodyCapturePatternMatches(normalizedKey) Then
+            BodyCaptureScopeAllows = True
+        Else
+            scopeReason = "pattern"
+        End If
+        Exit Function
+    End If
+
+    BodyCaptureScopeAllows = DefaultBodySiteScopeAllows(reqObj, eventContext, expectedTopContext, scopeReason)
 End Function
 
 Private Function TryCreateNetworkDataCollector(ByVal dataType As String, _
@@ -8045,7 +8165,20 @@ Private Sub ConsiderResponseBodyCandidate(ByVal params As Object, _
 
     Dim normalizedKey As String
     normalizedKey = NormalizeEndpointKey(responseUrl)
-    If Not BodyCapturePatternMatches(normalizedKey) Then Exit Sub
+
+    Dim reqObj As Object
+    Set reqObj = GetPathObject(params, "request")
+
+    Dim scopeReason As String
+    Dim responseContext As String
+    responseContext = GetPathString(params, "context")
+    If Not BodyCaptureScopeAllows(reqObj, normalizedKey, responseContext, m_bodyCollectorContextId, scopeReason) Then
+        Dim skippedMethod As String
+        skippedMethod = GetPathString(params, "request.method")
+        If Len(skippedMethod) = 0 Then skippedMethod = "?"
+        BumpBodySkipSummary scopeReason, skippedMethod, normalizedKey, mime, requestId
+        Exit Sub
+    End If
 
     Dim method As String
     method = GetPathString(params, "request.method")
@@ -8114,27 +8247,7 @@ Private Sub ConsiderResponseBodyCandidate(ByVal params As Object, _
 End Sub
 
 Private Function GetRequestContentType(ByVal reqObj As Object) As String
-    On Error GoTo CleanFail
-    If reqObj Is Nothing Then Exit Function
-    If Not reqObj.Exists("headers") Then Exit Function
-    If Not IsObject(reqObj("headers")) Then Exit Function
-
-    Dim hdr As Variant
-    For Each hdr In reqObj("headers")
-        If IsObject(hdr) Then
-            Dim headerName As String
-            headerName = GetPathString(hdr, "name")
-            If StrComp(headerName, "content-type", vbTextCompare) = 0 Then
-                Dim valObj As Object
-                Set valObj = GetPathObject(hdr, "value")
-                If Not valObj Is Nothing Then
-                    GetRequestContentType = GetPathString(valObj, "value")
-                End If
-                Exit Function
-            End If
-        End If
-    Next hdr
-CleanFail:
+    GetRequestContentType = GetRequestHeaderValue(reqObj, "content-type")
 End Function
 
 Private Sub BumpRequestBodySkipSummary(ByVal reason As String, _
@@ -8173,11 +8286,18 @@ Private Sub ConsiderRequestBodyCandidate(ByVal params As Object, _
 
     Dim normalizedKey As String
     normalizedKey = NormalizeEndpointKey(reqUrl)
-    If Not BodyCapturePatternMatches(normalizedKey) Then Exit Sub
 
     Dim contentType As String
     contentType = GetRequestContentType(reqObj)
     If InStr(1, LCase$(contentType), "json", vbBinaryCompare) = 0 Then Exit Sub
+
+    Dim scopeReason As String
+    Dim requestContext As String
+    requestContext = GetPathString(params, "context")
+    If Not BodyCaptureScopeAllows(reqObj, normalizedKey, requestContext, m_requestBodyCollectorContextId, scopeReason) Then
+        BumpRequestBodySkipSummary scopeReason, method, normalizedKey, contentType, requestId
+        Exit Sub
+    End If
 
     Dim redirectCount As Long
     Dim redirectText As String
@@ -8417,6 +8537,587 @@ Private Function TryGetCapturedRequestBody(ByVal candidate As Dictionary, _
 End Function
 
 
+Private Function AiJsonFirstNonWhitespacePos(ByVal value As String) As Long
+    Dim i As Long
+    Dim ch As String
+
+    For i = 1 To Len(value)
+        ch = Mid$(value, i, 1)
+        If ch <> " " And ch <> vbTab And ch <> vbCr And ch <> vbLf Then
+            AiJsonFirstNonWhitespacePos = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Sub AiJsonSkipWhitespace(ByVal value As String, ByRef pos As Long)
+    Dim ch As String
+
+    Do While pos <= Len(value)
+        ch = Mid$(value, pos, 1)
+        If ch <> " " And ch <> vbTab And ch <> vbCr And ch <> vbLf Then Exit Do
+        pos = pos + 1
+    Loop
+End Sub
+
+Private Function AiJsonLooksLikeContainer(ByVal value As String) As Boolean
+    Dim pos As Long
+    pos = AiJsonFirstNonWhitespacePos(value)
+    If pos = 0 Then Exit Function
+
+    Dim ch As String
+    ch = Mid$(value, pos, 1)
+    AiJsonLooksLikeContainer = (ch = "{" Or ch = "[")
+End Function
+
+Private Function TryParseAiJsonContainer(ByVal value As String, _
+                                         ByRef parsed As Object) As Boolean
+    Set parsed = Nothing
+    If Not AiJsonLooksLikeContainer(value) Then Exit Function
+
+    On Error Resume Next
+    Set parsed = WebJsonConverter.ParseJson(value)
+    On Error GoTo 0
+
+    TryParseAiJsonContainer = Not parsed Is Nothing
+End Function
+
+Private Function TryExtractAiJsonValue(ByVal value As String, _
+                                       ByVal startPos As Long, _
+                                       ByRef jsonText As String, _
+                                       ByRef nextPos As Long) As Boolean
+    jsonText = vbNullString
+    nextPos = startPos
+    If startPos < 1 Or startPos > Len(value) Then Exit Function
+
+    Dim firstCh As String
+    firstCh = Mid$(value, startPos, 1)
+    If firstCh <> "{" And firstCh <> "[" Then Exit Function
+
+    Dim depth As Long
+    Dim inString As Boolean
+    Dim escaped As Boolean
+    Dim i As Long
+    Dim ch As String
+
+    For i = startPos To Len(value)
+        ch = Mid$(value, i, 1)
+
+        If inString Then
+            If escaped Then
+                escaped = False
+            ElseIf ch = "\" Then
+                escaped = True
+            ElseIf ch = Chr$(34) Then
+                inString = False
+            End If
+        Else
+            Select Case ch
+                Case Chr$(34)
+                    inString = True
+                Case "{", "["
+                    depth = depth + 1
+                Case "}", "]"
+                    depth = depth - 1
+                    If depth = 0 Then
+                        jsonText = Mid$(value, startPos, i - startPos + 1)
+                        nextPos = i + 1
+                        TryExtractAiJsonValue = True
+                        Exit Function
+                    ElseIf depth < 0 Then
+                        Exit Function
+                    End If
+            End Select
+        End If
+    Next i
+End Function
+
+Private Function TrySkipAiJsonLengthLine(ByVal value As String, _
+                                         ByRef pos As Long) As Boolean
+    Dim scanPos As Long
+    scanPos = pos
+
+    Dim digitCount As Long
+    Dim ch As String
+    Do While scanPos <= Len(value)
+        ch = Mid$(value, scanPos, 1)
+        If ch < "0" Or ch > "9" Then Exit Do
+        digitCount = digitCount + 1
+        scanPos = scanPos + 1
+    Loop
+    If digitCount = 0 Then Exit Function
+
+    Do While scanPos <= Len(value)
+        ch = Mid$(value, scanPos, 1)
+        If ch <> " " And ch <> vbTab Then Exit Do
+        scanPos = scanPos + 1
+    Loop
+
+    If scanPos > Len(value) Then Exit Function
+    ch = Mid$(value, scanPos, 1)
+    If ch <> vbCr And ch <> vbLf Then Exit Function
+
+    If ch = vbCr Then
+        scanPos = scanPos + 1
+        If scanPos <= Len(value) Then
+            If Mid$(value, scanPos, 1) = vbLf Then scanPos = scanPos + 1
+        End If
+    Else
+        scanPos = scanPos + 1
+    End If
+
+    pos = scanPos
+    TrySkipAiJsonLengthLine = True
+End Function
+
+Private Function TryParseAiJsonFrameEnvelope(ByVal bodyText As String, _
+                                             ByRef parsedEnvelope As Object) As Boolean
+    Set parsedEnvelope = Nothing
+    If Len(bodyText) = 0 Then Exit Function
+
+    Dim pos As Long
+    pos = 1
+    AiJsonSkipWhitespace bodyText, pos
+
+    Dim hadXssiPrefix As Boolean
+    If pos + 3 <= Len(bodyText) Then
+        If Mid$(bodyText, pos, 4) = ")]}'" Then
+            hadXssiPrefix = True
+            pos = pos + 4
+            If pos <= Len(bodyText) Then
+                If Mid$(bodyText, pos, 1) = "," Then pos = pos + 1
+            End If
+        End If
+    End If
+
+    AiJsonSkipWhitespace bodyText, pos
+
+    Dim frames As New Collection
+    Dim hadLengthPrefix As Boolean
+    Dim frameText As String
+    Dim nextPos As Long
+    Dim frameObj As Object
+
+    Do While pos <= Len(bodyText)
+        AiJsonSkipWhitespace bodyText, pos
+        If pos > Len(bodyText) Then Exit Do
+
+        If TrySkipAiJsonLengthLine(bodyText, pos) Then
+            hadLengthPrefix = True
+            AiJsonSkipWhitespace bodyText, pos
+        End If
+        If pos > Len(bodyText) Then Exit Do
+
+        If Mid$(bodyText, pos, 1) <> "{" And Mid$(bodyText, pos, 1) <> "[" Then Exit Do
+
+        frameText = vbNullString
+        nextPos = pos
+        If Not TryExtractAiJsonValue(bodyText, pos, frameText, nextPos) Then Exit Do
+
+        Set frameObj = Nothing
+        If Not TryParseAiJsonContainer(frameText, frameObj) Then Exit Do
+        frames.Add frameObj
+        pos = nextPos
+    Loop
+
+    If frames.count = 0 Then Exit Function
+    If Not hadXssiPrefix And Not hadLengthPrefix And frames.count = 1 Then Exit Function
+
+    Dim envelope As New Dictionary
+    envelope.Add "__ai_envelope__", "json-frames"
+    envelope.Add "frameCount", frames.count
+
+    Dim framesValue As Variant
+    Set framesValue = frames
+    Call AssignValue(envelope, "frames", framesValue)
+
+    Set parsedEnvelope = envelope
+    TryParseAiJsonFrameEnvelope = True
+End Function
+
+Private Function TryParseEmbeddedAiJson(ByVal value As String, _
+                                        ByRef parsed As Object) As Boolean
+    Set parsed = Nothing
+    If Len(value) < 2 Then Exit Function
+    TryParseEmbeddedAiJson = TryParseAiJsonContainer(value, parsed)
+End Function
+
+Private Function BuildAiNormalizedJsonObject(ByVal node As Object, _
+                                             ByVal currentDepth As Long) As Object
+    Dim nodeType As String
+    nodeType = TypeName(node)
+
+    ' Lossless normalization never drops values. At the recursion guard, preserve the parsed
+    ' container unchanged rather than inserting an omission marker.
+    If currentDepth >= BODY_AI_MAX_RECURSION_DEPTH Then
+        Set BuildAiNormalizedJsonObject = node
+        Exit Function
+    End If
+
+    If nodeType = "Dictionary" Then
+        Dim normDict As New Dictionary
+        Dim k As Variant
+        For Each k In node.keys
+            Dim dictValue As Variant
+            Assign dictValue, node(k)
+
+            If IsObject(dictValue) Then
+                Dim dictChild As Object
+                Set dictChild = dictValue
+                Dim normDictChild As Object
+                Set normDictChild = BuildAiNormalizedJsonObject(dictChild, currentDepth + 1)
+                Dim normDictChildValue As Variant
+                Set normDictChildValue = normDictChild
+                Call AssignValue(normDict, CStr(k), normDictChildValue)
+            ElseIf VarType(dictValue) = vbString Then
+                Dim dictString As String
+                dictString = CStr(dictValue)
+
+                Dim dictEmbedded As Object
+                If TryParseEmbeddedAiJson(dictString, dictEmbedded) Then
+                    Dim normEmbeddedDict As Object
+                    Set normEmbeddedDict = BuildAiNormalizedJsonObject(dictEmbedded, currentDepth + 1)
+
+                    Dim embeddedDictMarker As New Dictionary
+                    Dim embeddedDictValue As Variant
+                    Set embeddedDictValue = normEmbeddedDict
+                    Call AssignValue(embeddedDictMarker, "__ai_embedded_json__", embeddedDictValue)
+
+                    Dim markerDictValue As Variant
+                    Set markerDictValue = embeddedDictMarker
+                    Call AssignValue(normDict, CStr(k), markerDictValue)
+                Else
+                    normDict(CStr(k)) = dictString
+                End If
+            Else
+                normDict(CStr(k)) = dictValue
+            End If
+        Next k
+
+        Set BuildAiNormalizedJsonObject = normDict
+        Exit Function
+    End If
+
+    If nodeType = "Collection" Then
+        Dim normList As New Collection
+        Dim i As Long
+        For i = 1 To node.count
+            Dim listValue As Variant
+            Assign listValue, node(i)
+
+            If IsObject(listValue) Then
+                Dim listChild As Object
+                Set listChild = listValue
+                Dim normListChild As Object
+                Set normListChild = BuildAiNormalizedJsonObject(listChild, currentDepth + 1)
+                normList.Add normListChild
+            ElseIf VarType(listValue) = vbString Then
+                Dim listString As String
+                listString = CStr(listValue)
+
+                Dim listEmbedded As Object
+                If TryParseEmbeddedAiJson(listString, listEmbedded) Then
+                    Dim normEmbeddedList As Object
+                    Set normEmbeddedList = BuildAiNormalizedJsonObject(listEmbedded, currentDepth + 1)
+
+                    Dim embeddedListMarker As New Dictionary
+                    Dim embeddedListValue As Variant
+                    Set embeddedListValue = normEmbeddedList
+                    Call AssignValue(embeddedListMarker, "__ai_embedded_json__", embeddedListValue)
+                    normList.Add embeddedListMarker
+                Else
+                    normList.Add listString
+                End If
+            Else
+                normList.Add listValue
+            End If
+        Next i
+
+        Set BuildAiNormalizedJsonObject = normList
+        Exit Function
+    End If
+
+    ' Parsed JSON containers should be Dictionary/Collection. Preserve an unexpected object
+    ' rather than replacing it with a lossy marker in this lossless path.
+    Set BuildAiNormalizedJsonObject = node
+End Function
+
+Private Function TryNormalizeFramedJsonBodyForAi(ByVal bodyText As String, _
+                                                  ByRef normalizedText As String) As Boolean
+    normalizedText = vbNullString
+    If Len(bodyText) = 0 Then Exit Function
+
+    Dim parsedEnvelope As Object
+    If Not TryParseAiJsonFrameEnvelope(bodyText, parsedEnvelope) Then Exit Function
+
+    On Error GoTo NormalizeFailed
+    Dim normalizedRoot As Object
+    Set normalizedRoot = BuildAiNormalizedJsonObject(parsedEnvelope, 0)
+    normalizedText = WebJsonConverter.ConvertToJson(normalizedRoot)
+    TryNormalizeFramedJsonBodyForAi = True
+    Exit Function
+
+NormalizeFailed:
+    normalizedText = vbNullString
+End Function
+
+Private Function BuildAiCompactedJsonObject(ByVal node As Object, _
+                                            ByVal maxStringChars As Long, _
+                                            ByVal maxArrayItems As Long, _
+                                            ByVal maxObjectMembers As Long, _
+                                            ByVal currentDepth As Long, _
+                                            ByRef changed As Boolean) As Object
+    Dim nodeType As String
+    nodeType = TypeName(node)
+
+    If currentDepth >= BODY_AI_MAX_RECURSION_DEPTH Then
+        Dim depthMarker As New Dictionary
+        depthMarker.Add "__ai_compact__", "maxDepth"
+        changed = True
+        Set BuildAiCompactedJsonObject = depthMarker
+        Exit Function
+    End If
+
+    If nodeType = "Dictionary" Then
+        Dim compactDict As New Dictionary
+        Dim k As Variant
+        Dim memberIndex As Long
+        Dim omittedMembers As Long
+
+        For Each k In node.keys
+            memberIndex = memberIndex + 1
+            If memberIndex > maxObjectMembers Then
+                omittedMembers = omittedMembers + 1
+                changed = True
+            Else
+                Dim dictValue As Variant
+                Assign dictValue, node(k)
+
+                If IsObject(dictValue) Then
+                    Dim dictChild As Object
+                    Set dictChild = dictValue
+                    Dim compactDictChild As Object
+                    Set compactDictChild = BuildAiCompactedJsonObject( _
+                        dictChild, maxStringChars, maxArrayItems, maxObjectMembers, _
+                        currentDepth + 1, changed)
+                    Dim dictChildValue As Variant
+                    Set dictChildValue = compactDictChild
+                    Call AssignValue(compactDict, CStr(k), dictChildValue)
+                ElseIf VarType(dictValue) = vbString Then
+                    Dim dictString As String
+                    dictString = CStr(dictValue)
+
+                    Dim dictEmbedded As Object
+                    If TryParseEmbeddedAiJson(dictString, dictEmbedded) Then
+                        Dim compactEmbeddedDict As Object
+                        Set compactEmbeddedDict = BuildAiCompactedJsonObject( _
+                            dictEmbedded, maxStringChars, maxArrayItems, maxObjectMembers, _
+                            currentDepth + 1, changed)
+
+                        Dim embeddedDictMarker As Dictionary
+                        Set embeddedDictMarker = New Dictionary
+                        Dim embeddedDictValue As Variant
+                        Set embeddedDictValue = compactEmbeddedDict
+                        Call AssignValue(embeddedDictMarker, "__ai_embedded_json__", embeddedDictValue)
+
+                        Dim markerDictValue As Variant
+                        Set markerDictValue = embeddedDictMarker
+                        Call AssignValue(compactDict, CStr(k), markerDictValue)
+                        changed = True
+                    ElseIf Len(dictString) > maxStringChars Then
+                        compactDict(CStr(k)) = "<LONG_STRING len=" & Len(dictString) & ">"
+                        changed = True
+                    Else
+                        compactDict(CStr(k)) = dictString
+                    End If
+                Else
+                    compactDict(CStr(k)) = dictValue
+                End If
+            End If
+        Next k
+
+        If omittedMembers > 0 Then
+            Dim omittedKey As String
+            omittedKey = "__ai_omitted_members"
+            Do While compactDict.Exists(omittedKey)
+                omittedKey = omittedKey & "_"
+            Loop
+            compactDict.Add omittedKey, omittedMembers
+        End If
+
+        Set BuildAiCompactedJsonObject = compactDict
+        Exit Function
+    End If
+
+    If nodeType = "Collection" Then
+        Dim compactList As New Collection
+        Dim keepCount As Long
+        keepCount = node.count
+        If keepCount > maxArrayItems Then keepCount = maxArrayItems
+
+        Dim i As Long
+        For i = 1 To keepCount
+            Dim listValue As Variant
+            Assign listValue, node(i)
+
+            If IsObject(listValue) Then
+                Dim listChild As Object
+                Set listChild = listValue
+                Dim compactListChild As Object
+                Set compactListChild = BuildAiCompactedJsonObject( _
+                    listChild, maxStringChars, maxArrayItems, maxObjectMembers, _
+                    currentDepth + 1, changed)
+                compactList.Add compactListChild
+            ElseIf VarType(listValue) = vbString Then
+                Dim listString As String
+                listString = CStr(listValue)
+
+                Dim listEmbedded As Object
+                If TryParseEmbeddedAiJson(listString, listEmbedded) Then
+                    Dim compactEmbeddedList As Object
+                    Set compactEmbeddedList = BuildAiCompactedJsonObject( _
+                        listEmbedded, maxStringChars, maxArrayItems, maxObjectMembers, _
+                        currentDepth + 1, changed)
+
+                    Dim embeddedListMarker As Dictionary
+                    Set embeddedListMarker = New Dictionary
+                    Dim embeddedListValue As Variant
+                    Set embeddedListValue = compactEmbeddedList
+                    Call AssignValue(embeddedListMarker, "__ai_embedded_json__", embeddedListValue)
+                    compactList.Add embeddedListMarker
+                    changed = True
+                ElseIf Len(listString) > maxStringChars Then
+                    compactList.Add "<LONG_STRING len=" & Len(listString) & ">"
+                    changed = True
+                Else
+                    compactList.Add listString
+                End If
+            Else
+                compactList.Add listValue
+            End If
+        Next i
+
+        If node.count > keepCount Then
+            Dim arrayMarker As New Dictionary
+            arrayMarker.Add "__ai_omitted_items", node.count - keepCount
+            compactList.Add arrayMarker
+            changed = True
+        End If
+
+        Set BuildAiCompactedJsonObject = compactList
+        Exit Function
+    End If
+
+    Dim objectMarker As New Dictionary
+    objectMarker.Add "__ai_compact__", "unsupportedObject:" & nodeType
+    changed = True
+    Set BuildAiCompactedJsonObject = objectMarker
+End Function
+
+Private Function TryCompactJsonBodyForAi(ByVal bodyText As String, _
+                                         ByVal maxStringChars As Long, _
+                                         ByVal maxArrayItems As Long, _
+                                         ByVal maxObjectMembers As Long, _
+                                         ByRef compactedText As String, _
+                                         ByRef changed As Boolean, _
+                                         ByRef normalizedEnvelope As Boolean) As Boolean
+    compactedText = vbNullString
+    changed = False
+    normalizedEnvelope = False
+    If Len(bodyText) = 0 Then Exit Function
+
+    Dim parsed As Object
+
+    On Error Resume Next
+    Set parsed = WebJsonConverter.ParseJson(bodyText)
+    On Error GoTo 0
+
+    If parsed Is Nothing Then
+        If TryParseAiJsonFrameEnvelope(bodyText, parsed) Then
+            normalizedEnvelope = True
+        Else
+            Exit Function
+        End If
+    End If
+
+    Dim compactedRoot As Object
+    On Error GoTo CompactFailed
+    Set compactedRoot = BuildAiCompactedJsonObject( _
+        parsed, maxStringChars, maxArrayItems, maxObjectMembers, 0, changed)
+
+    compactedText = WebJsonConverter.ConvertToJson(compactedRoot)
+    TryCompactJsonBodyForAi = True
+    Exit Function
+
+CompactFailed:
+    compactedText = vbNullString
+    changed = False
+End Function
+
+Private Function CompactBodyForAiLog(ByVal bodyText As String, _
+                                     ByRef wasCompacted As Boolean, _
+                                     ByRef wasNormalized As Boolean) As String
+    wasCompacted = False
+    wasNormalized = False
+    CompactBodyForAiLog = bodyText
+    If Len(bodyText) = 0 Then Exit Function
+
+    ' Small payloads are already cheap to log. For framed/XSSI JSON, normalize the envelope
+    ' and expand embedded JSON losslessly, but do NOT sample arrays/objects or replace strings.
+    ' A half-cap source threshold leaves headroom for the canonical envelope to grow.
+    If Len(bodyText) <= BODY_AI_LOSSLESS_SOURCE_MAX_CHARS Then
+        Dim normalizedText As String
+        If TryNormalizeFramedJsonBodyForAi(bodyText, normalizedText) Then
+            If Len(normalizedText) <= DEFAULT_MAX_LOGGED_BODY_CHARS Then
+                CompactBodyForAiLog = normalizedText
+                wasNormalized = True
+                Exit Function
+            End If
+        Else
+            ' Ordinary small JSON/non-framed text remains byte-for-byte as retrieved.
+            Exit Function
+        End If
+    End If
+
+    Dim compactedText As String
+    Dim changed As Boolean
+    Dim normalizedEnvelope As Boolean
+
+    If TryCompactJsonBodyForAi(bodyText, _
+                               BODY_AI_MAX_STRING_CHARS, _
+                               BODY_AI_MAX_ARRAY_ITEMS, _
+                               BODY_AI_MAX_OBJECT_MEMBERS, _
+                               compactedText, changed, normalizedEnvelope) Then
+        ' Large framed/XSSI JSON is normalized and structurally compacted. Ordinary JSON adopts
+        ' compaction only when it actually reduces the logged representation.
+        If normalizedEnvelope Then
+            CompactBodyForAiLog = compactedText
+            wasNormalized = True
+            wasCompacted = changed
+        ElseIf changed And Len(compactedText) < Len(bodyText) Then
+            CompactBodyForAiLog = compactedText
+            wasCompacted = True
+        End If
+    End If
+
+    If Len(CompactBodyForAiLog) <= DEFAULT_MAX_LOGGED_BODY_CHARS Then Exit Function
+
+    Dim strictText As String
+    Dim strictChanged As Boolean
+    Dim strictNormalized As Boolean
+    If TryCompactJsonBodyForAi(bodyText, _
+                               BODY_AI_STRICT_MAX_STRING_CHARS, _
+                               BODY_AI_STRICT_MAX_ARRAY_ITEMS, _
+                               BODY_AI_STRICT_MAX_OBJECT_MEMBERS, _
+                               strictText, strictChanged, strictNormalized) Then
+        If Len(strictText) < Len(CompactBodyForAiLog) Then
+            CompactBodyForAiLog = strictText
+            wasCompacted = (wasCompacted Or strictChanged)
+            If strictNormalized Then wasNormalized = True
+        End If
+    End If
+End Function
+
 Private Function BodyStoreSkipCount(ByVal lineText As String) As Long
     Const COUNT_MARKER As String = " | count="
     Dim startPos As Long
@@ -8444,6 +9145,28 @@ Private Function BodyStoreSkipCount(ByVal lineText As String) As Long
     End If
 End Function
 
+Private Function BodyStoreNumericField(ByVal lineText As String, ByVal fieldName As String) As Long
+    Dim marker As String
+    marker = " | " & fieldName & "="
+
+    Dim startPos As Long
+    startPos = InStr(1, lineText, marker, vbBinaryCompare)
+    If startPos = 0 Then Exit Function
+
+    startPos = startPos + Len(marker)
+    Dim endPos As Long
+    endPos = InStr(startPos, lineText, " | ", vbBinaryCompare)
+
+    Dim token As String
+    If endPos = 0 Then
+        token = Mid$(lineText, startPos)
+    Else
+        token = Mid$(lineText, startPos, endPos - startPos)
+    End If
+
+    If IsNumeric(token) Then BodyStoreNumericField = CLng(token)
+End Function
+
 Private Sub AppendBodyStoreStats(ByVal output As Collection)
     If output Is Nothing Then Exit Sub
 
@@ -8451,11 +9174,16 @@ Private Sub AppendBodyStoreStats(ByVal output As Collection)
     Dim responseCaptured As Long
     Dim requestCaptured As Long
     Dim truncated As Long
+    Dim normalized As Long
+    Dim compacted As Long
+    Dim sourceCharsTotal As Long
+    Dim loggedCharsTotal As Long
     Dim miss As Long
     Dim missUnavailable As Long
     Dim skipCap As Long
     Dim skipRedirect As Long
     Dim skipOversize As Long
+    Dim skipScope As Long
     Dim skipOther As Long
     Dim disabled As Long
     Dim inBody As Boolean
@@ -8472,11 +9200,19 @@ Private Sub AppendBodyStoreStats(ByVal output As Collection)
             captured = captured + 1
             responseCaptured = responseCaptured + 1
             If InStr(1, lineText, " | truncated=true", vbTextCompare) > 0 Then truncated = truncated + 1
+            If InStr(1, lineText, " | normalized=true", vbTextCompare) > 0 Then normalized = normalized + 1
+            If InStr(1, lineText, " | compacted=true", vbTextCompare) > 0 Then compacted = compacted + 1
+            sourceCharsTotal = sourceCharsTotal + BodyStoreNumericField(lineText, "sourceChars")
+            loggedCharsTotal = loggedCharsTotal + BodyStoreNumericField(lineText, "loggedChars")
             inBody = True
         ElseIf InStr(1, lineText, "[BODY] REQUEST |", vbBinaryCompare) = 1 Then
             captured = captured + 1
             requestCaptured = requestCaptured + 1
             If InStr(1, lineText, " | truncated=true", vbTextCompare) > 0 Then truncated = truncated + 1
+            If InStr(1, lineText, " | normalized=true", vbTextCompare) > 0 Then normalized = normalized + 1
+            If InStr(1, lineText, " | compacted=true", vbTextCompare) > 0 Then compacted = compacted + 1
+            sourceCharsTotal = sourceCharsTotal + BodyStoreNumericField(lineText, "sourceChars")
+            loggedCharsTotal = loggedCharsTotal + BodyStoreNumericField(lineText, "loggedChars")
             inBody = True
         ElseIf InStr(1, lineText, "[BODY-MISS]", vbBinaryCompare) = 1 Then
             miss = miss + 1
@@ -8490,6 +9226,12 @@ Private Sub AppendBodyStoreStats(ByVal output As Collection)
                 skipRedirect = skipRedirect + skipCount
             ElseIf InStr(1, lineText, "reason=oversize", vbTextCompare) > 0 Then
                 skipOversize = skipOversize + skipCount
+            ElseIf InStr(1, lineText, "reason=cross-site", vbTextCompare) > 0 Or _
+                   InStr(1, lineText, "reason=site-unknown", vbTextCompare) > 0 Or _
+                   InStr(1, lineText, "reason=child-context", vbTextCompare) > 0 Or _
+                   InStr(1, lineText, "reason=context-unknown", vbTextCompare) > 0 Or _
+                   InStr(1, lineText, "reason=pattern", vbTextCompare) > 0 Then
+                skipScope = skipScope + skipCount
             Else
                 skipOther = skipOther + skipCount
             End If
@@ -8502,11 +9244,17 @@ Private Sub AppendBodyStoreStats(ByVal output As Collection)
                " | response=" & CStr(responseCaptured) & _
                " | request=" & CStr(requestCaptured) & _
                " | truncated=" & CStr(truncated) & _
+               " | normalized=" & CStr(normalized) & _
+               " | compacted=" & CStr(compacted) & _
+               " | sourceChars=" & CStr(sourceCharsTotal) & _
+               " | loggedChars=" & CStr(loggedCharsTotal) & _
+               " | savedChars=" & CStr(sourceCharsTotal - loggedCharsTotal) & _
                " | miss=" & CStr(miss) & _
                " | missUnavailable=" & CStr(missUnavailable) & _
                " | skipCap=" & CStr(skipCap) & _
                " | skipRedirect=" & CStr(skipRedirect) & _
                " | skipOversize=" & CStr(skipOversize) & _
+               " | skipScope=" & CStr(skipScope) & _
                " | skipOther=" & CStr(skipOther) & _
                " | disabled=" & CStr(disabled)
 End Sub
@@ -8518,20 +9266,34 @@ Private Function BuildDiscoveryBodyStoreOutput() As Collection
     If Not m_bodyCaptureRequested And Not m_requestBodyCaptureRequested Then Exit Function
 
     output.Add "=== BODY STORE (Optional Network Bodies) ==="
-    output.Add "BODY-SECURITY | Request/response bodies may contain credentials, personal, authentication, or confidential data. Review before sharing with AI or public forums."
+    output.Add "BODY-SECURITY | Request/response bodies may contain credentials, personal, authentication, or confidential data. Default BODY STORE retrieval/logging requires the recorder top-level context plus Sec-Fetch-Site same-origin/same-site/none; explicit AddBodyCapturePattern entries override that allow-list. The browser-side BiDi collector may still temporarily retain other response data until collector cleanup. Review logs before sharing with AI or public forums."
     If m_bodyCaptureRequested Then
         output.Add "BODY-CONFIG | dataType=response | mime=json-only | patterns=" & _
-                   BodyCapturePatternsSummary() & " | collectorMaxEncodedDataSize=" & _
+                   BodyCapturePatternsSummary() & " | retrievalScope=top-context+sec-fetch-site-default-or-explicit-pattern | collectorMaxEncodedDataSize=" & _
                    CStr(DEFAULT_MAX_COLLECTED_BODY_SIZE) & " | maxLoggedChars=" & _
                    CStr(DEFAULT_MAX_LOGGED_BODY_CHARS) & " | maxCount=" & _
-                   CStr(MAX_BODY_CAPTURE_COUNT) & " | maxPerMethodKeyMime=" & CStr(MAX_BODY_PER_KEY)
+                   CStr(MAX_BODY_CAPTURE_COUNT) & " | maxPerMethodKeyMime=" & CStr(MAX_BODY_PER_KEY) & _
+                   " | aiCompact=True | frameJson=True | embeddedJson=True | losslessSourceMaxChars=" & CStr(BODY_AI_LOSSLESS_SOURCE_MAX_CHARS) & _
+                   " | maxStringChars=" & CStr(BODY_AI_MAX_STRING_CHARS) & _
+                   " | maxArrayItems=" & CStr(BODY_AI_MAX_ARRAY_ITEMS) & _
+                   " | maxObjectMembers=" & CStr(BODY_AI_MAX_OBJECT_MEMBERS) & _
+                   " | strictStringChars=" & CStr(BODY_AI_STRICT_MAX_STRING_CHARS) & _
+                   " | strictArrayItems=" & CStr(BODY_AI_STRICT_MAX_ARRAY_ITEMS) & _
+                   " | strictObjectMembers=" & CStr(BODY_AI_STRICT_MAX_OBJECT_MEMBERS)
     End If
     If m_requestBodyCaptureRequested Then
         output.Add "BODY-CONFIG | dataType=request | mime=json-only | patterns=" & _
-                   BodyCapturePatternsSummary() & " | collectorMaxEncodedDataSize=" & _
+                   BodyCapturePatternsSummary() & " | retrievalScope=top-context+sec-fetch-site-default-or-explicit-pattern | collectorMaxEncodedDataSize=" & _
                    CStr(DEFAULT_MAX_COLLECTED_BODY_SIZE) & " | maxLoggedChars=" & _
                    CStr(DEFAULT_MAX_LOGGED_BODY_CHARS) & " | maxCount=" & _
-                   CStr(MAX_BODY_CAPTURE_COUNT) & " | maxPerMethodKeyMime=" & CStr(MAX_BODY_PER_KEY)
+                   CStr(MAX_BODY_CAPTURE_COUNT) & " | maxPerMethodKeyMime=" & CStr(MAX_BODY_PER_KEY) & _
+                   " | aiCompact=True | frameJson=True | embeddedJson=True | losslessSourceMaxChars=" & CStr(BODY_AI_LOSSLESS_SOURCE_MAX_CHARS) & _
+                   " | maxStringChars=" & CStr(BODY_AI_MAX_STRING_CHARS) & _
+                   " | maxArrayItems=" & CStr(BODY_AI_MAX_ARRAY_ITEMS) & _
+                   " | maxObjectMembers=" & CStr(BODY_AI_MAX_OBJECT_MEMBERS) & _
+                   " | strictStringChars=" & CStr(BODY_AI_STRICT_MAX_STRING_CHARS) & _
+                   " | strictArrayItems=" & CStr(BODY_AI_STRICT_MAX_ARRAY_ITEMS) & _
+                   " | strictObjectMembers=" & CStr(BODY_AI_STRICT_MAX_OBJECT_MEMBERS)
     End If
 
     ' Never introduce synchronous getData round-trips while a SPA wait is measuring quietness or
@@ -8556,6 +9318,13 @@ Private Function BuildDiscoveryBodyStoreOutput() As Collection
                     idText = ShortId(CStr(candidate("requestId")))
 
                     If TryGetCapturedResponseBody(candidate, bodyText, missReason, missDetail) Then
+                        Dim sourceChars As Long
+                        sourceChars = Len(bodyText)
+
+                        Dim wasCompacted As Boolean
+                        Dim wasNormalized As Boolean
+                        bodyText = CompactBodyForAiLog(bodyText, wasCompacted, wasNormalized)
+
                         Dim wasTruncated As Boolean
                         wasTruncated = False
                         If Len(bodyText) > DEFAULT_MAX_LOGGED_BODY_CHARS Then
@@ -8576,6 +9345,10 @@ Private Function BuildDiscoveryBodyStoreOutput() As Collection
                                    " | mime=" & CStr(candidate("mime")) & _
                                    " | key=" & CStr(candidate("key")) & _
                                    " | bodySize=" & sizeText & _
+                                   " | sourceChars=" & CStr(sourceChars) & _
+                                   " | loggedChars=" & CStr(Len(bodyText)) & _
+                                   " | normalized=" & LCase$(CStr(wasNormalized)) & _
+                                   " | compacted=" & LCase$(CStr(wasCompacted)) & _
                                    " | truncated=" & LCase$(CStr(wasTruncated))
                         output.Add bodyText
                         output.Add "[/BODY]"
@@ -8608,6 +9381,13 @@ Private Function BuildDiscoveryBodyStoreOutput() As Collection
                     reqIdText = ShortId(CStr(reqCandidate("requestId")))
 
                     If TryGetCapturedRequestBody(reqCandidate, reqBodyText, reqMissReason, reqMissDetail) Then
+                        Dim reqSourceChars As Long
+                        reqSourceChars = Len(reqBodyText)
+
+                        Dim reqWasCompacted As Boolean
+                        Dim reqWasNormalized As Boolean
+                        reqBodyText = CompactBodyForAiLog(reqBodyText, reqWasCompacted, reqWasNormalized)
+
                         Dim reqWasTruncated As Boolean
                         reqWasTruncated = False
                         If Len(reqBodyText) > DEFAULT_MAX_LOGGED_BODY_CHARS Then
@@ -8627,6 +9407,10 @@ Private Function BuildDiscoveryBodyStoreOutput() As Collection
                                    " | mime=" & CStr(reqCandidate("mime")) & _
                                    " | key=" & CStr(reqCandidate("key")) & _
                                    " | bodySize=" & reqSizeText & _
+                                   " | sourceChars=" & CStr(reqSourceChars) & _
+                                   " | loggedChars=" & CStr(Len(reqBodyText)) & _
+                                   " | normalized=" & LCase$(CStr(reqWasNormalized)) & _
+                                   " | compacted=" & LCase$(CStr(reqWasCompacted)) & _
                                    " | truncated=" & LCase$(CStr(reqWasTruncated))
                         output.Add reqBodyText
                         output.Add "[/BODY]"
@@ -8686,6 +9470,8 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     ' and never creates a half-enabled new recorder.
     Dim stagedLogs As New Collection
     Dim stagedSuppByKey As New Dictionary
+    Dim stagedRequestUrlById As New Dictionary
+    Dim stagedRequestKeyById As New Dictionary
     Dim stagedStartTime As Double
     Dim stagedResponseCompletedSubscriptionId As String
     Dim stagedBodyCollectorId As String
@@ -8801,6 +9587,8 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_isRecording = False
     Set m_recorderLogs = stagedLogs
     Set m_recSuppByKey = stagedSuppByKey
+    Set m_recRequestUrlById = stagedRequestUrlById
+    Set m_recRequestKeyById = stagedRequestKeyById
     m_recorderStartTime = stagedStartTime
     m_excludeResources = excludeImagesAndCss
     m_recSuppOverflowCount = 0
@@ -8955,18 +9743,34 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         If m_bodyCaptureRequested Then
             stm.writeText "BODY-CONFIG | requested=True | active=" & bodyCaptureWasActive & _
                           " | dataType=response | mime=json-only | patterns=" & BodyCapturePatternsSummary() & _
+                          " | retrievalScope=top-context+sec-fetch-site-default-or-explicit-pattern" & _
                           " | collectorMaxEncodedDataSize=" & DEFAULT_MAX_COLLECTED_BODY_SIZE & _
                           " | maxLoggedChars=" & DEFAULT_MAX_LOGGED_BODY_CHARS & _
                           " | maxCount=" & MAX_BODY_CAPTURE_COUNT & _
-                          " | maxPerMethodKeyMime=" & MAX_BODY_PER_KEY & vbCrLf
+                          " | maxPerMethodKeyMime=" & MAX_BODY_PER_KEY & _
+                          " | aiCompact=True | frameJson=True | embeddedJson=True | losslessSourceMaxChars=" & BODY_AI_LOSSLESS_SOURCE_MAX_CHARS & _
+                          " | maxStringChars=" & BODY_AI_MAX_STRING_CHARS & _
+                          " | maxArrayItems=" & BODY_AI_MAX_ARRAY_ITEMS & _
+                          " | maxObjectMembers=" & BODY_AI_MAX_OBJECT_MEMBERS & _
+                          " | strictStringChars=" & BODY_AI_STRICT_MAX_STRING_CHARS & _
+                          " | strictArrayItems=" & BODY_AI_STRICT_MAX_ARRAY_ITEMS & _
+                          " | strictObjectMembers=" & BODY_AI_STRICT_MAX_OBJECT_MEMBERS & vbCrLf
         End If
         If m_requestBodyCaptureRequested Then
             stm.writeText "BODY-CONFIG | requested=True | active=" & requestBodyCaptureWasActive & _
                           " | dataType=request | mime=json-only | patterns=" & BodyCapturePatternsSummary() & _
+                          " | retrievalScope=top-context+sec-fetch-site-default-or-explicit-pattern" & _
                           " | collectorMaxEncodedDataSize=" & DEFAULT_MAX_COLLECTED_BODY_SIZE & _
                           " | maxLoggedChars=" & DEFAULT_MAX_LOGGED_BODY_CHARS & _
                           " | maxCount=" & MAX_BODY_CAPTURE_COUNT & _
-                          " | maxPerMethodKeyMime=" & MAX_BODY_PER_KEY & vbCrLf
+                          " | maxPerMethodKeyMime=" & MAX_BODY_PER_KEY & _
+                          " | aiCompact=True | frameJson=True | embeddedJson=True | losslessSourceMaxChars=" & BODY_AI_LOSSLESS_SOURCE_MAX_CHARS & _
+                          " | maxStringChars=" & BODY_AI_MAX_STRING_CHARS & _
+                          " | maxArrayItems=" & BODY_AI_MAX_ARRAY_ITEMS & _
+                          " | maxObjectMembers=" & BODY_AI_MAX_OBJECT_MEMBERS & _
+                          " | strictStringChars=" & BODY_AI_STRICT_MAX_STRING_CHARS & _
+                          " | strictArrayItems=" & BODY_AI_STRICT_MAX_ARRAY_ITEMS & _
+                          " | strictObjectMembers=" & BODY_AI_STRICT_MAX_OBJECT_MEMBERS & vbCrLf
         End If
         ' Ring-buffer head eviction is reported so a truncated timeline is never mistaken for
         ' a complete capture.
@@ -8975,17 +9779,21 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                           " oldest timeline line(s); only the most recent " & MAX_LOG_SIZE & _
                           " event(s) are shown. Earlier events existed but were evicted (ring buffer)." & vbCrLf
         End If
-        stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path, volatile query stripped, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
+        stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path; volatile query values stripped, '?' preserves query presence, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
         stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During navigation URL-stability polling, recorder-owned responseCompleted may be temporarily paused and is restored before SPA idle wait; [REQ] remains live, so some [REQ] lines in that narrow window may have no [RES] pair. Per-request latency (dur=) is not computed." & vbCrLf
-        stm.writeText "LEGEND | [SPA-ACT]=DOM mutation burst (manual RecordEventsForSeconds samples this by default)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has outcome + slackMs)  [SUPPRESSED]=filtered-noise tally" & vbCrLf
+        stm.writeText "LEGEND | [ERR]/[BLOCK] carry request id + normalized key; if fetchError omits its URL, the recorder falls back to the beforeRequestSent id->URL/key cache (including suppressed requests). Path/matrix assignment values such as ;ord=... or /_dc_unique_id=... are stripped to name= so volatile identifiers do not fragment keys." & vbCrLf
+        stm.writeText "LEGEND | [SPA-ACT]=sampled/coalesced DOM mutation burst (NOT an exhaustive event stream; absence does not prove no mutation)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has achieved quiet + observed confirmation-window duration; neither is a safety-margin score)  [SUPPRESSED]=filtered-noise tally with idle=skip|track" & vbCrLf
+        stm.writeText "LEGEND | [SPA-PROBE-INITIALIZING]/[SPA-PROBE-READY]=normal first-use/new-document lazy initialization. [SPA-PROBE-UNHEALTHY]/[SPA-PROBE-RECOVERED]=a probe already verified healthy in the same document was later missing/unhealthy and recovered. Unverified samples contribute NO stability evidence; READY/RECOVERED restart the full confirmation window. WAIT-END reports probeHealthy, probeInitializations, probeRecoveries, and detectedUnhealthyMs." & vbCrLf
         stm.writeText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
-        stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate AND resets the DOM-quiet timer; quietAtHit=<quiet ms discarded by that reset>. net HITs are event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag. dom/vis HITs are poll-detected (~100ms). Gated waits carry signal=<armed types> on [SPA-WAIT-BEGIN] and signal=<type>:<hit|miss> per armed type on [SPA-WAIT-END]; ungated waits omit the field." & vbCrLf
+        stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate and resets the consensus stability window. dom/vis quietAtHit is measured on the poll that detects the hit (~100ms). net HITs are event-triggered between polls, so quietAtHit=unknown; lastPolledQuietMs/sampleAgeMs are diagnostic samples only and MUST NOT be treated as quiet at the network event. [SPA-NET-TO-CONTENT] is the first content render OBSERVED after an armed net HIT; observedMs includes poll-detection delay and does not assert ownership. Gated waits carry signal=<armed types> on BEGIN and hit|miss on END." & vbCrLf
         stm.writeText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
         stm.writeText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
-            stm.writeText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. [BODY] may be REQUEST or RESPONSE; truncated=True means only the first maxLoggedChars characters were written." & vbCrLf
+            stm.writeText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. With no explicit body patterns, JSON retrieval/logging requires BOTH the recorder top-level browsing context and Sec-Fetch-Site same-origin/same-site/none. Child-frame, cross-site, and unknown-context/site bodies are not pulled into the log. Explicit AddBodyCapturePattern entries act as the body allow-list and may intentionally override those defaults. The browser-side BiDi collector may still temporarily retain other data until cleanup." & vbCrLf
+            stm.writeText "LEGEND | [BODY] may be REQUEST or RESPONSE; normalized=True means parseable XSSI/length-framed JSON was converted to a canonical json-frames envelope. Small payloads under losslessSourceMaxChars are normalized without lossy sampling. compacted=True means lossy AI structural reduction was applied (long strings summarized and/or large arrays/objects sampled). truncated=True means the final result still exceeded maxLoggedChars and only its prefix was written." & vbCrLf
+            stm.writeText "LEGEND | normalized=True or compacted=True means BODY content is not byte-for-byte raw. AI normalization/compaction preserves structural/value samples; sourceChars is retrieved text length and loggedChars is final output length." & vbCrLf
             stm.writeText "LEGEND | [BODY-SKIP] means getData was deliberately not called (redirect, oversize, or capture cap). [BODY-MISS] means a selected getData pull failed; unavailable commonly means data was not retained/was evicted. Missing body data must NOT be interpreted as an empty response body." & vbCrLf
-            stm.writeText "LEGEND | [BODY-STATS] summarizes captured/truncated/miss/skip outcomes for quick review; detailed [BODY], [BODY-SKIP], and [BODY-MISS] lines remain authoritative." & vbCrLf
+            stm.writeText "LEGEND | [BODY-STATS] summarizes captured/normalized/compacted/truncated/miss/skip outcomes for quick review; detailed [BODY], [BODY-SKIP], and [BODY-MISS] lines remain authoritative." & vbCrLf
         End If
         stm.writeText vbCrLf
         stm.writeText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
@@ -9004,18 +9812,35 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "     would also match /login). Match what was observed (e.g. generate_204, not gen_204)." & vbCrLf
         stm.writeText vbCrLf
         stm.writeText "2) Wait-time assessment" & vbCrLf
-        stm.writeText "   - Per [SPA-WAIT-END]: slackMs = domQuietMs - minStableMs (margin over the stability gate)." & vbCrLf
-        stm.writeText "     Flag any wait with slack < ~100ms as marginal -> consider raising minStableMs, especially" & vbCrLf
-        stm.writeText "     if that action is capture/timing-sensitive." & vbCrLf
-        stm.writeText "   - Check maxElapsed vs maxTimeoutMs (headroom). Any TIMEOUT/HALT = wait too short or a real stall." & vbCrLf
+        stm.writeText "   - Consensus uses current network-idle + DOM-quiet>=minStableMs AND a poll-based" & vbCrLf
+        stm.writeText "     stable-window timer. stableWindowMs is elapsed time since the most recent poll that" & vbCrLf
+        stm.writeText "     observed the combined idle/quiet condition as false (or an explicit signal reset)." & vbCrLf
+        stm.writeText "     Because the true threshold crossing occurs between polls, stableWindowMs is NOT an exact" & vbCrLf
+        stm.writeText "     post-threshold dwell time or a safety margin. Its amount above minStableMs is largely" & vbCrLf
+        stm.writeText "     polling phase/overshoot. Do NOT rank or tune waits from that difference." & vbCrLf
+        stm.writeText "   - Probe health is fail-safe. Every SPA stability evaluation requires a freshly verified healthy" & vbCrLf
+        stm.writeText "     probe sample; navigation/unsampled periods contribute NO stability evidence. INITIALIZING/READY" & vbCrLf
+        stm.writeText "     is normal first-use/new-document setup. UNHEALTHY/RECOVERED is reserved for a probe already" & vbCrLf
+        stm.writeText "     verified healthy in the same document. READY/RECOVERED restart the full confirmation window." & vbCrLf
+        stm.writeText "     At WAIT-END, probeHealthy=true is required for a trustworthy STABLE; otherwise flag error-state." & vbCrLf
+        stm.writeText "   - detectedUnhealthyMs starts at the first OBSERVED unhealthy sample, not at the unknown instant the" & vbCrLf
+        stm.writeText "     probe may actually have disappeared. probeInitializations/probeRecoveries are diagnostics, not" & vbCrLf
+        stm.writeText "     failures by themselves. Do not infer total probe-absence duration from detectedUnhealthyMs." & vbCrLf
+        stm.writeText "   - Check elapsedMs vs maxTimeoutMs (headroom). Any TIMEOUT/HALT = wait too short or a real stall." & vbCrLf
         stm.writeText "   - Long elapsed caused by slow server responses is NOT a threshold problem; do not raise" & vbCrLf
         stm.writeText "     minStableMs for that. Infer server latency from the timestamp gaps between consecutive" & vbCrLf
         stm.writeText "     [RES]/[NAV] lines (per-request dur is not recorded; see LEGEND)." & vbCrLf
         stm.writeText "   - Gated waits ([SPA-WAIT-BEGIN] carries signal=): a TIMEOUT with signal=..:miss is NOT a" & vbCrLf
         stm.writeText "     threshold problem -- do not suggest raising minStableMs for it; fix the armed selector/" & vbCrLf
-        stm.writeText "     pattern or the action instead. quietAtHit > minStableMs on a net/vis HIT is a settle-to-" & vbCrLf
-        stm.writeText "     render gap the gate absorbed; for dom HITs use section 3 instead (a dom HIT is itself a" & vbCrLf
-        stm.writeText "     mutation, so its quietAtHit is structurally near zero and proves nothing)." & vbCrLf
+        stm.writeText "     pattern or the action instead. For vis HITs, quietAtHit is measured at poll time. For" & vbCrLf
+        stm.writeText "     net HITs, quietAtHit=unknown by design: lastPolledQuietMs/sampleAgeMs are stale-sample" & vbCrLf
+        stm.writeText "     diagnostics only and MUST NOT be used to infer a settle-to-render gap. If a" & vbCrLf
+        stm.writeText "     [SPA-NET-TO-CONTENT] line exists, observedMs is the delay from net event dispatch to" & vbCrLf
+        stm.writeText "     the first content render OBSERVED by a later poll. The true DOM change may have occurred" & vbCrLf
+        stm.writeText "     up to roughly one poll earlier, so observedMs near/above minStableMs is a warning/uncertain" & vbCrLf
+        stm.writeText "     zone, not proof of early completion. Prefer a stable content/visibility gate or a larger" & vbCrLf
+        stm.writeText "     per-action minStableMs when capture correctness matters. For dom HITs, quietAtHit is" & vbCrLf
+        stm.writeText "     structurally near zero because the hit itself is a mutation." & vbCrLf
         stm.writeText vbCrLf
         stm.writeText "3) Settle-to-render suspicion check (early-STABLE warning; the tool pre-computes this)" & vbCrLf
         stm.writeText "   - The tool already emits two advisory markers; you do NOT re-derive them by pairing:" & vbCrLf
@@ -9023,26 +9848,34 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "       no content render -> treat that STABLE as possibly premature (NOT clean for capture)." & vbCrLf
         stm.writeText "     [SPA-CARRYOVER-NOTE] = the immediately next wait then showed a content render that MAY be" & vbCrLf
         stm.writeText "       the previous action's delayed paint. It is a heads-up, not an attribution." & vbCrLf
-        stm.writeText "   - Deliberately NOT provided (do not attempt to compute or demand them): an exact settle-to-" & vbCrLf
-        stm.writeText "     render gap, an owner pairing (which json produced which render), or an AMBIGUOUS/CONFIRMED" & vbCrLf
-        stm.writeText "     verdict. The markers only assert 'this run is not clean', never 'this render belongs to X'." & vbCrLf
+        stm.writeText "   - Deliberately NOT provided: an exact OWNER-ATTRIBUTED settle-to-render gap, a pairing" & vbCrLf
+        stm.writeText "     proving which json produced which render, or an AMBIGUOUS/CONFIRMED verdict." & vbCrLf
+        stm.writeText "     [SPA-NET-TO-CONTENT] may provide an observed first-render delay for an explicitly armed" & vbCrLf
+        stm.writeText "     net signal, but owner=not-asserted and poll detection still apply." & vbCrLf
         stm.writeText "   - The check is adjacent-wait only: a hint lives for exactly ONE following wait, so a SUSPECT" & vbCrLf
         stm.writeText "     with no NOTE in the very next wait is not chased further. Absence of a NOTE is not 'safe'." & vbCrLf
-        stm.writeText "   - What to do with a SUSPECT/NOTE (do NOT just raise minStableMs on an ungated wait):" & vbCrLf
+        stm.writeText "   - Before treating a SUSPECT firstJson as render-producing work, check whether it looks like" & vbCrLf
+        stm.writeText "     telemetry/beacon/browser-metadata traffic. If so, prefer an IGNORE suggestion for that" & vbCrLf
+        stm.writeText "     observed endpoint; idle=skip responses do not create SUSPECT state." & vbCrLf
+        stm.writeText "   - For an app/content API SUSPECT/NOTE (do NOT just raise minStableMs on an ungated wait):" & vbCrLf
         stm.writeText "     re-run with an explicit gate from observed lines to confirm and to get the real timing --" & vbCrLf
-        stm.writeText "       bidi.ArmContentSignal ""<a targeted xpath seen in [SPA-ACT], e.g. //*[@id='table-body']>""" & vbCrLf
+        stm.writeText "       bidi.ArmContentSignal ""<a stable, value-identifying xpath informed by [SPA-ACT]>""" & vbCrLf
         stm.writeText "       and/or bidi.ArmNetworkSignal ""<substring of the SUSPECT's firstJson key>""." & vbCrLf
+        stm.writeText "     [SPA-ACT] is sampled/coalesced rather than exhaustive; avoid dynamic IDs when the log" & vbCrLf
+        stm.writeText "     shows them changing across otherwise similar UI states. Prefer stable attributes." & vbCrLf
         stm.writeText "     With net+content armed, the HITs give a much cleaner measurement than ungated inference" & vbCrLf
-        stm.writeText "     (net HIT is event-triggered and timestamped at VBA dispatch time; queue backlog can add positive lag; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
-        stm.writeText "     without guessing. Fallback: on a net-armed wait with no stable dom" & vbCrLf
-        stm.writeText "     selector, raising THAT action's minStableMs to (measured gap + margin) is valid per-action." & vbCrLf
+        stm.writeText "     (net HIT is event-triggered at VBA dispatch time but has no exact DOM-quiet sample; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
+        stm.writeText "     without guessing. Fallback: on a net-armed wait with no stable DOM selector, an observed" & vbCrLf
+        stm.writeText "     NET-TO-CONTENT delay near/above minStableMs can justify a more conservative per-action" & vbCrLf
+        stm.writeText "     minStableMs, but include poll uncertainty rather than treating observedMs as exact." & vbCrLf
         stm.writeText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
         stm.writeText "     PREVIOUS action's late paint. Prefer a value-identifying selector for the expected content." & vbCrLf
         stm.writeText vbCrLf
         stm.writeText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
-        stm.writeText "idle (skip|track), [SPA-ACT] (DOM mutation), [SUPPRESSED] (already-filtered noise tally)." & vbCrLf
+        stm.writeText "idle (skip|track), [SPA-ACT] (sampled/coalesced DOM mutation evidence), [SUPPRESSED] (filtered-noise tally; each key carries idle=skip|track)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
-            stm.writeText "If BODY STORE is present, correlate RESPONSE to [RES] and REQUEST to [REQ] by the same ShortId + key. Treat [BODY-SKIP]/[BODY-MISS] as capture outcomes, not evidence that the HTTP body was empty." & vbCrLf
+            stm.writeText "If BODY STORE is present, correlate RESPONSE to [RES] and REQUEST to [REQ] by the same ShortId + key. Treat [BODY-SKIP]/[BODY-MISS] as capture outcomes, not evidence that the HTTP body was empty. With default patterns, child-frame/cross-site/unknown-scope JSON is intentionally skipped; explicit body patterns are an opt-in allow-list override." & vbCrLf
+            stm.writeText "A BODY with normalized=True is a canonical AI-oriented representation, not byte-for-byte raw. Small framed bodies below losslessSourceMaxChars are normalized without lossy sampling (compacted=False). compacted=True means some detail may be summarized/sampled; <LONG_STRING len=N>, __ai_omitted_items, and __ai_omitted_members explicitly mark that loss. __ai_envelope__=json-frames marks normalized XSSI/length-framed JSON, and __ai_embedded_json__ marks a JSON string expanded structurally; do not infer omitted values." & vbCrLf
             stm.writeText "Use [BODY-STATS] as the quick outcome summary before inspecting individual BODY records." & vbCrLf
         End If
         stm.writeText "=== END REQUEST ===" & vbCrLf
@@ -9082,6 +9915,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
 
     Set m_recorderLogs = Nothing
     Set m_recSuppByKey = Nothing
+    Set m_recRequestUrlById = Nothing
+    Set m_recRequestKeyById = Nothing
     m_recSuppOverflowCount = 0
     m_discoveryDomCaptureEnabled = False
     m_discoveryManualPumpActive = False
@@ -9209,6 +10044,7 @@ Private Function CaptureDiscoverySpaActivity(ByRef targetCtx As String, _
     LogInvalidProbeSelectors probe, targetCtx
 
     If IsSpaProbeReady(probe) Then
+        MarkProbeKnownReadyForDocument targetCtx
         If Not IsProbeFilterCurrent(targetCtx) Then
             If Not PushIdleFiltersToProbe(targetCtx) Then
                 If Not StartSpaIdleProbe(targetCtx) Then GoTo ProbeUnavailable
@@ -9412,6 +10248,30 @@ Cleanup:
 End Sub
 
 
+Private Sub CacheRecorderRequest(ByVal requestId As String, ByVal rawUrl As String)
+    If Len(requestId) = 0 Then Exit Sub
+    If m_recRequestUrlById Is Nothing Then Set m_recRequestUrlById = New Dictionary
+    If m_recRequestKeyById Is Nothing Then Set m_recRequestKeyById = New Dictionary
+
+    m_recRequestUrlById(requestId) = rawUrl
+    m_recRequestKeyById(requestId) = NormalizeEndpointKey(rawUrl)
+End Sub
+
+Private Function TryGetCachedRecorderRequest(ByVal requestId As String, _
+                                             ByRef rawUrl As String, _
+                                             ByRef normalizedKey As String) As Boolean
+    If Len(requestId) = 0 Then Exit Function
+
+    If Not m_recRequestUrlById Is Nothing Then
+        If m_recRequestUrlById.Exists(requestId) Then rawUrl = CStr(m_recRequestUrlById(requestId))
+    End If
+    If Not m_recRequestKeyById Is Nothing Then
+        If m_recRequestKeyById.Exists(requestId) Then normalizedKey = CStr(m_recRequestKeyById(requestId))
+    End If
+
+    TryGetCachedRecorderRequest = (Len(rawUrl) > 0 Or Len(normalizedKey) > 0)
+End Function
+
 Private Sub FormatAndStoreLog(ByVal json As Object)
     ' Guard keys explicitly; blanket OERN would hide malformed event structures.
 
@@ -9452,7 +10312,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
 
             If m_excludeResources Then
                 If IsNoiseUrl(resUrl) Or IsNoiseMime(mime) Then
-                    BumpSuppressed resKey
+                    BumpSuppressed resKey, IIf(IsIdleIgnored(resUrl), "skip", "track")
                     Exit Sub
                 End If
             End If
@@ -9486,11 +10346,16 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             Dim reqObj As Object: Set reqObj = params("request")
             If Not reqObj.Exists("url") Then Exit Sub
             Dim reqUrl As String: reqUrl = CStr(reqObj("url"))
-            If m_excludeResources Then
-                If IsNoiseUrl(reqUrl) Then BumpSuppressed NormalizeEndpointKey(reqUrl): Exit Sub
-            End If
             Dim reqId As String: reqId = ""
             If reqObj.Exists("request") Then reqId = CStr(reqObj("request"))
+
+            ' Cache correlation before output suppression. fetchError may omit/replace URL even when
+            ' beforeRequestSent already supplied it, and suppressed resources still need ERR pairing.
+            CacheRecorderRequest reqId, reqUrl
+
+            If m_excludeResources Then
+                If IsNoiseUrl(reqUrl) Then BumpSuppressed NormalizeEndpointKey(reqUrl), IIf(IsIdleIgnored(reqUrl), "skip", "track"): Exit Sub
+            End If
             Dim reqMethod As String: reqMethod = ""
             If reqObj.Exists("method") Then reqMethod = CStr(reqObj("method"))
             LogLine = "[" & relTime & "] [REQ] " & reqMethod & " | id=" & ShortId(reqId) & _
@@ -9504,19 +10369,34 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             End If
 
         Case "network.fetchError"
-            ' Log blocker matches as [BLOCK] and all other fetch failures as [ERR], even when
-            ' Chromium supplies no error text.
+            ' Log blocker matches as [BLOCK] and all other fetch failures as [ERR]. Chromium can
+            ' omit the URL here, so fall back to the beforeRequestSent correlation cache.
             If Not params.Exists("request") Then Exit Sub
             If Not IsObject(params("request")) Then Exit Sub
             Dim ferReq As Object: Set ferReq = params("request")
-            If Not ferReq.Exists("url") Then Exit Sub
-            Dim ferUrl As String: ferUrl = CStr(ferReq("url"))
+
+            Dim ferId As String: ferId = ""
+            If ferReq.Exists("request") Then ferId = CStr(ferReq("request"))
+
+            Dim ferUrl As String
+            If ferReq.Exists("url") Then ferUrl = CStr(ferReq("url"))
+            Dim ferKey As String
+            If Len(ferUrl) > 0 And StrComp(ferUrl, "UNKNOWN", vbTextCompare) <> 0 Then
+                ferKey = NormalizeEndpointKey(ferUrl)
+            Else
+                ferUrl = vbNullString
+                Call TryGetCachedRecorderRequest(ferId, ferUrl, ferKey)
+            End If
+            If Len(ferKey) = 0 Then ferKey = "UNKNOWN"
+
             If m_excludeResources Then
-                If IsNoiseUrl(ferUrl) Then BumpSuppressed NormalizeEndpointKey(ferUrl): Exit Sub
+                If Len(ferUrl) > 0 Then
+                    If IsNoiseUrl(ferUrl) Then BumpSuppressed ferKey, IIf(IsIdleIgnored(ferUrl), "skip", "track"): Exit Sub
+                End If
             End If
 
             Dim wasBlocked As Boolean: wasBlocked = False
-            If m_blockingPatterns.count > 0 Then
+            If m_blockingPatterns.count > 0 And Len(ferUrl) > 0 Then
                 Dim ferTok As Variant
                 For Each ferTok In m_blockingPatterns
                     If UrlMatchesPattern(ferUrl, CStr(ferTok)) Then
@@ -9526,12 +10406,24 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                 Next
             End If
 
+            Dim ferIdle As String
+            ferIdle = "track"
+            If Len(ferUrl) > 0 Then
+                If IsIdleIgnored(ferUrl) Then ferIdle = "skip"
+            End If
+
             If wasBlocked Then
-                LogLine = "[" & relTime & "] [BLOCK] - " & NormalizeEndpointKey(ferUrl)
+                LogLine = "[" & relTime & "] [BLOCK] | id=" & ShortId(ferId) & _
+                          " | key=" & ferKey & _
+                          " | idle=" & ferIdle
             Else
                 Dim ferErr As String: ferErr = ""
                 If params.Exists("errorText") Then ferErr = CStr(params("errorText"))
-                LogLine = "[" & relTime & "] [ERR] " & ferErr & " - " & NormalizeEndpointKey(ferUrl)
+                If Len(ferErr) = 0 Then ferErr = "(empty)"
+                LogLine = "[" & relTime & "] [ERR] " & ferErr & _
+                          " | id=" & ShortId(ferId) & _
+                          " | key=" & ferKey & _
+                          " | idle=" & ferIdle
             End If
 
         Case "browsingContext.load", "browsingContext.domContentLoaded"
@@ -9705,6 +10597,36 @@ End Function
 
 ' Endpoint keys drop volatile query tokens but retain high-signal rpcids so repeated API
 ' families collapse without losing their discriminator.
+Private Function RedactPathAssignmentValues(ByVal pathText As String) As String
+    ' Normalize matrix/path parameters such as:
+    '   /activityi;dc_pre=ABC;ord=123 -> /activityi;dc_pre=;ord=
+    '   /conversion/_dc_unique_id=ABC;_dc_ptd=XYZ -> /conversion/_dc_unique_id=;_dc_ptd=
+    ' This preserves endpoint semantics/grouping without retaining volatile identifier values.
+    Dim i As Long
+    Dim tokenStart As Long: tokenStart = 1
+    Dim result As String
+
+    For i = 1 To Len(pathText) + 1
+        Dim ch As String
+        If i <= Len(pathText) Then ch = Mid$(pathText, i, 1) Else ch = vbNullString
+
+        If ch = "/" Or ch = ";" Or i > Len(pathText) Then
+            Dim token As String
+            token = Mid$(pathText, tokenStart, i - tokenStart)
+
+            Dim eqPos As Long
+            eqPos = InStr(token, "=")
+            If eqPos > 1 Then token = Left$(token, eqPos)
+
+            result = result & token
+            If i <= Len(pathText) Then result = result & ch
+            tokenStart = i + 1
+        End If
+    Next i
+
+    RedactPathAssignmentValues = result
+End Function
+
 Private Function NormalizeEndpointKey(ByVal url As String) As String
     On Error GoTo Fallback
     Dim s As String: s = url
@@ -9726,9 +10648,16 @@ Private Function NormalizeEndpointKey(ByVal url As String) As String
         pathPart = s
         queryPart = ""
     End If
+    pathPart = RedactPathAssignmentValues(pathPart)
     Dim keyStr As String: keyStr = pathPart
     Dim rp As String: rp = ExtractQueryToken(queryPart, "rpcids")
-    If Len(rp) > 0 Then keyStr = keyStr & "?rpcids=" & rp
+    If Len(rp) > 0 Then
+        keyStr = keyStr & "?rpcids=" & rp
+    ElseIf q > 0 Then
+        ' Preserve query presence without retaining volatile values. This lets AI safely
+        ' distinguish e.g. /log? from /login when deriving literal ignore patterns.
+        keyStr = keyStr & "?"
+    End If
     Const MAX_KEY_LEN As Long = 160
     If Len(keyStr) > MAX_KEY_LEN Then keyStr = Left$(keyStr, MAX_KEY_LEN) & "..."
     NormalizeEndpointKey = keyStr
@@ -9772,9 +10701,11 @@ Private Function ShortId(ByVal idStr As String) As String
     If Len(idStr) > 18 Then ShortId = Right$(idStr, 18) Else ShortId = idStr
 End Function
 
-Private Sub BumpSuppressed(ByVal keyStr As String)
+Private Sub BumpSuppressed(ByVal keyStr As String, Optional ByVal idleState As String = "")
     On Error Resume Next
     If m_recSuppByKey Is Nothing Then Exit Sub
+
+    If Len(idleState) > 0 Then keyStr = keyStr & " | idle=" & idleState
 
     If m_recSuppByKey.Exists(keyStr) Then
         m_recSuppByKey.item(keyStr) = CLng(m_recSuppByKey.item(keyStr)) + 1
@@ -10073,6 +11004,30 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
 
     If Len(renderXPath) > 0 Then
         m_unresolvedJsonThisWait = False
+
+        ' Advisory only: for an armed network signal, record the first content render observed
+        ' after the network hit. The render is detected on a SPA-probe poll, so observedMs may
+        ' overstate the true network-to-DOM gap by up to roughly one poll interval. No ownership
+        ' between the response and render is asserted.
+        If m_sigNetArmed And m_sigNetSeen And Not m_sigNetContentObserved And m_sigNetHitMs > 0 Then
+            Dim netToContentMs As Double
+            netToContentMs = socket_.nowMs() - m_sigNetHitMs
+            If netToContentMs < 0 Then netToContentMs = 0
+
+            Dim netToContentMinStableMs As Long
+            If Not ctx Is Nothing Then
+                If ctx.Exists("minStableMs") Then netToContentMinStableMs = CLng(ctx("minStableMs"))
+            End If
+
+            LogSignalLine "[SPA-NET-TO-CONTENT] key=" & m_sigNetHitKey & _
+                          " | observedMs=" & Format(netToContentMs, "0") & _
+                          " | render=" & renderXPath & _
+                          " | detection=poll" & _
+                          " | owner=not-asserted" & _
+                          IIf(netToContentMinStableMs > 0, " | minStableMs=" & CStr(netToContentMinStableMs), "")
+            m_sigNetContentObserved = True
+        End If
+
         If m_carryoverNoteArmedThisWait And Not m_carryoverNoteEmittedThisWait And m_isRecording Then
             Dim rt As String
             rt = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
@@ -10233,6 +11188,7 @@ Public Sub ArmNetworkSignal(ByVal urlPattern As String, _
     ClaimSignalOwner targetCtx
     If m_sigNetArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=net | overwrite=true (previous net arm replaced)"
     m_sigNetArmed = True: m_sigNetSeen = False: m_sigNetPattern = urlPattern
+    m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False
     m_sigNetContextMissWarned = False
     LogSignalLine "[SPA-SIGNAL-ARM] type=net | pattern=" & urlPattern & _
                   " | ctx=" & targetCtx
@@ -10484,6 +11440,7 @@ End Sub
 Private Sub ResetSignalState()
     m_sigDomArmed = False: m_sigDomSeen = False: m_sigDomXPath = ""
     m_sigNetArmed = False: m_sigNetSeen = False: m_sigNetPattern = ""
+    m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False
     m_sigVisArmed = False: m_sigVisSeen = False: m_sigVisXPath = ""
     m_signalOwnerContextId = ""
     m_sigLostWarned = False
@@ -10766,10 +11723,21 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     waitCtx.Add "missingProbeCount", 0 ' Used for multi-stage JIT recovery
     ' Pre-seeded metrics are diagnostic only and guarantee a complete END line.
     waitCtx.Add "lastJsIdleDuration", 0#
+    waitCtx.Add "lastStableWindowMs", 0#
     waitCtx.Add "lastInflFetch", 0
     waitCtx.Add "lastInflXhr", 0
     waitCtx.Add "lastProbeHealthSignature", vbNullString
     waitCtx.Add "lastProbeHealthSummary", vbNullString
+    waitCtx.Add "probeHealthy", False
+    waitCtx.Add "probeInitializingActive", False
+    waitCtx.Add "probeInitializingSinceMs", 0#
+    waitCtx.Add "probeInitializations", 0
+    waitCtx.Add "probeInitializationAttempts", 0
+    waitCtx.Add "probeUnhealthyActive", False
+    waitCtx.Add "probeUnhealthySinceMs", 0#
+    waitCtx.Add "probeDetectedUnhealthyMs", 0#
+    waitCtx.Add "probeRecoveries", 0
+    waitCtx.Add "probeRecoveryAttempts", 0
     ' Network hits latch asynchronously. Reset stableStart once on the first poll that sees
     ' the hit; pre-wait hits need no extra reset because stableStart is already fresh.
     waitCtx.Add "sigNetAcked", m_sigNetSeen
@@ -10823,9 +11791,11 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
     ctx("lastInflFetch") = inflFetch
     ctx("lastInflXhr") = inflXhr
 
-    ' Keep the pre-hit DOM-quiet duration so logs can show when a network hit prevented a
-    ' premature consensus.
+    ' Cache the latest poll only as a diagnostic sample. A network event can arrive between
+    ' polls, so this value must never be presented as quietAtHit for a net signal.
     m_lastProbeQuietMs = jsIdleDuration
+    m_lastProbeSampleMs = currentMs
+    m_lastProbeContextId = CStr(ctx("contextId"))
 
     LogInvalidProbeSelectors probe, CStr(ctx("contextId"))
 
@@ -10883,13 +11853,18 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                   (Not m_sigVisArmed Or m_sigVisSeen)
 
     If netIdle And activityStable Then
+        Dim stableWindowMs As Double
+        stableWindowMs = currentMs - CDbl(ctx("stableStart"))
+        If stableWindowMs < 0 Then stableWindowMs = 0
+        ctx("lastStableWindowMs") = stableWindowMs
+
         If Not sigGateOpen Then
             ' Do not reset stableStart while merely waiting for a signal; the hit itself owns the
-            ' single reset.
+            ' single reset. A TIMEOUT with signal=miss must not use this window as evidence.
             EvaluateSpaIdleCondition = False
             Exit Function
         End If
-        If (currentMs - CDbl(ctx("stableStart"))) >= CDbl(minStableMs) Then
+        If stableWindowMs >= CDbl(minStableMs) Then
             If m_debugMode Then
                 Call socket_.LogEvent("Consensus reached (" & minStableMs & "ms window satisfied)", "", ">>> [BiDi SPA Stable]")
             End If
@@ -10916,6 +11891,7 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
         End If
     Else
         ctx("stableStart") = currentMs
+        ctx("lastStableWindowMs") = 0#
         EvaluateSpaIdleCondition = False
     End If
 End Function
@@ -11167,6 +12143,7 @@ Private Function StartSpaIdleProbe(Optional ByVal contextId As String = "") As B
     End If
 
     MarkProbeFilterCurrent targetCtx
+    MarkProbeKnownReadyForDocument targetCtx
     StartSpaIdleProbe = True
     Exit Function
 
@@ -11344,6 +12321,18 @@ Private Sub MarkProbeFilterCurrent(ByVal contextId As String)
     If Len(contextId) = 0 Then Exit Sub
     If m_probeFilterRevisions Is Nothing Then Set m_probeFilterRevisions = New Dictionary
     m_probeFilterRevisions(contextId) = m_idleFilterRevision
+End Sub
+
+Private Function IsProbeKnownReadyForDocument(ByVal contextId As String) As Boolean
+    If Len(contextId) = 0 Then Exit Function
+    If m_probeKnownReadyContexts Is Nothing Then Set m_probeKnownReadyContexts = New Dictionary
+    IsProbeKnownReadyForDocument = m_probeKnownReadyContexts.Exists(contextId)
+End Function
+
+Private Sub MarkProbeKnownReadyForDocument(ByVal contextId As String)
+    If Len(contextId) = 0 Then Exit Sub
+    If m_probeKnownReadyContexts Is Nothing Then Set m_probeKnownReadyContexts = New Dictionary
+    m_probeKnownReadyContexts(contextId) = True
 End Sub
 
 ' Update only the mutable arrays. Existing healthy Fetch/XHR/DOM hooks remain unchanged.
@@ -11959,8 +12948,8 @@ ErrorHandler:
     Resume CleanExit
 End Function
 
-' SPA-WAIT-END records outcome, elapsed time, achieved DOM quiet/slack, and network
-' counters. It is the diagnostic pair of SPA-WAIT-BEGIN and runs only while recording.
+' SPA-WAIT-END records outcome, elapsed time, achieved DOM quiet, poll-observed confirmation-window
+' duration, and network counters. stableWindowMs is diagnostic duration, not a safety-margin score.
 Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
                             ByVal mode As waitMode, _
                             ByRef ctx As Dictionary, _
@@ -11980,8 +12969,22 @@ Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
     If ctx.Exists("lastInflFetch") Then inflFetch = CLng(ctx("lastInflFetch"))
     If ctx.Exists("lastInflXhr") Then inflXhr = CLng(ctx("lastInflXhr"))
 
+    Dim stableWindowMs As Double
+    If ctx.Exists("lastStableWindowMs") Then stableWindowMs = CDbl(ctx("lastStableWindowMs"))
+
     Dim elapsedMs As Double: elapsedMs = socket_.elapsedMs(startTick)
-    Dim slackMs As Double: slackMs = domQuietMs - CDbl(minStableMs)
+
+    Dim probeHealthy As Boolean
+    If ctx.Exists("probeHealthy") Then probeHealthy = CBool(ctx("probeHealthy"))
+
+    Dim probeInitializations As Long
+    If ctx.Exists("probeInitializations") Then probeInitializations = CLng(ctx("probeInitializations"))
+
+    Dim probeRecoveries As Long
+    If ctx.Exists("probeRecoveries") Then probeRecoveries = CLng(ctx("probeRecoveries"))
+
+    Dim probeDetectedUnhealthyMs As Double
+    probeDetectedUnhealthyMs = ProbeDetectedUnhealthyTotalMs(ctx, socket_.nowMs())
 
     Dim relTime As String
     relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
@@ -11993,15 +12996,120 @@ Private Sub WriteSpaWaitEnd(ByVal outcome As String, _
     PushTimelineLine "[" & relTime & "] [SPA-WAIT-END] " & outcome & _
                      " | elapsedMs=" & Format(elapsedMs, "0") & _
                      " | domQuietMs=" & Format(domQuietMs, "0") & _
-                     " | slackMs=" & Format(slackMs, "0") & _
+                     " | stableWindowMs=" & Format(stableWindowMs, "0") & _
                      " | minStableMs=" & minStableMs & _
                      " | fetch=" & inflFetch & _
                      " | xhr=" & inflXhr & _
+                     " | probeHealthy=" & LCase$(CStr(probeHealthy)) & _
+                     " | probeInitializations=" & CStr(probeInitializations) & _
+                     " | probeRecoveries=" & CStr(probeRecoveries) & _
+                     " | detectedUnhealthyMs=" & Format(probeDetectedUnhealthyMs, "0") & _
                      IIf(Len(sigEndDesc) > 0, " | signal=" & sigEndDesc, "")
 
     m_carryoverNoteArmedThisWait = False
     m_carryoverNoteEmittedThisWait = False
 End Sub
+
+Private Sub BeginProbeInitializationEpisode(ByRef ctx As Dictionary, _
+                                           ByVal currentMs As Double, _
+                                           ByVal targetCtx As String)
+    If ctx Is Nothing Then Exit Sub
+
+    ctx("probeHealthy") = False
+    If Not CBool(ctx("probeInitializingActive")) Then
+        ctx("probeInitializingActive") = True
+        ctx("probeInitializingSinceMs") = currentMs
+        ctx("probeInitializationAttempts") = 0
+        LogProbeDiagnosticLine "[SPA-PROBE-INITIALIZING] reason=new-document-or-first-use | ctx=" & targetCtx
+    End If
+End Sub
+
+Private Sub NoteProbeInitializationAttempt(ByRef ctx As Dictionary)
+    If ctx Is Nothing Then Exit Sub
+    ctx("probeInitializationAttempts") = CLng(ctx("probeInitializationAttempts")) + 1
+End Sub
+
+Private Sub CompleteProbeInitialization(ByRef ctx As Dictionary, _
+                                        ByVal currentMs As Double, _
+                                        ByVal targetCtx As String)
+    If ctx Is Nothing Then Exit Sub
+
+    ctx("probeHealthy") = True
+    If Not CBool(ctx("probeInitializingActive")) Then Exit Sub
+
+    Dim initMs As Double
+    initMs = currentMs - CDbl(ctx("probeInitializingSinceMs"))
+    If initMs < 0 Then initMs = 0
+
+    ctx("probeInitializations") = CLng(ctx("probeInitializations")) + 1
+    ctx("stableStart") = currentMs
+    ctx("lastStableWindowMs") = 0#
+
+    LogProbeDiagnosticLine "[SPA-PROBE-READY] initMs=" & Format(initMs, "0") & _
+                           " | attempts=" & CStr(ctx("probeInitializationAttempts")) & _
+                           " | ctx=" & targetCtx
+
+    ctx("probeInitializingActive") = False
+    ctx("probeInitializingSinceMs") = 0#
+    ctx("probeInitializationAttempts") = 0
+End Sub
+
+Private Sub BeginProbeUnhealthyEpisode(ByRef ctx As Dictionary, ByVal currentMs As Double)
+    If ctx Is Nothing Then Exit Sub
+
+    ctx("probeHealthy") = False
+    If Not CBool(ctx("probeUnhealthyActive")) Then
+        ctx("probeUnhealthyActive") = True
+        ctx("probeUnhealthySinceMs") = currentMs
+        ctx("probeRecoveryAttempts") = 0
+    End If
+End Sub
+
+Private Sub NoteProbeReinjectionAttempt(ByRef ctx As Dictionary)
+    If ctx Is Nothing Then Exit Sub
+    ctx("probeRecoveryAttempts") = CLng(ctx("probeRecoveryAttempts")) + 1
+End Sub
+
+Private Sub CompleteProbeRecovery(ByRef ctx As Dictionary, _
+                                  ByVal currentMs As Double, _
+                                  ByVal targetCtx As String)
+    If ctx Is Nothing Then Exit Sub
+
+    ctx("probeHealthy") = True
+    If Not CBool(ctx("probeUnhealthyActive")) Then Exit Sub
+
+    Dim episodeMs As Double
+    episodeMs = currentMs - CDbl(ctx("probeUnhealthySinceMs"))
+    If episodeMs < 0 Then episodeMs = 0
+
+    ctx("probeDetectedUnhealthyMs") = CDbl(ctx("probeDetectedUnhealthyMs")) + episodeMs
+    ctx("probeRecoveries") = CLng(ctx("probeRecoveries")) + 1
+    ctx("stableStart") = currentMs
+    ctx("lastStableWindowMs") = 0#
+
+    LogProbeDiagnosticLine "[SPA-PROBE-RECOVERED] detectedUnhealthyMs=" & Format(episodeMs, "0") & _
+                           " | attempts=" & CStr(ctx("probeRecoveryAttempts")) & _
+                           " | ctx=" & targetCtx
+
+    ctx("probeUnhealthyActive") = False
+    ctx("probeUnhealthySinceMs") = 0#
+    ctx("probeRecoveryAttempts") = 0
+End Sub
+
+Private Function ProbeDetectedUnhealthyTotalMs(ByRef ctx As Dictionary, ByVal currentMs As Double) As Double
+    If ctx Is Nothing Then Exit Function
+
+    Dim totalMs As Double
+    totalMs = CDbl(ctx("probeDetectedUnhealthyMs"))
+
+    If CBool(ctx("probeUnhealthyActive")) Then
+        Dim activeMs As Double
+        activeMs = currentMs - CDbl(ctx("probeUnhealthySinceMs"))
+        If activeMs > 0 Then totalMs = totalMs + activeMs
+    End If
+
+    ProbeDetectedUnhealthyTotalMs = totalMs
+End Function
 
 Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dictionary) As Boolean
     Const MAX_RECOVERY_ATTEMPTS As Long = 8
@@ -12025,19 +13133,42 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
             Dim isProbeActive As Boolean: isProbeActive = IsSpaProbeReady(probe)
 
             If isProbeActive Then
+                Dim healthyNowMs As Double: healthyNowMs = socket_.nowMs()
+
+                If CBool(ctx("probeInitializingActive")) Then
+                    CompleteProbeInitialization ctx, healthyNowMs, targetCtx
+                Else
+                    CompleteProbeRecovery ctx, healthyNowMs, targetCtx
+                End If
+                MarkProbeKnownReadyForDocument targetCtx
+                ctx("probeHealthy") = True
                 ctx("missingProbeCount") = 0
+                If m_navigationDetected And m_navigationContextId = targetCtx Then
+                    m_navigationDetected = False
+                    m_navigationContextId = ""
+                End If
                 ResetSpaProbeHealthBurst ctx
 
-                EvaluateWaitCondition = EvaluateSpaIdleCondition(probe, ctx, socket_.nowMs())
+                EvaluateWaitCondition = EvaluateSpaIdleCondition(probe, ctx, healthyNowMs)
 
                 Set probe = Nothing
             Else
-                ' When the probe disappears, clear cached inflight URLs so stale data cannot misclassify
-                ' a later timeout as a network HALT.
+                Dim unhealthyNowMs As Double: unhealthyNowMs = socket_.nowMs()
+                Dim isInitialProbeForDocument As Boolean
+                isInitialProbeForDocument = CBool(ctx("probeInitializingActive")) Or _
+                                            Not IsProbeKnownReadyForDocument(targetCtx)
+
+                If isInitialProbeForDocument Then
+                    BeginProbeInitializationEpisode ctx, unhealthyNowMs, targetCtx
+                Else
+                    BeginProbeUnhealthyEpisode ctx, unhealthyNowMs
+                End If
+
+                ' No unverified sample contributes stability evidence.
                 If ctx.Exists("lastInflightUrls") Then ctx.Remove "lastInflightUrls"
 
-                ' navigationStarted permits predictive probe reinjection without an extra failed query;
-                ' the flag is one-shot.
+                ' navigationStarted is one-shot. A new document is initialization, not an
+                ' unhealthy/recovery incident.
                 If m_navigationDetected And m_navigationContextId = targetCtx Then
                     m_navigationDetected = False
                     m_navigationContextId = ""
@@ -12052,39 +13183,49 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
                     If m_debugMode Then
                         Debug.Print "BiDi: Predictive probe injection (navigationStarted shortcut)"
                     End If
+                    If isInitialProbeForDocument Then
+                        NoteProbeInitializationAttempt ctx
+                    Else
+                        NoteProbeReinjectionAttempt ctx
+                    End If
                     Call StartSpaIdleProbe(targetCtx)
 
                     EvaluateWaitCondition = False
                     Exit Function
                 End If
 
-                ' Expected navigation-driven disappearance is handled above without an unhealthy
-                ' warning. All other missing/unhealthy samples are explicit diagnostics.
-                TrackSpaProbeUnhealthy probe, ctx, targetCtx
+                If Not isInitialProbeForDocument Then TrackSpaProbeUnhealthy probe, ctx, targetCtx
 
                 Dim bCount As Long: bCount = CLng(ctx("missingProbeCount")) + 1
                 ctx("missingProbeCount") = bCount
+                ctx("stableStart") = unhealthyNowMs
+                ctx("lastStableWindowMs") = 0#
 
-                ctx("stableStart") = socket_.nowMs()
-
-                ' Repeated inability to establish the probe raises logical panic 505. Include the
-                ' latest explicit false/missing health flags so the caller can diagnose the failed hook.
                 If bCount > MAX_RECOVERY_ATTEMPTS Then
-                    TrackSpaProbeUnhealthy probe, ctx, targetCtx, True
-
                     Dim lastProbeHealth As String
-                    If ctx.Exists("lastProbeHealthSummary") Then
-                        lastProbeHealth = CStr(ctx("lastProbeHealthSummary"))
+                    If Not isInitialProbeForDocument Then
+                        TrackSpaProbeUnhealthy probe, ctx, targetCtx, True
+                        If ctx.Exists("lastProbeHealthSummary") Then
+                            lastProbeHealth = CStr(ctx("lastProbeHealthSummary"))
+                        End If
                     End If
                     If Len(lastProbeHealth) = 0 Then lastProbeHealth = BuildSpaProbeHealthSummary(probe)
 
                     Err.Raise 505, "BiDi:ConsensusError", _
-                        "SPA Consensus Panic: Stability probe failed to initialize after " & _
+                        "SPA Consensus Panic: Stability probe failed to " & _
+                        IIf(isInitialProbeForDocument, "initialize", "recover") & " after " & _
                         MAX_RECOVERY_ATTEMPTS & " attempts. The page state is too volatile. " & _
-                        "Last unhealthy probe: " & lastProbeHealth
+                        "Last probe health: " & lastProbeHealth
                 End If
 
-                If m_debugMode Then Debug.Print "BiDi: SPA Probe inactive. Attempting re-injection (#" & bCount & ")..."
+                If m_debugMode Then
+                    Debug.Print "BiDi: SPA Probe inactive. Attempting injection (#" & bCount & ")..."
+                End If
+                If isInitialProbeForDocument Then
+                    NoteProbeInitializationAttempt ctx
+                Else
+                    NoteProbeReinjectionAttempt ctx
+                End If
                 Call StartSpaIdleProbe(targetCtx)
 
                 EvaluateWaitCondition = False
@@ -12567,6 +13708,7 @@ Private Sub PrepareProbeForAction(ByVal contextId As String)
 
     Set probe = QuerySpaProbe(contextId)
     isReady = IsSpaProbeReady(probe)
+    If isReady Then MarkProbeKnownReadyForDocument contextId
 
     If Not isReady Then
         StartSpaIdleProbe contextId
