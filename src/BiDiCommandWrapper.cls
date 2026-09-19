@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.1"
+Private Const BIDI_WRAPPER_VERSION As String = "5.2"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -184,6 +184,7 @@ Private Const MAX_FORENSIC_INCIDENT_LOG_SIZE As Long = 512
 Private Const MAX_FORENSIC_INCIDENT_LINE_CHARS As Long = 2048
 Private Const MAX_SUPPRESSED_KEYS As Long = 2000
 Private Const MAX_SUPPRESSED_SUMMARY_LINES As Long = 25
+Private Const MAX_REC_RESPONSE_RESTORE_ATTEMPTS As Long = 3
 Private Const MAX_CONSOLE_LOG_TEXT_SIZE As Long = 2000
 Private Const MIN_MSG_SIZE As Long = 10     ' Ignore extremely short messages
 ' Reserved send-only ID; communicator discards its response.
@@ -210,6 +211,18 @@ Private m_nextDiscoveryDomPollMs As Double      ' nowMs deadline; 0 = sample on 
 ' Recorder-owned responseCompleted is subscribed independently so it can be paused only during
 ' URL-stability polling without disturbing request/lifecycle recording.
 Private m_recorderResponseCompletedSubscriptionId As String
+' Recorder observation-gap state is intentionally separate from subscription ownership. A gap is
+' open only while the GLOBAL network.responseCompleted subscription is absent after recorder pause.
+Private m_recResponseGapOpen As Boolean
+Private m_recResponseGapSinceSec As Double
+Private m_recResponseGapReason As String
+Private m_recResponseRestoreAttempts As Long
+Private m_recResponseResumeFailLogged As Boolean
+Private m_recResponseGapIntervals As Collection     ' Dictionaries: startSec/endSec/reason/attempts
+Private m_recResponseCurrentGap As Dictionary
+Private m_recRequestHops As Dictionary              ' (request id, redirectCount) -> hop diagnostics
+Private m_recResponseRestoreInProgress As Boolean
+Private m_discoveryStartInProgress As Boolean
 ' beforeRequestSent is recorder-only; no latency pairing is retained.
 Private m_recSuppByKey As Dictionary       ' normalized key -> suppressed-event count
 Private m_recRequestUrlById As Dictionary   ' full request id -> latest raw URL, including suppressed requests
@@ -2850,7 +2863,14 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         ' The bounded drain prevents a large event burst from monopolizing the VBA thread.
         DrainNonBlockingRecorderQueue
 
-        If IsFinalNavigationStatusReadyForPause() Then
+        ' Keep the readiness predicate side-effect free. When an armed network signal still
+        ' depends on responseCompleted, record the explicit reason why recorder pause is skipped.
+        If m_sigNetArmed And Not m_sigNetSeen Then
+            If m_isRecording Then
+                PushTimelineLine "[" & RecorderRelativeTimeText() & "] [REC-PAUSE-SKIP] network.responseCompleted" & _
+                                 " | reason=net-signal-armed"
+            End If
+        ElseIf IsFinalNavigationStatusReadyForPause() Then
             recorderResponseCompletedPaused = _
                 PauseRecorderResponseCompletedBestEffort( _
                     recorderResponseCompletedReleasedId)
@@ -2930,9 +2950,10 @@ Cleanup:
     On Error Resume Next
 
     If recorderResponseCompletedPaused Then
-        Call RestoreRecorderResponseCompletedBestEffort(True)
-        recorderResponseCompletedPaused = False
-        recorderResponseCompletedReleasedId = vbNullString
+        If RestoreRecorderResponseCompletedBestEffort(True) Then
+            recorderResponseCompletedPaused = False
+            recorderResponseCompletedReleasedId = vbNullString
+        End If
     End If
 
     ReleaseNavigationResponseStartedSubscriptionBestEffort _
@@ -3322,6 +3343,14 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
     Next tc
 
     ExecuteSessionSubscribe = lastRes
+
+    ' If recording previously opened a responseCompleted observation gap, any later GLOBAL
+    ' subscription makes events observable again. Do not claim ownership here: this path may be
+    ' ArmNetworkSignal or user code. Start/recorder-restore manage their ownership explicitly.
+    If m_isRecording And m_recResponseGapOpen And _
+       Not m_recResponseRestoreInProgress And Not m_discoveryStartInProgress Then
+        SyncRecorderResponseGapAvailability "existing-subscription"
+    End If
 End Function
 
 Private Sub AcquireNavigationResponseStartedSubscription(ByRef ownedSubscriptionId As String)
@@ -3407,6 +3436,10 @@ End Sub
 
 Private Function IsFinalNavigationStatusReadyForPause() As Boolean
     IsFinalNavigationStatusReadyForPause = False
+
+    ' Recorder must not change the behavior being observed. In particular, never pause the
+    ' responseCompleted stream while an armed network signal still depends on that event.
+    If m_sigNetArmed And Not m_sigNetSeen Then Exit Function
     If Not m_navHttpCaptureStatusKnown Then Exit Function
 
     Dim statusCode As Long
@@ -3424,6 +3457,8 @@ Private Function PauseRecorderResponseCompletedBestEffort( _
     releasedSubscriptionId = vbNullString
     PauseRecorderResponseCompletedBestEffort = False
 
+    ' Recorder must not change the behavior being observed and must never unsubscribe a borrowed
+    ' subscription. Only the exact GLOBAL subscription ID created/owned by the recorder is paused.
     If Not m_isRecording Then Exit Function
     If Len(m_recorderResponseCompletedSubscriptionId) = 0 Then Exit Function
     If m_activeSubscriptions Is Nothing Then Exit Function
@@ -3460,6 +3495,12 @@ Private Function PauseRecorderResponseCompletedBestEffort( _
 
     m_recorderResponseCompletedSubscriptionId = vbNullString
     releasedSubscriptionId = ownedId
+
+    ' Do not pump the recorder queue here. A bounded drain cannot make [REC-PAUSE] a strict
+    ' timestamp boundary, while an unbounded drain would let recording perturb navigation timing.
+    ' responseCompleted events already received/queued before unsubscribe completed may therefore
+    ' be processed after [REC-PAUSE]; pause-exposed remains a conservative exposure marker.
+    OpenRecorderResponseGap "navigation-url-stability"
     PauseRecorderResponseCompletedBestEffort = True
     Exit Function
 
@@ -3477,24 +3518,286 @@ Private Function RestoreRecorderResponseCompletedBestEffort( _
     If socket_ Is Nothing Then Exit Function
     If socket_.state <> StateConnected Then Exit Function
 
+    ' Recorder must not change the behavior being observed and must not claim ownership of a
+    ' subscription created by ArmNetworkSignal or user code. The exact GLOBAL key is deliberate:
+    ' a context-scoped network.responseCompleted|<ctx> subscription is insufficient for recorder
+    ' coverage. Today borrowed global subscriptions cannot disappear mid-recording except through
+    ' recorder pause or ClearState/session cleanup; revisit gap tracking if public per-event
+    ' unsubscribe support is added in the future.
     On Error GoTo Failed
 
     If m_activeSubscriptions Is Nothing Then Set m_activeSubscriptions = New Dictionary
 
-    If Not m_activeSubscriptions.Exists(SUB_KEY) Then
-        Call Me.ExecuteSessionSubscribe(Array(SUB_KEY), Silent:=True)
+    If m_activeSubscriptions.Exists(SUB_KEY) Then
+        If m_recResponseGapOpen Then CloseRecorderResponseGap "existing-subscription"
+        RestoreRecorderResponseCompletedBestEffort = True
+        Exit Function
     End If
 
+    If m_recResponseGapOpen Then
+        If m_recResponseRestoreAttempts >= MAX_REC_RESPONSE_RESTORE_ATTEMPTS Then Exit Function
+        m_recResponseRestoreAttempts = m_recResponseRestoreAttempts + 1
+        UpdateCurrentRecorderGapAttempts
+    End If
+
+    m_recResponseRestoreInProgress = True
+    Call Me.ExecuteSessionSubscribe(Array(SUB_KEY), Silent:=True)
+    m_recResponseRestoreInProgress = False
+
     If m_activeSubscriptions.Exists(SUB_KEY) Then
+        ' The global subscription did not exist before this call, so this successful subscribe is
+        ' recorder-owned and may be paused again by a later navigation optimization.
         m_recorderResponseCompletedSubscriptionId = CStr(m_activeSubscriptions(SUB_KEY))
+        If m_recResponseGapOpen Then CloseRecorderResponseGap "recorder"
         RestoreRecorderResponseCompletedBestEffort = _
             (Len(m_recorderResponseCompletedSubscriptionId) > 0)
     End If
     Exit Function
 
 Failed:
+    m_recResponseRestoreInProgress = False
+    If m_recResponseGapOpen Then LogRecorderResponseResumeFailureOnce
     Err.Clear
 End Function
+
+Private Function RecorderRelativeSeconds() As Double
+    If socket_ Is Nothing Then Exit Function
+    RecorderRelativeSeconds = (socket_.nowMs() / 1000) - m_recorderStartTime
+    If RecorderRelativeSeconds < 0# Then RecorderRelativeSeconds = 0#
+End Function
+
+Private Function RecorderRelativeTimeText() As String
+    RecorderRelativeTimeText = Format(RecorderRelativeSeconds(), "0.00") & "s"
+End Function
+
+Private Sub ResetRecorderResponseGapRunState()
+    m_recResponseGapOpen = False
+    m_recResponseGapSinceSec = 0#
+    m_recResponseGapReason = vbNullString
+    m_recResponseRestoreAttempts = 0
+    m_recResponseResumeFailLogged = False
+    m_recResponseRestoreInProgress = False
+    Set m_recResponseGapIntervals = New Collection
+    Set m_recResponseCurrentGap = Nothing
+    Set m_recRequestHops = New Dictionary
+End Sub
+
+Private Sub OpenRecorderResponseGap(ByVal reason As String)
+    If Not m_isRecording Then Exit Sub
+    If m_recResponseGapOpen Then Exit Sub
+
+    m_recResponseGapOpen = True
+    m_recResponseGapSinceSec = RecorderRelativeSeconds()
+    m_recResponseGapReason = reason
+    m_recResponseRestoreAttempts = 0
+    m_recResponseResumeFailLogged = False
+
+    Set m_recResponseCurrentGap = New Dictionary
+    m_recResponseCurrentGap.Add "startSec", m_recResponseGapSinceSec
+    m_recResponseCurrentGap.Add "endSec", Empty
+    m_recResponseCurrentGap.Add "reason", reason
+    m_recResponseCurrentGap.Add "attempts", 0
+    If m_recResponseGapIntervals Is Nothing Then Set m_recResponseGapIntervals = New Collection
+    m_recResponseGapIntervals.Add m_recResponseCurrentGap
+
+    MarkOpenRecorderRequestHopsPauseExposed
+    PushTimelineLine "[" & RecorderRelativeTimeText() & "] [REC-PAUSE] network.responseCompleted" & _
+                     " | reason=" & reason
+End Sub
+
+Private Sub UpdateCurrentRecorderGapAttempts()
+    If m_recResponseCurrentGap Is Nothing Then Exit Sub
+    If m_recResponseCurrentGap.Exists("attempts") Then
+        m_recResponseCurrentGap("attempts") = m_recResponseRestoreAttempts
+    End If
+End Sub
+
+Private Sub CloseRecorderResponseGap(ByVal resumedBy As String)
+    If Not m_recResponseGapOpen Then Exit Sub
+
+    If Not m_recResponseCurrentGap Is Nothing Then
+        If m_recResponseCurrentGap.Exists("endSec") Then _
+            m_recResponseCurrentGap("endSec") = RecorderRelativeSeconds()
+        UpdateCurrentRecorderGapAttempts
+    End If
+
+    PushTimelineLine "[" & RecorderRelativeTimeText() & "] [REC-RESUME] network.responseCompleted" & _
+                     " | reason=" & m_recResponseGapReason & _
+                     " | by=" & resumedBy & _
+                     " | attempts=" & CStr(m_recResponseRestoreAttempts)
+
+    m_recResponseGapOpen = False
+    m_recResponseGapSinceSec = 0#
+    m_recResponseGapReason = vbNullString
+    m_recResponseRestoreAttempts = 0
+    m_recResponseResumeFailLogged = False
+    Set m_recResponseCurrentGap = Nothing
+End Sub
+
+Private Sub SyncRecorderResponseGapAvailability(ByVal resumedBy As String)
+    Const SUB_KEY As String = "network.responseCompleted"
+    If Not m_recResponseGapOpen Then Exit Sub
+    If m_activeSubscriptions Is Nothing Then Exit Sub
+    If Not m_activeSubscriptions.Exists(SUB_KEY) Then Exit Sub
+
+    ' Availability closes the observation gap regardless of ownership. Existing subscriptions are
+    ' borrowed; only Restore's own subscribe path records recorder ownership.
+    CloseRecorderResponseGap resumedBy
+End Sub
+
+Private Sub LogRecorderResponseResumeFailureOnce()
+    If Not m_recResponseGapOpen Then Exit Sub
+    If m_recResponseResumeFailLogged Then Exit Sub
+
+    m_recResponseResumeFailLogged = True
+    PushTimelineLine "[" & RecorderRelativeTimeText() & "] [REC-RESUME-FAIL] network.responseCompleted" & _
+                     " | reason=" & m_recResponseGapReason & _
+                     " | attempts=" & CStr(m_recResponseRestoreAttempts) & _
+                     " | gap remains open"
+End Sub
+
+Private Sub RetryRecorderResponseGapAtSpaWaitEntry()
+    If Not m_isRecording Then Exit Sub
+    If Not m_recResponseGapOpen Then Exit Sub
+
+    ' Retry only at SPA-wait entry. Never insert this recovery between Arm*Signal and the
+    ' subsequent action; doing so would change the timing contract of signal arming.
+    SyncRecorderResponseGapAvailability "existing-subscription"
+    If Not m_recResponseGapOpen Then Exit Sub
+    If m_recResponseRestoreAttempts >= MAX_REC_RESPONSE_RESTORE_ATTEMPTS Then Exit Sub
+
+    Call RestoreRecorderResponseCompletedBestEffort(True)
+End Sub
+
+Private Sub AppendOpenRecorderResponseGapMarker()
+    If Not m_recResponseGapOpen Then Exit Sub
+    UpdateCurrentRecorderGapAttempts
+    PushTimelineLine "[end] [REC-PAUSE-OPEN] network.responseCompleted" & _
+                     " | since=" & Format(m_recResponseGapSinceSec, "0.00") & "s" & _
+                     " | reason=" & m_recResponseGapReason & _
+                     " | attempts=" & CStr(m_recResponseRestoreAttempts)
+End Sub
+
+Private Function RecorderRequestHopKey(ByVal requestId As String, ByVal redirectCount As Long) As String
+    RecorderRequestHopKey = requestId & "|" & CStr(redirectCount)
+End Function
+
+Private Function RecorderRedirectCount(ByVal params As Object) As Long
+    Dim redirectText As String
+    redirectText = GetPathString(params, "redirectCount")
+    If Len(redirectText) > 0 And IsNumeric(redirectText) Then _
+        RecorderRedirectCount = CLng(redirectText)
+End Function
+
+Private Sub MarkOpenRecorderRequestHopsPauseExposed()
+    If m_recRequestHops Is Nothing Then Exit Sub
+
+    Dim hopKey As Variant
+    Dim hop As Dictionary
+    For Each hopKey In m_recRequestHops.keys
+        Set hop = m_recRequestHops(CStr(hopKey))
+        If CBool(hop("open")) Then hop("pauseExposed") = True
+    Next hopKey
+End Sub
+
+Private Sub TrackRecorderRequestHopStart(ByVal params As Object, ByVal requestId As String)
+    If Len(requestId) = 0 Then Exit Sub
+    If m_recRequestHops Is Nothing Then Set m_recRequestHops = New Dictionary
+
+    Dim redirectCount As Long
+    redirectCount = RecorderRedirectCount(params)
+
+    ' Seeing the next redirect hop proves that the prior hop is no longer open even if its
+    ' terminal response event was not observed by the recorder.
+    If redirectCount > 0 Then
+        Dim prevKey As String
+        prevKey = RecorderRequestHopKey(requestId, redirectCount - 1)
+        If m_recRequestHops.Exists(prevKey) Then
+            Dim prevHop As Dictionary
+            Set prevHop = m_recRequestHops(prevKey)
+            If CBool(prevHop("open")) Then
+                prevHop("open") = False
+                prevHop("advancedByRedirect") = True
+            End If
+        End If
+    End If
+
+    Dim hopKey As String
+    hopKey = RecorderRequestHopKey(requestId, redirectCount)
+    If m_recRequestHops.Exists(hopKey) Then Exit Sub
+
+    Dim hop As New Dictionary
+    hop.Add "requestId", requestId
+    hop.Add "redirectCount", redirectCount
+    hop.Add "open", True
+    hop.Add "terminalSeen", False
+    hop.Add "pauseExposed", m_recResponseGapOpen
+    hop.Add "advancedByRedirect", False
+    hop.Add "startSec", RecorderRelativeSeconds()
+    m_recRequestHops.Add hopKey, hop
+End Sub
+
+Private Sub TrackRecorderRequestHopTerminal(ByVal params As Object, ByVal requestId As String)
+    If Len(requestId) = 0 Then Exit Sub
+    If m_recRequestHops Is Nothing Then Exit Sub
+
+    Dim redirectCount As Long
+    redirectCount = RecorderRedirectCount(params)
+    Dim hopKey As String
+    hopKey = RecorderRequestHopKey(requestId, redirectCount)
+
+    Dim hop As Dictionary
+    If m_recRequestHops.Exists(hopKey) Then
+        Set hop = m_recRequestHops(hopKey)
+    Else
+        ' Defensive fallback for implementations that omit redirectCount on a terminal event.
+        Dim k As Variant
+        Dim candidate As Dictionary
+        Dim bestRedirect As Long: bestRedirect = -1
+        For Each k In m_recRequestHops.keys
+            Set candidate = m_recRequestHops(CStr(k))
+            If StrComp(CStr(candidate("requestId")), requestId, vbBinaryCompare) = 0 Then
+                If CBool(candidate("open")) Then
+                    If CLng(candidate("redirectCount")) > bestRedirect Then
+                        bestRedirect = CLng(candidate("redirectCount"))
+                        Set hop = candidate
+                    End If
+                End If
+            End If
+        Next k
+        If hop Is Nothing Then Exit Sub
+    End If
+
+    hop("terminalSeen") = True
+    hop("open") = False
+End Sub
+
+Private Sub AppendRecorderUnpairedRequestSummary()
+    If m_recRequestHops Is Nothing Then Exit Sub
+
+    Dim total As Long, pauseExposed As Long, openAtEnd As Long, other As Long
+    Dim k As Variant
+    Dim hop As Dictionary
+
+    For Each k In m_recRequestHops.keys
+        Set hop = m_recRequestHops(CStr(k))
+        If Not CBool(hop("terminalSeen")) Then
+            total = total + 1
+            If CBool(hop("pauseExposed")) Then
+                pauseExposed = pauseExposed + 1
+            ElseIf CBool(hop("open")) Then
+                openAtEnd = openAtEnd + 1
+            Else
+                other = other + 1
+            End If
+        End If
+    Next k
+
+    PushTimelineLine "[end] [REQ-UNPAIRED] count=" & CStr(total) & _
+                     " | pause-exposed=" & CStr(pauseExposed) & _
+                     " | open-at-end=" & CStr(openAtEnd) & _
+                     " | other=" & CStr(other)
+End Sub
 
 ' browsingContext.navigate waits to interactive at the protocol layer. waitMode controls
 ' only the additional bounded wrapper-side settlement after the command returns. A5 caps command
@@ -6560,6 +6863,9 @@ Private Sub ResetSessionBoundaryState()
     m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
     m_recorderStartTime = 0
+    m_recorderResponseCompletedSubscriptionId = vbNullString
+    ResetRecorderResponseGapRunState
+    m_discoveryStartInProgress = False
     m_discoveryDomCaptureEnabled = False
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
@@ -8215,7 +8521,7 @@ Private Sub ConsiderResponseBodyCandidate(ByVal params As Object, _
     If m_bodyCandidateCountByKey Is Nothing Then Set m_bodyCandidateCountByKey = New Dictionary
 
     Dim candidateKey As String
-    candidateKey = UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(mime)
+    candidateKey = UCase$(method) & "|" & BodyCaptureIdentityUrl(responseUrl) & "|" & LCase$(mime)
 
     Dim acceptedForKey As Long
     If m_bodyCandidateCountByKey.Exists(candidateKey) Then acceptedForKey = CLng(m_bodyCandidateCountByKey(candidateKey))
@@ -8331,7 +8637,7 @@ Private Sub ConsiderRequestBodyCandidate(ByVal params As Object, _
     If m_requestBodyCandidateCountByKey Is Nothing Then Set m_requestBodyCandidateCountByKey = New Dictionary
 
     Dim candidateKey As String
-    candidateKey = UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(contentType)
+    candidateKey = UCase$(method) & "|" & BodyCaptureIdentityUrl(reqUrl) & "|" & LCase$(contentType)
 
     Dim acceptedForKey As Long
     If m_requestBodyCandidateCountByKey.Exists(candidateKey) Then acceptedForKey = CLng(m_requestBodyCandidateCountByKey(candidateKey))
@@ -9490,6 +9796,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Dim stagedRequestBodySkipSummary As New Dictionary
     Dim events(3) As String
 
+    m_discoveryStartInProgress = True
     On Error GoTo StartFailed
 
     ' Recorder timestamps are seconds; NowMs values are divided by 1000 consistently.
@@ -9523,6 +9830,13 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
             stagedResponseCompletedSubscriptionId = _
                 CStr(m_activeSubscriptions("network.responseCompleted"))
         End If
+    End If
+
+    ' Recorder coverage requires the exact GLOBAL subscription key. A context-scoped
+    ' network.responseCompleted|<ctx> entry is intentionally not sufficient.
+    If Not m_activeSubscriptions.Exists("network.responseCompleted") Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:StartDiscoveryLog", _
+                  "Unable to establish the global network.responseCompleted subscription required by Discovery Log."
     End If
 
     ' Body capture is opt-in and capability-probed by attempting the collector once. Failure does
@@ -9594,6 +9908,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_recSuppOverflowCount = 0
     m_droppedHeadCount = 0
     m_recorderResponseCompletedSubscriptionId = stagedResponseCompletedSubscriptionId
+    ResetRecorderResponseGapRunState
     m_bodyCaptureRequested = captureResponseBodies
     m_bodyCaptureActive = stagedBodyCaptureActive
     m_bodyCaptureUnavailableReason = stagedBodyUnavailableReason
@@ -9626,6 +9941,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_carryoverNoteEmittedThisWait = False
 
     m_isRecording = True
+    m_discoveryStartInProgress = False
 
     ' Prime manual DOM capture before control returns to the caller. Querying first drains any
     ' stale pre-recording changeList entries; if no healthy probe exists, the same call injects
@@ -9644,6 +9960,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Exit Sub
 
 StartFailed:
+    m_discoveryStartInProgress = False
     Dim errNum As Long: errNum = Err.Number
     Dim errSrc As String: errSrc = Err.source
     Dim errDesc As String: errDesc = Err.description
@@ -9671,6 +9988,13 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     ' while that flag is True. RecordEventsForSeconds owns the final manual DOM sample; Stop does
     ' not consume the SPA probe outside that explicit manual recording window.
     Call ProcessRecorderQueue
+
+    ' Synchronize the gap state with actual global subscription availability before finalizing.
+    ' Then record any still-open observation gap and unpaired request-hop summary while the
+    ' recorder timeline is still writable.
+    SyncRecorderResponseGapAvailability "existing-subscription"
+    AppendOpenRecorderResponseGapMarker
+    AppendRecorderUnpairedRequestSummary
 
     m_isRecording = False
 
@@ -9707,6 +10031,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         m_discoveryDomContextId = vbNullString
         m_nextDiscoveryDomPollMs = 0#
         ResetDiscoveryBodyRunState
+        ResetRecorderResponseGapRunState
         Exit Sub
     End If
 
@@ -9779,17 +10104,26 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                           " oldest timeline line(s); only the most recent " & MAX_LOG_SIZE & _
                           " event(s) are shown. Earlier events existed but were evicted (ring buffer)." & vbCrLf
         End If
-        stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<host+path; volatile query values stripped, '?' preserves query presence, rpcids kept> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
-        stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During navigation URL-stability polling, recorder-owned responseCompleted may be temporarily paused and is restored before SPA idle wait; [REQ] remains live, so some [REQ] lines in that narrow window may have no [RES] pair. Per-request latency (dur=) is not computed." & vbCrLf
+        stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<normalized network endpoint; URL fragment removed; query parameter names preserved with values stripped, except rpcids value retained> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
+        stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). Recorder-owned responseCompleted may be temporarily paused during navigation URL-stability; [REQ] remains live. Per-request latency (dur=) is not computed." & vbCrLf
+        stm.writeText "LEGEND | [REC-PAUSE]/[REC-RESUME] mark recorder-owned observation gaps where the GLOBAL network.responseCompleted subscription was intentionally removed and later became available again. Events already received/queued before unsubscribe completed may still be processed as [RES] after [REC-PAUSE], so REC-PAUSE is NOT a strict timestamp boundary for visible [RES] lines." & vbCrLf
+        stm.writeText "LEGEND | [REC-PAUSE-SKIP] means the recorder deliberately did NOT pause GLOBAL network.responseCompleted because an armed net signal still depended on that event; reason=net-signal-armed records this known cause rather than inferring it from the absence of [REC-PAUSE]." & vbCrLf
+        stm.writeText "LEGEND | A [RES] line between [REC-PAUSE] and [REC-RESUME] is expected to be a responseCompleted event received before unsubscribe completed and processed later; it does NOT indicate that the observation gap did not exist. by=recorder means the recorder re-subscribed; by=existing-subscription means a GLOBAL subscription already existed and is borrowed, not claimed as recorder-owned. Context-scoped subscriptions do NOT close this gap." & vbCrLf
+        stm.writeText "LEGEND | [REC-RESUME-FAIL] reports only the FIRST failed recorder restore attempt for a gap; attempts= counts recorder-owned session.subscribe restore attempts for that gap (maximum " & MAX_REC_RESPONSE_RESTORE_ATTEMPTS & "). [REC-PAUSE-OPEN] at log end means the gap was still open; since= is the recorder-relative PAUSE start time. These markers identify observation gaps but do NOT prove that any specific unpaired request completed inside the gap." & vbCrLf
+        stm.writeText "LEGEND | [REQ-UNPAIRED] tracks request hops by (request id, redirectCount), including suppressed requests. Categories are exclusive: pause-exposed=the hop was open when a recorder gap began or its REQ was processed while a gap was open; open-at-end=not pause-exposed and still had no observed terminal event/redirect advance when recording ended; other=not pause-exposed, no terminal event observed, but later evidence (such as the next redirect hop) showed it was no longer open. pause-exposed is NOT proof that the missing terminal event occurred during the gap." & vbCrLf
         stm.writeText "LEGEND | [ERR]/[BLOCK] carry request id + normalized key; if fetchError omits its URL, the recorder falls back to the beforeRequestSent id->URL/key cache (including suppressed requests). Path/matrix assignment values such as ;ord=... or /_dc_unique_id=... are stripped to name= so volatile identifiers do not fragment keys." & vbCrLf
-        stm.writeText "LEGEND | [SPA-ACT]=sampled/coalesced DOM mutation burst (NOT an exhaustive event stream; absence does not prove no mutation)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has achieved quiet + observed confirmation-window duration; neither is a safety-margin score)  [SUPPRESSED]=filtered-noise tally with idle=skip|track" & vbCrLf
+        stm.writeText "LEGEND | [SPA-ACT]=sampled/coalesced DOM mutation burst (NOT an exhaustive event stream; absence does not prove no mutation)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has achieved quiet + observed confirmation-window duration; neither is a safety-margin score)  [SUPPRESSED]=filtered-noise tally aggregated by normalized host+path; query presence '?' is retained but query parameter names/values are omitted; idle=skip|track" & vbCrLf
         stm.writeText "LEGEND | [SPA-PROBE-INITIALIZING]/[SPA-PROBE-READY]=normal first-use/new-document lazy initialization. [SPA-PROBE-UNHEALTHY]/[SPA-PROBE-RECOVERED]=a probe already verified healthy in the same document was later missing/unhealthy and recovered. Unverified samples contribute NO stability evidence; READY/RECOVERED restart the full confirmation window. WAIT-END reports probeHealthy, probeInitializations, probeRecoveries, and detectedUnhealthyMs." & vbCrLf
         stm.writeText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
         stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate and resets the consensus stability window. dom/vis quietAtHit is measured on the poll that detects the hit (~100ms). net HITs are event-triggered between polls, so quietAtHit=unknown; lastPolledQuietMs/sampleAgeMs are diagnostic samples only and MUST NOT be treated as quiet at the network event. [SPA-NET-TO-CONTENT] is the first content render OBSERVED after an armed net HIT; observedMs includes poll-detection delay and does not assert ownership. Gated waits carry signal=<armed types> on BEGIN and hit|miss on END." & vbCrLf
+        stm.writeText "LEGEND | If a net HIT occurs before SPA-WAIT-BEGIN, the net gate is already open when the wait starts. The wait's stability window starts at SPA-WAIT-BEGIN (after the HIT), so no separate HIT reset is needed. SPA-NET-TO-CONTENT is NOT measured for such a HIT. Completion then relies on the idle/DOM-quiet/probe state observed during the wait; the net gate itself does NOT link that HIT to any specific render." & vbCrLf
+        stm.writeText "LEGEND | For dom signals, count= is the cumulative number of MutationRecords observed by the armed MutationObserver from ARM until the polling cycle that first detects the HIT. The observer watches the subtree of the single target node resolved at ARM (the FIRST node matched by xpath=, or the node resolved by shadowPath=). Attribute mutations are included only when the ARM line shows attributes=true. count= is NOT the number of matched elements, rendered rows, page-wide mutations, or mutations attributable only to the subsequent action." & vbCrLf
+        stm.writeText "LEGEND | stableWindowMs is elapsed time since the most recent of: wait start, a poll that observed the combined idle/quiet condition as false, or an explicit reset (dom/vis HIT; net HIT at the first poll that observes it, not its event timestamp; probe READY/RECOVERED; navigation reset; probe missing/unhealthy detection). It is NOT an exact post-threshold dwell time or a safety margin; the true condition may have become satisfied between polls." & vbCrLf
         stm.writeText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
         stm.writeText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
             stm.writeText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. With no explicit body patterns, JSON retrieval/logging requires BOTH the recorder top-level browsing context and Sec-Fetch-Site same-origin/same-site/none. Child-frame, cross-site, and unknown-context/site bodies are not pulled into the log. Explicit AddBodyCapturePattern entries act as the body allow-list and may intentionally override those defaults. The browser-side BiDi collector may still temporarily retain other data until cleanup." & vbCrLf
+            stm.writeText "LEGEND | BODY maxPerMethodKeyMime uses an internal method + fragment-free full URL + MIME identity, separate from the public normalized key. Query values remain private but different query values count as distinct BODY capture identities; repeated requests to the same URL still share the cap." & vbCrLf
             stm.writeText "LEGEND | [BODY] may be REQUEST or RESPONSE; normalized=True means parseable XSSI/length-framed JSON was converted to a canonical json-frames envelope. Small payloads under losslessSourceMaxChars are normalized without lossy sampling. compacted=True means lossy AI structural reduction was applied (long strings summarized and/or large arrays/objects sampled). truncated=True means the final result still exceeded maxLoggedChars and only its prefix was written." & vbCrLf
             stm.writeText "LEGEND | normalized=True or compacted=True means BODY content is not byte-for-byte raw. AI normalization/compaction preserves structural/value samples; sourceChars is retrieved text length and loggedChars is final output length." & vbCrLf
             stm.writeText "LEGEND | [BODY-SKIP] means getData was deliberately not called (redirect, oversize, or capture cap). [BODY-MISS] means a selected getData pull failed; unavailable commonly means data was not retained/was evicted. Missing body data must NOT be interpreted as an empty response body." & vbCrLf
@@ -9810,11 +10144,17 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "   - Derive patterns from URLs ACTUALLY seen below (do not guess). '*' = wildcard ""contains"";" & vbCrLf
         stm.writeText "     no '*' = literal substring. Do not over-broaden (use ""/log?"" literal, NOT ""*/log*"", which" & vbCrLf
         stm.writeText "     would also match /login). Match what was observed (e.g. generate_204, not gen_204)." & vbCrLf
+        stm.writeText "     Timeline [REQ]/[RES] normalized keys preserve query parameter names but strip values (except" & vbCrLf
+        stm.writeText "     rpcids), so patterns such as year= can be derived without exposing the original query value." & vbCrLf
+        stm.writeText "     [SUPPRESSED] intentionally aggregates more coarsely by normalized host+path plus query presence" & vbCrLf
+        stm.writeText "     only; use [REQ]/[RES] when query parameter names matter for a suggested pattern." & vbCrLf
         stm.writeText vbCrLf
         stm.writeText "2) Wait-time assessment" & vbCrLf
         stm.writeText "   - Consensus uses current network-idle + DOM-quiet>=minStableMs AND a poll-based" & vbCrLf
-        stm.writeText "     stable-window timer. stableWindowMs is elapsed time since the most recent poll that" & vbCrLf
-        stm.writeText "     observed the combined idle/quiet condition as false (or an explicit signal reset)." & vbCrLf
+        stm.writeText "     stable-window timer. stableWindowMs is elapsed time since the most recent of: wait start," & vbCrLf
+        stm.writeText "     a poll that observed the combined idle/quiet condition as false, or an explicit reset" & vbCrLf
+        stm.writeText "     (dom/vis HIT; net HIT at the first poll that observes it, not its event timestamp;" & vbCrLf
+        stm.writeText "     probe READY/RECOVERED; navigation reset; probe missing/unhealthy detection)." & vbCrLf
         stm.writeText "     Because the true threshold crossing occurs between polls, stableWindowMs is NOT an exact" & vbCrLf
         stm.writeText "     post-threshold dwell time or a safety margin. Its amount above minStableMs is largely" & vbCrLf
         stm.writeText "     polling phase/overshoot. Do NOT rank or tune waits from that difference." & vbCrLf
@@ -9827,6 +10167,13 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "     probe may actually have disappeared. probeInitializations/probeRecoveries are diagnostics, not" & vbCrLf
         stm.writeText "     failures by themselves. Do not infer total probe-absence duration from detectedUnhealthyMs." & vbCrLf
         stm.writeText "   - Check elapsedMs vs maxTimeoutMs (headroom). Any TIMEOUT/HALT = wait too short or a real stall." & vbCrLf
+        stm.writeText "   - If REC-* markers exist, treat them as recorder observation-coverage facts. [RES] lines may still" & vbCrLf
+        stm.writeText "     appear after [REC-PAUSE] when responseCompleted events were already received/queued before the" & vbCrLf
+        stm.writeText "     unsubscribe completed and were processed later; this does NOT invalidate the REC gap. A REC gap" & vbCrLf
+        stm.writeText "     can explain why some REQ hops have no RES/BODY candidate, but it does NOT prove a specific" & vbCrLf
+        stm.writeText "     response completed during that gap. Use [REQ-UNPAIRED] for the recorder's exclusive end-of-run" & vbCrLf
+        stm.writeText "     classification. [REC-PAUSE-SKIP] does NOT create an observation gap; do not treat it as a cause" & vbCrLf
+        stm.writeText "     of missing [RES], missing BODY candidates, or unpaired requests." & vbCrLf
         stm.writeText "   - Long elapsed caused by slow server responses is NOT a threshold problem; do not raise" & vbCrLf
         stm.writeText "     minStableMs for that. Infer server latency from the timestamp gaps between consecutive" & vbCrLf
         stm.writeText "     [RES]/[NAV] lines (per-request dur is not recorded; see LEGEND)." & vbCrLf
@@ -9854,6 +10201,9 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "     net signal, but owner=not-asserted and poll detection still apply." & vbCrLf
         stm.writeText "   - The check is adjacent-wait only: a hint lives for exactly ONE following wait, so a SUSPECT" & vbCrLf
         stm.writeText "     with no NOTE in the very next wait is not chased further. Absence of a NOTE is not 'safe'." & vbCrLf
+        stm.writeText "   - Absence of [SPA-CONSENSUS-SUSPECT] does NOT prove render safety, especially when the relevant" & vbCrLf
+        stm.writeText "     json/API response or net HIT occurred before SPA-WAIT-BEGIN. BODY STORE presence proves capture," & vbCrLf
+        stm.writeText "     not response-to-render timing; do not use BODY ordering in this saved log as temporal proof." & vbCrLf
         stm.writeText "   - Before treating a SUSPECT firstJson as render-producing work, check whether it looks like" & vbCrLf
         stm.writeText "     telemetry/beacon/browser-metadata traffic. If so, prefer an IGNORE suggestion for that" & vbCrLf
         stm.writeText "     observed endpoint; idle=skip responses do not create SUSPECT state." & vbCrLf
@@ -9863,16 +10213,16 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "       and/or bidi.ArmNetworkSignal ""<substring of the SUSPECT's firstJson key>""." & vbCrLf
         stm.writeText "     [SPA-ACT] is sampled/coalesced rather than exhaustive; avoid dynamic IDs when the log" & vbCrLf
         stm.writeText "     shows them changing across otherwise similar UI states. Prefer stable attributes." & vbCrLf
-        stm.writeText "     With net+content armed, the HITs give a much cleaner measurement than ungated inference" & vbCrLf
-        stm.writeText "     (net HIT is event-triggered at VBA dispatch time but has no exact DOM-quiet sample; dom/vis HIT is poll-detected at ~100ms) and resolve the owner" & vbCrLf
-        stm.writeText "     without guessing. Fallback: on a net-armed wait with no stable DOM selector, an observed" & vbCrLf
+        stm.writeText "     With net+content armed, the HITs provide cleaner action-scoped evidence than ungated inference," & vbCrLf
+        stm.writeText "     but they still do NOT prove that a specific network response caused a specific render." & vbCrLf
+        stm.writeText "     Fallback: on a net-armed wait with no stable DOM selector, an observed" & vbCrLf
         stm.writeText "     NET-TO-CONTENT delay near/above minStableMs can justify a more conservative per-action" & vbCrLf
         stm.writeText "     minStableMs, but include poll uncertainty rather than treating observedMs as exact." & vbCrLf
         stm.writeText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
         stm.writeText "     PREVIOUS action's late paint. Prefer a value-identifying selector for the expected content." & vbCrLf
         stm.writeText vbCrLf
         stm.writeText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
-        stm.writeText "idle (skip|track), [SPA-ACT] (sampled/coalesced DOM mutation evidence), [SUPPRESSED] (filtered-noise tally; each key carries idle=skip|track)." & vbCrLf
+        stm.writeText "idle (skip|track), [SPA-ACT] (sampled/coalesced DOM mutation evidence), [SUPPRESSED] (filtered-noise tally aggregated by normalized host+path plus query presence; each key carries idle=skip|track)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
             stm.writeText "If BODY STORE is present, correlate RESPONSE to [RES] and REQUEST to [REQ] by the same ShortId + key. Treat [BODY-SKIP]/[BODY-MISS] as capture outcomes, not evidence that the HTTP body was empty. With default patterns, child-frame/cross-site/unknown-scope JSON is intentionally skipped; explicit body patterns are an opt-in allow-list override." & vbCrLf
             stm.writeText "A BODY with normalized=True is a canonical AI-oriented representation, not byte-for-byte raw. Small framed bodies below losslessSourceMaxChars are normalized without lossy sampling (compacted=False). compacted=True means some detail may be summarized/sampled; <LONG_STRING len=N>, __ai_omitted_items, and __ai_omitted_members explicitly mark that loss. __ai_envelope__=json-frames marks normalized XSSI/length-framed JSON, and __ai_embedded_json__ marks a JSON string expanded structurally; do not infer omitted values." & vbCrLf
@@ -9923,6 +10273,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     ResetDiscoveryBodyRunState
+    ResetRecorderResponseGapRunState
 End Sub
 
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
@@ -10309,6 +10660,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                     If params("request").Exists("request") Then resId = CStr(params("request")("request"))
                 End If
             End If
+            TrackRecorderRequestHopTerminal params, resId
 
             If m_excludeResources Then
                 If IsNoiseUrl(resUrl) Or IsNoiseMime(mime) Then
@@ -10348,6 +10700,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             Dim reqUrl As String: reqUrl = CStr(reqObj("url"))
             Dim reqId As String: reqId = ""
             If reqObj.Exists("request") Then reqId = CStr(reqObj("request"))
+            TrackRecorderRequestHopStart params, reqId
 
             ' Cache correlation before output suppression. fetchError may omit/replace URL even when
             ' beforeRequestSent already supplied it, and suppressed resources still need ERR pairing.
@@ -10377,6 +10730,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
 
             Dim ferId As String: ferId = ""
             If ferReq.Exists("request") Then ferId = CStr(ferReq("request"))
+            TrackRecorderRequestHopTerminal params, ferId
 
             Dim ferUrl As String
             If ferReq.Exists("url") Then ferUrl = CStr(ferReq("url"))
@@ -10429,7 +10783,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
         Case "browsingContext.load", "browsingContext.domContentLoaded"
             If Not params.Exists("url") Then Exit Sub
             ' Normalize navigation URLs so opaque authentication payloads cannot bloat the log.
-            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeEndpointKey(CStr(params("url")))
+            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(CStr(params("url")))
 
             ' A document load clears all carryover state; same-document SPA transitions do not.
             m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
@@ -10627,6 +10981,82 @@ Private Function RedactPathAssignmentValues(ByVal pathText As String) As String
     RedactPathAssignmentValues = result
 End Function
 
+Private Function StripUrlFragment(ByVal url As String) As String
+    Dim h As Long
+    h = InStr(url, "#")
+    If h > 0 Then
+        StripUrlFragment = Left$(url, h - 1)
+    Else
+        StripUrlFragment = url
+    End If
+End Function
+
+Private Function NormalizeQueryShape(ByVal queryPart As String) As String
+    If Len(queryPart) = 0 Then Exit Function
+
+    Dim parts() As String
+    parts = Split(queryPart, "&")
+
+    Dim result As String
+    Dim i As Long
+    For i = LBound(parts) To UBound(parts)
+        Dim token As String
+        token = parts(i)
+        If Len(token) = 0 Then GoTo NextPart
+
+        Dim eqPos As Long
+        eqPos = InStr(token, "=")
+
+        Dim paramName As String
+        Dim paramValue As String
+        If eqPos > 0 Then
+            paramName = Left$(token, eqPos - 1)
+            paramValue = Mid$(token, eqPos + 1)
+        Else
+            paramName = token
+            paramValue = vbNullString
+        End If
+
+        If Len(paramName) = 0 Then GoTo NextPart
+        If Len(result) > 0 Then result = result & "&"
+
+        ' Preserve parameter names while removing values. rpcids is intentionally retained
+        ' because its value identifies the RPC family and is useful for AI/network diagnostics.
+        If LCase$(paramName) = "rpcids" Then
+            result = result & paramName & "=" & paramValue
+        Else
+            result = result & paramName & "="
+        End If
+NextPart:
+    Next i
+
+    NormalizeQueryShape = result
+End Function
+
+Private Function BodyCaptureIdentityUrl(ByVal url As String) As String
+    ' Internal BODY de-duplication identity. Query values remain available here so distinct
+    ' request URLs can be captured separately, but fragments are excluded because they are not
+    ' part of the HTTP request. This value is never written to the Discovery Log.
+    BodyCaptureIdentityUrl = StripUrlFragment(url)
+End Function
+
+Private Function NormalizeNavigationDetail(ByVal url As String) As String
+    ' Network endpoint keys intentionally drop fragments. Navigation lines preserve them because
+    ' client-side fragments can describe meaningful document/application state.
+    Dim h As Long
+    h = InStr(url, "#")
+    If h <= 0 Then
+        NormalizeNavigationDetail = NormalizeEndpointKey(url)
+        Exit Function
+    End If
+
+    Dim baseUrl As String
+    Dim fragment As String
+    baseUrl = Left$(url, h - 1)
+    fragment = Mid$(url, h)
+    NormalizeNavigationDetail = NormalizeEndpointKey(baseUrl) & fragment
+End Function
+
 Private Function NormalizeEndpointKey(ByVal url As String) As String
     On Error GoTo Fallback
     Dim s As String: s = url
@@ -10637,6 +11067,10 @@ Private Function NormalizeEndpointKey(ByVal url As String) As String
         If cm > 0 Then NormalizeEndpointKey = Left$(s, cm) Else NormalizeEndpointKey = Left$(s, 40)
         Exit Function
     End If
+
+    ' URL fragments are client-side state and are never part of an HTTP request endpoint.
+    s = StripUrlFragment(s)
+
     Dim p As Long: p = InStr(s, "://")
     If p > 0 Then s = Mid$(s, p + 3)
     Dim q As Long: q = InStr(s, "?")
@@ -10649,34 +11083,22 @@ Private Function NormalizeEndpointKey(ByVal url As String) As String
         queryPart = ""
     End If
     pathPart = RedactPathAssignmentValues(pathPart)
+
     Dim keyStr As String: keyStr = pathPart
-    Dim rp As String: rp = ExtractQueryToken(queryPart, "rpcids")
-    If Len(rp) > 0 Then
-        keyStr = keyStr & "?rpcids=" & rp
-    ElseIf q > 0 Then
-        ' Preserve query presence without retaining volatile values. This lets AI safely
-        ' distinguish e.g. /log? from /login when deriving literal ignore patterns.
-        keyStr = keyStr & "?"
+    If q > 0 Then
+        Dim queryShape As String
+        queryShape = NormalizeQueryShape(queryPart)
+        keyStr = keyStr & "?" & queryShape
     End If
+
     Const MAX_KEY_LEN As Long = 160
     If Len(keyStr) > MAX_KEY_LEN Then keyStr = Left$(keyStr, MAX_KEY_LEN) & "..."
     NormalizeEndpointKey = keyStr
     Exit Function
 Fallback:
-    NormalizeEndpointKey = url
+    NormalizeEndpointKey = StripUrlFragment(url)
 End Function
 
-Private Function ExtractQueryToken(ByVal query As String, ByVal name As String) As String
-    If Len(query) = 0 Then Exit Function
-    Dim parts() As String: parts = Split(query, "&")
-    Dim i As Long, pfx As String: pfx = LCase(name) & "="
-    For i = LBound(parts) To UBound(parts)
-        If LCase(Left$(parts(i), Len(pfx))) = pfx Then
-            ExtractQueryToken = Mid$(parts(i), Len(pfx) + 1)
-            Exit Function
-        End If
-    Next i
-End Function
 
 Private Function IsIdleIgnored(ByVal url As String) As Boolean
     Dim lUrl As String: lUrl = LCase(url)
@@ -10701,10 +11123,21 @@ Private Function ShortId(ByVal idStr As String) As String
     If Len(idStr) > 18 Then ShortId = Right$(idStr, 18) Else ShortId = idStr
 End Function
 
+Private Function NormalizeSuppressedKey(ByVal keyStr As String) As String
+    ' SUPPRESSED is a frequency summary for filtered noise, not a full endpoint-shape log.
+    ' Keep normalized host+path plus query presence, but omit query parameter names/values so
+    ' ordering, repetition, or optional query fields do not split one noisy endpoint into many keys.
+    Dim q As Long
+    q = InStr(keyStr, "?")
+    If q > 0 Then keyStr = Left$(keyStr, q)
+    NormalizeSuppressedKey = keyStr
+End Function
+
 Private Sub BumpSuppressed(ByVal keyStr As String, Optional ByVal idleState As String = "")
     On Error Resume Next
     If m_recSuppByKey Is Nothing Then Exit Sub
 
+    keyStr = NormalizeSuppressedKey(keyStr)
     If Len(idleState) > 0 Then keyStr = keyStr & " | idle=" & idleState
 
     If m_recSuppByKey.Exists(keyStr) Then
@@ -11105,7 +11538,8 @@ Public Sub ArmContentSignal(ByVal signalXPath As String, _
             If m_sigDomArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=dom | overwrite=true (previous dom arm replaced)"
             m_sigDomArmed = True: m_sigDomSeen = False: m_sigDomXPath = signalXPath
             m_sigLostWarned = False
-            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | xpath=" & signalXPath & " | ctx=" & targetCtx
+            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | xpath=" & signalXPath & _
+                          " | attributes=" & LCase$(CStr(includeAttributes)) & " | ctx=" & targetCtx
         Case -1
             LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=not-found | xpath=" & signalXPath
             Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
@@ -11152,7 +11586,8 @@ Public Sub ArmShadowContentSignal(ByVal selectorPath As Variant, _
             m_sigDomSeen = False
             m_sigDomXPath = "ShadowPath=" & selectorJson
             m_sigLostWarned = False
-            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | shadowPath=" & selectorJson & " | ctx=" & targetCtx
+            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | shadowPath=" & selectorJson & _
+                          " | attributes=" & LCase$(CStr(includeAttributes)) & " | ctx=" & targetCtx
         Case -1
             LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=not-found | shadowPath=" & selectorJson
             Err.Raise ERR_ACTION_FAILED, "BiDi:ArmShadowContentSignal", _
@@ -11715,6 +12150,10 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
 
     ' Do not let a large navigation burst monopolize the caller before SPA consensus begins.
     DrainNonBlockingRecorderQueue
+
+    ' A recorder-owned responseCompleted pause is normally restored before SPA settlement. If a
+    ' prior restore failed, retry here (bounded). Never retry between Arm*Signal and the action.
+    RetryRecorderResponseGapAtSpaWaitEntry
 
     Dim waitCtx As New Dictionary
     waitCtx.Add "contextId", targetCtx
