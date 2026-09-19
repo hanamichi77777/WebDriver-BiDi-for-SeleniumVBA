@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "4.9"
+Private Const BIDI_WRAPPER_VERSION As String = "5.0"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -3823,7 +3823,8 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
                                        ByVal contextId As String, _
                                        ByVal useKeyEvents As Boolean, _
                                        ByVal useNativeKeys As Boolean, _
-                                       ByVal callerName As String) As String
+                                       ByVal callerName As String, _
+                                       Optional ByVal selectAllFirst As Boolean = False) As String
     ResetLastSyncState
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim sharedId As String
@@ -3833,7 +3834,7 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
     Dim args As Collection: Set args = NewElementArgs(sharedId, valueToSet)
     If useNativeKeys Then
         Dim nativeKeyActions As Collection
-        Set nativeKeyActions = BuildNativeKeyActions(valueToSet, callerName)
+        Set nativeKeyActions = BuildNativeKeyActions(valueToSet, callerName, selectAllFirst)
 
         Dim focusArgs As Collection: Set focusArgs = NewElementArgs(sharedId)
         Call ExecuteBaseAction(targetCtx, "click", focusArgs, False, minStableMs, _
@@ -3892,11 +3893,12 @@ Public Function ExecuteInputValueByXPath(ByVal xpath As String, _
                                          Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                          Optional ByVal contextId As String = "", _
                                          Optional ByVal useKeyEvents As Boolean = True, _
-                                         Optional ByVal useNativeKeys As Boolean = False) As String
+                                         Optional ByVal useNativeKeys As Boolean = False, _
+                                         Optional ByVal selectAllFirst As Boolean = False) As String
     ExecuteInputValueByXPath = ExecuteInputValueCore( _
         ElementLocatorXPath, xpath, valueToSet, searchTimeoutMs, waitNetworkIdle, _
         minStableMs, maxTimeoutMs, contextId, useKeyEvents, useNativeKeys, _
-        "ExecuteInputValueByXPath")
+        "ExecuteInputValueByXPath", selectAllFirst)
 End Function
 
 Public Function ExecuteSetFilesByXPath(ByVal xpath As String, _
@@ -4670,9 +4672,14 @@ Private Function PerformSetFiles(ByVal contextId As String, _
 End Function
 
 Private Function BuildNativeKeyActions(ByVal text As String, _
-                                       ByVal callerName As String) As Collection
+                                       ByVal callerName As String, _
+                                       Optional ByVal selectAllFirst As Boolean = False) As Collection
 
     Dim keyActions As New Collection
+
+    If selectAllFirst Then
+        AppendModifierChord keyActions, ChrW(&HE009&), "a"
+    End If
     Dim i As Long
     Dim ch As String
     Dim codeUnit As Long
@@ -4764,6 +4771,28 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
     If waitNetworkIdle Then RunRequiredSpaSync contextId, minStableMs, maxTimeoutMs
     PerformNativeKeyInput = strRes
 End Function
+
+Private Sub AppendModifierChord(ByRef actions As Collection, ByVal modifierValue As String, ByVal keyValue As String)
+    Dim modifierDown As New Dictionary
+    modifierDown.Add "type", "keyDown"
+    modifierDown.Add "value", modifierValue
+    actions.Add modifierDown
+
+    Dim keyDown As New Dictionary
+    keyDown.Add "type", "keyDown"
+    keyDown.Add "value", keyValue
+    actions.Add keyDown
+
+    Dim keyUp As New Dictionary
+    keyUp.Add "type", "keyUp"
+    keyUp.Add "value", keyValue
+    actions.Add keyUp
+
+    Dim modifierUp As New Dictionary
+    modifierUp.Add "type", "keyUp"
+    modifierUp.Add "value", modifierValue
+    actions.Add modifierUp
+End Sub
 
 Private Sub AppendKeyStroke(ByRef actions As Collection, ByVal value As String)
     Dim dn As New Dictionary
