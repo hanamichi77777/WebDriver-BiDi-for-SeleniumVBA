@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.3"
+Private Const BIDI_WRAPPER_VERSION As String = "5.4"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -191,7 +191,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const SPA_PROBE_VERSION As Long = 41 ' Internal probe generation/quiet/filter/health-diagnostic contract
+Private Const SPA_PROBE_VERSION As Long = 42 ' Internal probe generation/quiet/filter/health-diagnostic contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
 Private m_idleFilterRevision As Long          ' increments whenever VBA-side ignore filters change
@@ -9709,16 +9709,6 @@ Private Function StopPerfElapsedTimerMs(ByVal startSec As Double) As Double
     StopPerfElapsedTimerMs = (endSec - startSec) * 1000#
 End Function
 
-Private Sub WriteDiscoveryStopPerfSidecar(ByVal logFilePath As String, ByVal perfLine As String)
-    On Error Resume Next
-    Dim ff As Integer
-    ff = FreeFile
-    Open logFilePath & ".perf.txt" For Output As #ff
-    Print #ff, perfLine
-    Close #ff
-    On Error GoTo 0
-End Sub
-
 Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discovery_log.txt")
     Dim perfStopStartMs As Double
     Dim perfPhaseStartMs As Double
@@ -9885,7 +9875,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | [SPA-ACT]=sampled/coalesced DOM mutation burst (NOT an exhaustive event stream; absence does not prove no mutation)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has achieved quiet + observed confirmation-window duration; neither is a safety-margin score)  [SUPPRESSED]=filtered-noise tally aggregated by normalized host+path; query presence '?' is retained but query parameter names/values are omitted; idle=skip|track" & vbCrLf
         stm.writeText "LEGEND | [SPA-PROBE-INITIALIZING]/[SPA-PROBE-READY]=normal first-use/new-document lazy initialization. [SPA-PROBE-UNHEALTHY]/[SPA-PROBE-RECOVERED]=a probe already verified healthy in the same document was later missing/unhealthy and recovered. Unverified samples contribute NO stability evidence; READY/RECOVERED restart the full confirmation window. WAIT-END reports probeHealthy, probeInitializations, probeRecoveries, and detectedUnhealthyMs." & vbCrLf
         stm.writeText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
-        stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate and resets the consensus stability window. dom/vis quietAtHit is measured on the poll that detects the hit (~100ms). net HITs are event-triggered between polls, so quietAtHit=unknown; lastPolledQuietMs/sampleAgeMs are diagnostic samples only and MUST NOT be treated as quiet at the network event. [SPA-NET-TO-CONTENT] is the first content render OBSERVED after an armed net HIT; observedMs includes poll-detection delay and does not assert ownership. Gated waits carry signal=<armed types> on BEGIN and hit|miss on END." & vbCrLf
+        stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate and resets the consensus stability window. dom/vis quietAtHit is measured on the poll that detects the hit (~100ms). net HITs are event-triggered between polls, so quietAtHit=unknown; lastPolledQuietMs/sampleAgeMs are diagnostic samples only and MUST NOT be treated as quiet at the network event. [SPA-NET-TO-CONTENT] is the first content mutation whose browser timestamp is safely after an armed net HIT and is later OBSERVED by a poll; mutationAfterHitMs is the cross-clock estimated event delay, timingUncertaintyMs is the mapping uncertainty, observedMs is only HIT-to-poll observation delay, and owner is not asserted. Gated waits carry signal=<armed types> on BEGIN and hit|miss on END." & vbCrLf
         stm.writeText "LEGEND | If a net HIT occurs before SPA-WAIT-BEGIN, the net gate is already open when the wait starts. The wait's stability window starts at SPA-WAIT-BEGIN (after the HIT), so no separate HIT reset is needed. SPA-NET-TO-CONTENT is NOT measured for such a HIT. Completion then relies on the idle/DOM-quiet/probe state observed during the wait; the net gate itself does NOT link that HIT to any specific render." & vbCrLf
         stm.writeText "LEGEND | For dom signals, count= is the cumulative number of MutationRecords observed by the armed MutationObserver from ARM until the polling cycle that first detects the HIT. The observer watches the subtree of the single target node resolved at ARM (the FIRST node matched by xpath=, or the node resolved by shadowPath=). Attribute mutations are included only when the ARM line shows attributes=true. count= is NOT the number of matched elements, rendered rows, page-wide mutations, or mutations attributable only to the subsequent action." & vbCrLf
         stm.writeText "LEGEND | stableWindowMs is elapsed time since the most recent of: wait start, a poll that observed the combined idle/quiet condition as false, or an explicit reset (dom/vis HIT; net HIT at the first poll that observes it, not its event timestamp; probe READY/RECOVERED; navigation reset; probe missing/unhealthy detection). It is NOT an exact post-threshold dwell time or a safety margin; the true condition may have become satisfied between polls." & vbCrLf
@@ -9947,9 +9937,10 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "     pattern or the action instead. For vis HITs, quietAtHit is measured at poll time. For" & vbCrLf
         stm.writeText "     net HITs, quietAtHit=unknown by design: lastPolledQuietMs/sampleAgeMs are stale-sample" & vbCrLf
         stm.writeText "     diagnostics only and MUST NOT be used to infer a settle-to-render gap. If a" & vbCrLf
-        stm.writeText "     [SPA-NET-TO-CONTENT] line exists, observedMs is the delay from net event dispatch to" & vbCrLf
-        stm.writeText "     the first content render OBSERVED by a later poll. The true DOM change may have occurred" & vbCrLf
-        stm.writeText "     up to roughly one poll earlier, so observedMs near/above minStableMs is a warning/uncertain" & vbCrLf
+        stm.writeText "     [SPA-NET-TO-CONTENT] line exists, mutationAfterHitMs is the estimated delay to the first" & vbCrLf
+        stm.writeText "     content mutation known to postdate the net HIT; interpret it with timingUncertaintyMs." & vbCrLf
+        stm.writeText "     observedMs is only the later poll-observation delay and may be much larger when polling or" & vbCrLf
+        stm.writeText "     recorder-queue work is delayed. mutationAfterHitMs near/above minStableMs is a warning/uncertain" & vbCrLf
         stm.writeText "     zone, not proof of early completion. Prefer a stable content/visibility gate or a larger" & vbCrLf
         stm.writeText "     per-action minStableMs when capture correctness matters. For dom HITs, quietAtHit is" & vbCrLf
         stm.writeText "     structurally near zero because the hit itself is a mutation." & vbCrLf
@@ -9962,8 +9953,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "       the previous action's delayed paint. It is a heads-up, not an attribution." & vbCrLf
         stm.writeText "   - Deliberately NOT provided: an exact OWNER-ATTRIBUTED settle-to-render gap, a pairing" & vbCrLf
         stm.writeText "     proving which json produced which render, or an AMBIGUOUS/CONFIRMED verdict." & vbCrLf
-        stm.writeText "     [SPA-NET-TO-CONTENT] may provide an observed first-render delay for an explicitly armed" & vbCrLf
-        stm.writeText "     net signal, but owner=not-asserted and poll detection still apply." & vbCrLf
+        stm.writeText "     [SPA-NET-TO-CONTENT] may provide a timestamped first-render delay for an explicitly armed" & vbCrLf
+        stm.writeText "     net signal, but timingUncertaintyMs applies and owner=not-asserted remains important." & vbCrLf
         stm.writeText "   - The check is adjacent-wait only: a hint lives for exactly ONE following wait, so a SUSPECT" & vbCrLf
         stm.writeText "     with no NOTE in the very next wait is not chased further. Absence of a NOTE is not 'safe'." & vbCrLf
         stm.writeText "   - Absence of [SPA-CONSENSUS-SUSPECT] does NOT prove render safety, especially when the relevant" & vbCrLf
@@ -9981,7 +9972,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "     With net+content armed, the HITs provide cleaner action-scoped evidence than ungated inference," & vbCrLf
         stm.writeText "     but they still do NOT prove that a specific network response caused a specific render." & vbCrLf
         stm.writeText "     Fallback: on a net-armed wait with no stable DOM selector, an observed" & vbCrLf
-        stm.writeText "     NET-TO-CONTENT delay near/above minStableMs can justify a more conservative per-action" & vbCrLf
+        stm.writeText "     NET-TO-CONTENT mutationAfterHitMs near/above minStableMs can justify a more conservative per-action" & vbCrLf
         stm.writeText "     minStableMs, but include poll uncertainty rather than treating observedMs as exact." & vbCrLf
         stm.writeText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
         stm.writeText "     PREVIOUS action's late paint. Prefer a value-identifying selector for the expected content." & vbCrLf
@@ -10074,7 +10065,6 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
 
         Debug.Print "BiDi Recorder: Log saved to " & filePath
         Debug.Print perfLine
-        WriteDiscoveryStopPerfSidecar filePath, perfLine
     End If
 End Sub
 
@@ -11194,7 +11184,9 @@ End Sub
 ' consensus. This preserves [SPA-ACT] / render diagnostics without treating unhealthy metrics
 ' as stability evidence.
 Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
-                                                  ByRef ctx As Dictionary)
+                                                  ByRef ctx As Dictionary, _
+                                                  ByVal probeSampleVbaMs As Double, _
+                                                  ByVal probeSampleUncertaintyMs As Double)
     On Error GoTo Done
     If probe Is Nothing Then Exit Sub
     If Not probe.Exists("version") Then Exit Sub
@@ -11225,14 +11217,51 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
 
     ' A render observed during an unhealthy sample is diagnostic evidence only. It may clear
     ' the unresolved-json advisory state, but no timing/idle metric from this sample is used.
+    Dim changeTimes As Dictionary
+    If probe.Exists("changeTimes") Then
+        If IsObject(probe("changeTimes")) Then Set changeTimes = probe("changeTimes")
+    End If
+
+    Dim netTimingEligible As Boolean
+    netTimingEligible = m_sigNetArmed And m_sigNetSeen And Not m_sigNetContentObserved And m_sigNetHitMs > 0
+    If Not ctx Is Nothing Then
+        If ctx.Exists("sigNetHitWasPreWait") Then
+            If CBool(ctx("sigNetHitWasPreWait")) Then netTimingEligible = False
+        End If
+    End If
+
+    ' Map the VBA network-hit timestamp into the page's performance.now() clock using the
+    ' current probe query midpoint. The half-roundtrip is treated as uncertainty; only changes
+    ' definitely newer than the hit are eligible for NET-TO-CONTENT.
+    Dim netHitJsMs As Double
+    Dim haveNetHitJsMs As Boolean
+    If netTimingEligible And probe.Exists("now") Then
+        netHitJsMs = CDbl(probe("now")) - (probeSampleVbaMs - m_sigNetHitMs)
+        If netHitJsMs >= 0 And netHitJsMs <= CDbl(probe("now")) Then haveNetHitJsMs = True
+    End If
+
     Dim ce As Variant
     Dim renderXPath As String
+    Dim netRenderXPath As String
+    Dim netRenderAfterHitMs As Double
     renderXPath = vbNullString
+    netRenderXPath = vbNullString
+
     For Each ce In changes
         If Left$(CStr(ce), 4) = "DOM:" Then
             If IsContentRenderPath(Mid$(CStr(ce), 5)) Then
-                renderXPath = CStr(ce)
-                Exit For
+                If Len(renderXPath) = 0 Then renderXPath = CStr(ce)
+
+                If haveNetHitJsMs And Len(netRenderXPath) = 0 And Not changeTimes Is Nothing Then
+                    If changeTimes.Exists(CStr(ce)) Then
+                        Dim changeJsMs As Double
+                        changeJsMs = CDbl(changeTimes(CStr(ce)))
+                        If changeJsMs > (netHitJsMs + probeSampleUncertaintyMs) Then
+                            netRenderXPath = CStr(ce)
+                            netRenderAfterHitMs = changeJsMs - netHitJsMs
+                        End If
+                    End If
+                End If
             End If
         End If
     Next ce
@@ -11240,11 +11269,10 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
     If Len(renderXPath) > 0 Then
         m_unresolvedJsonThisWait = False
 
-        ' Advisory only: for an armed network signal, record the first content render observed
-        ' after the network hit. The render is detected on a SPA-probe poll, so observedMs may
-        ' overstate the true network-to-DOM gap by up to roughly one poll interval. No ownership
-        ' between the response and render is asserted.
-        If m_sigNetArmed And m_sigNetSeen And Not m_sigNetContentObserved And m_sigNetHitMs > 0 Then
+        ' Advisory only: emit NET-TO-CONTENT only for a content mutation that is known to have
+        ' occurred after a network hit that itself occurred after WAIT-BEGIN. This prevents stale
+        ' changeList entries (and pre-wait hits) from being presented as post-hit render evidence.
+        If Len(netRenderXPath) > 0 Then
             Dim netToContentMs As Double
             netToContentMs = socket_.nowMs() - m_sigNetHitMs
             If netToContentMs < 0 Then netToContentMs = 0
@@ -11255,8 +11283,10 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
             End If
 
             LogSignalLine "[SPA-NET-TO-CONTENT] key=" & m_sigNetHitKey & _
+                          " | mutationAfterHitMs=" & Format(netRenderAfterHitMs, "0") & _
+                          " | timingUncertaintyMs=" & Format(probeSampleUncertaintyMs, "0") & _
                           " | observedMs=" & Format(netToContentMs, "0") & _
-                          " | render=" & renderXPath & _
+                          " | render=" & netRenderXPath & _
                           " | detection=poll" & _
                           " | owner=not-asserted" & _
                           IIf(netToContentMinStableMs > 0, " | minStableMs=" & CStr(netToContentMinStableMs), "")
@@ -11574,6 +11604,15 @@ End Sub
 Private Function IsContentRenderPath(ByVal domPath As String) As Boolean
     Dim p As String: p = Trim$(domPath)
     If Len(p) = 0 Then IsContentRenderPath = False: Exit Function
+
+    ' Head metadata is not visible page content. In particular, a title mutation must not clear
+    ' SUSPECT state or satisfy NET-TO-CONTENT merely because /html/head/title has depth >= 3.
+    Dim pLower As String: pLower = LCase$(p)
+    If InStr(pLower, "/head[") > 0 Or InStr(pLower, "/title[") > 0 Then
+        IsContentRenderPath = False
+        Exit Function
+    End If
+
     If InStr(p, "[@id=") > 0 Then IsContentRenderPath = True: Exit Function
     Dim segs() As String, i As Long, depth As Long
     segs = Split(p, "/")
@@ -11978,6 +12017,9 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     ' Network hits latch asynchronously. Reset stableStart once on the first poll that sees
     ' the hit; pre-wait hits need no extra reset because stableStart is already fresh.
     waitCtx.Add "sigNetAcked", m_sigNetSeen
+    ' A network hit that predates WAIT-BEGIN opens the gate, but it is deliberately excluded
+    ' from NET-TO-CONTENT timing diagnostics. The fresh stableStart above still governs consensus.
+    waitCtx.Add "sigNetHitWasPreWait", (m_sigNetArmed And m_sigNetSeen)
 
     ' A carryover reservation becomes a one-wait arm at BEGIN and is cleared immediately;
     ' this wait's unresolved state is reset independently.
@@ -12935,8 +12977,8 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "apper)}};"
             js = js & "if(p){p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';var h0=probeHealth();if(h0.versionOk&&h0.fetchWrapped&&h0.xhrWrapped&&h0.observerActive&&h0.shadowObserverReady&&h0.inputWrapped){window.__vbaSpaProbeInstalled=true;return true}}"
             js = js & "var legacy=!!(window.__vbaSpaProbeInstalled&&p&&(p.version===undefined||p.version===null));"
-            js = js & "p=p||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],inflightUrlCounts:new Map()};window.__vbaIdleProbe=p;window.__vbaSpaProbeInstalled=true;p.version=V;p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';"
-            js = js & "if(typeof p.inflightFetchCount!=='number')p.inflightFetchCount=0;if(typeof p.inflightXhrCount!=='number')p.inflightXhrCount=0;if(typeof p.lastMutationTs!=='number')p.lastMutationTs=performance.now();if(!Array.isArray(p.changeList))p.changeList=[];"
+            js = js & "p=p||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],changeTimes:{},inflightUrlCounts:new Map()};window.__vbaIdleProbe=p;window.__vbaSpaProbeInstalled=true;p.version=V;p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';"
+            js = js & "if(typeof p.inflightFetchCount!=='number')p.inflightFetchCount=0;if(typeof p.inflightXhrCount!=='number')p.inflightXhrCount=0;if(typeof p.lastMutationTs!=='number')p.lastMutationTs=performance.now();if(!Array.isArray(p.changeList))p.changeList=[];if(!p.changeTimes||typeof p.changeTimes!=='object'||Array.isArray(p.changeTimes))p.changeTimes={};"
             js = js & "if(!(p.inflightUrlCounts instanceof Map)){p.inflightUrlCounts=new Map();if(p.inflightUrls&&p.inflightUrls.forEach)p.inflightUrls.forEach((u)=>p.inflightUrlCounts.set(u,1))}"
             js = js & "p.invalidSelectors=new Set();"
             js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath='';p.visKind='';p.visPath=null}"
@@ -12948,7 +12990,7 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visKind='xpath';p.visXPath=x;p.visPath=null;p.visArmed=true;p.visSeen=false;return 0};"
             js = js & "p.armShadowVisSignal=function(a){var n=null;try{n=p.shadowResolve(a)}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visKind='shadow';p.visXPath='';p.visPath=a.slice();p.visArmed=true;p.visSeen=false;return 0};"
             js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath='';p.visKind='';p.visPath=null};"
-            js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{if(e){uT();if(p.changeList.indexOf(e)===-1&&p.changeList.length<50)p.changeList.push(e)}};p.touch=uT;p.logChange=lg;"
+            js = js & "var uT=()=>{p.lastMutationTs=performance.now()},lg=(e)=>{if(e){var ts=performance.now(),ix=p.changeList.indexOf(e);p.lastMutationTs=ts;if(ix!==-1){p.changeTimes[e]=ts}else if(p.changeList.length<50){p.changeList.push(e);p.changeTimes[e]=ts}}};p.touch=uT;p.logChange=lg;"
             js = js & "var iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;if(!t)return 0;for(var i=0;i<s.length;i++){var x=s[i],k=String(x);if(p.invalidSelectors.has(k))continue;var q=t;while(q){try{if(q.closest&&q.closest(x)!==null)return 1}catch(e){p.invalidSelectors.add(k);break}var r=null;try{r=q.getRootNode?q.getRootNode():null}catch(e){}q=(r&&r.host)?r.host:null}}return 0};"
             js = js & "try{var d=getInputDesc();if(legacy&&!p.inputSetterWrapper&&d&&typeof d.set==='function'){p.inputSetterWrapper=d.set;p.inputGetterWrapper=d.get||null}else if(!(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&!p.inputOriginalSet)){var bS=(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&p.inputOriginalSet)?p.inputOriginalSet:(d&&d.set),bG=(p.inputGetterWrapper&&d&&d.get===p.inputGetterWrapper&&p.inputOrigi"
             js = js & "nalGet)?p.inputOriginalGet:(d&&d.get);if(bS&&bG){var sW=function(v){if(!iN(this,p.selectors||[]))lg('PROP:'+gX(this)+'[value]');return bS.call(this,v)},gW=function(){return bG.call(this)};Object.defineProperty(HTMLInputElement.prototype,'value',{set:sW,get:gW,configurable:true});p.inputOriginalSet=bS;p.inputOriginalGet=bG;p.inputSetterWrapper=sW;p.inputGetterWrapper=gW}}}catch(e){p.lastHealthError='input:'+String(e&&e.message||e)}"
@@ -12978,7 +13020,7 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "var h={versionOk:p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p.baseObserver,shadowObserverReady:typeof p.observeShadowRoot==='function'&&Array.isArray(p.shadowObservers),inputWrapped:!!d&&(!!p.inputSetterWrapper&&d.set===p.inputSetterWrapper)};"
             js = js & "var healthy=h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.shadowObserverReady&&h.inputWrapped;"
             js = js & "if(p.visArmed&&!p.visSeen){try{var vn=null;if(p.visKind==='shadow'&&p.visPath)vn=p.shadowResolve(p.visPath);else if(p.visXPath)vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
-            js = js & "var res={active:healthy,version:p.version||0,health:h,lastHealthError:String(p.lastHealthError||''),now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,inflightUrls:Array.from((p.inflightUrlCounts||new Map()).keys()),invalidSelectors:Array.from(p.invalidSelectors||[]),sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};p.changeList=[];return JSON.stringify(res);"
+            js = js & "var res={active:healthy,version:p.version||0,health:h,lastHealthError:String(p.lastHealthError||''),now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,changeTimes:p.changeTimes,inflightUrls:Array.from((p.inflightUrlCounts||new Map()).keys()),invalidSelectors:Array.from(p.invalidSelectors||[]),sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};p.changeList=[];p.changeTimes={};return JSON.stringify(res);"
     End Select
     GetProbeJs = js
 End Function
@@ -13360,12 +13402,18 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
             EvaluateWaitCondition = (InStr(GetCurrentUrl(targetCtx, True), CStr(ctx("partialUrl"))) > 0)
 
         Case WaitMode_SpaIdle
+            Dim probeQueryStartMs As Double: probeQueryStartMs = socket_.nowMs()
             Dim probe As Dictionary: Set probe = QuerySpaProbe(targetCtx)
+            Dim probeQueryEndMs As Double: probeQueryEndMs = socket_.nowMs()
+            Dim probeSampleVbaMs As Double: probeSampleVbaMs = (probeQueryStartMs + probeQueryEndMs) / 2#
+            Dim probeSampleUncertaintyMs As Double: probeSampleUncertaintyMs = (probeQueryEndMs - probeQueryStartMs) / 2#
+            If probeSampleUncertaintyMs < 0 Then probeSampleUncertaintyMs = 0
 
             ' QuerySpaProbe drains changeList even when health is false. Preserve current-version
             ' activity/render diagnostics before readiness decides whether this sample may affect
-            ' consensus.
-            ProcessSpaProbeChangesForDiagnostics probe, ctx
+            ' consensus. The query midpoint maps browser performance.now() to the VBA monotonic clock
+            ' closely enough to reject DOM entries that definitely predate an armed network hit.
+            ProcessSpaProbeChangesForDiagnostics probe, ctx, probeSampleVbaMs, probeSampleUncertaintyMs
 
             Dim isProbeActive As Boolean: isProbeActive = IsSpaProbeReady(probe)
 

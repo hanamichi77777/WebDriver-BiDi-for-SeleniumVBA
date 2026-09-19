@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "5.3"
+Private Const BIDI_SOCKET_VERSION As String = "5.4"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -655,15 +655,16 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
         Exit Function
     End If
 
+    ' A direct Connect attempt starts a fresh diagnostic session without creating a trace file.
+    ' Recovery reconnects keep the original transport failure and retry history in the same file.
+    ' The file is created lazily only when a critical diagnostic is actually written.
+    If Not m_isRecovering Then DeleteSocketTraceLogIfExists
+
     If LenB(wsUrl) = 0 Or localPort < 1 Or localPort > 65535 Then
         trace "[Security] Blocked: WebSocket URL is empty or localPort is outside 1..65535.", True
         SetState StateError
         Exit Function
     End If
-
-    ' A direct Connect starts a fresh diagnostic session. Recovery reconnects keep
-    ' the original transport failure and retry history in the same trace file.
-    If Not m_isRecovering Then ResetSocketTraceLog
 
     ' Reject anything except loopback ws:// before entering the RFC 6455 parser.
     m_RegExp.pattern = "^ws://(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:/|$)"
@@ -2540,7 +2541,8 @@ End Sub
 
 ' COMMUNICATOR_DEBUG_ENABLED controls outer-communicator Immediate output and
 ' keyword-based file detection. In production, file logging is driven only by
-' the caller's explicit isCritical classification.
+' the caller's explicit isCritical classification; the trace file is created lazily
+' on the first critical diagnostic and is absent for a clean direct-connect session.
 Public Sub trace(ByVal msg As String, Optional ByVal isCritical As Boolean = False)
     If Not COMMUNICATOR_DEBUG_ENABLED And Not isCritical Then Exit Sub
     
@@ -2637,19 +2639,17 @@ Private Function ResolveLogDirectory() As String
     ResolveLogDirectory = localDir
 End Function
 
-Private Sub ResetSocketTraceLog()
+Private Sub DeleteSocketTraceLogIfExists()
     Dim localDir As String
     Dim logPath As String
-    Dim fNum As Integer
 
     On Error Resume Next
     localDir = ResolveLogDirectory()
     logPath = localDir & "bidi_socket_trace.log"
-    fNum = FreeFile
 
-    Err.Clear
-    Open logPath For Output As #fNum
-    If Err.Number = 0 Then Close #fNum
+    ' Start a direct connection with no trace artifact. If a critical condition occurs later,
+    ' trace/WriteLogToFile will create the file lazily via Open ... For Append.
+    Kill logPath
     On Error GoTo 0
 End Sub
 
