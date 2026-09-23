@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.4"
+Private Const BIDI_WRAPPER_VERSION As String = "5.5"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -612,7 +612,9 @@ InitializationFailed:
     Dim initErrNum As Long: initErrNum = Err.Number
     Dim initErrDesc As String: initErrDesc = Err.description
     Dim initErrSrc As String: initErrSrc = Err.source
+    Resume InitializationCleanup
 
+InitializationCleanup:
     On Error Resume Next
 
     ' Initialization may already have created session-side state before a later mandatory step
@@ -2201,9 +2203,11 @@ Failed:
     Dim savedErrSrc As String: savedErrSrc = Err.source
     Dim savedErrDesc As String: savedErrDesc = Err.description
 
-    CaptureLastDownloadFailureDiagnostic savedErrNum, savedErrSrc, savedErrDesc, downloadCaptureInitialized
+    Resume DownloadFailureCleanup
 
+DownloadFailureCleanup:
     On Error Resume Next
+    CaptureLastDownloadFailureDiagnostic savedErrNum, savedErrSrc, savedErrDesc, downloadCaptureInitialized
     m_downloadArmed = False
     m_downloadBatchActive = False
     EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
@@ -2561,7 +2565,9 @@ Failed:
     Dim captureErrNum As Long: captureErrNum = Err.Number
     Dim captureErrSrc As String: captureErrSrc = Err.source
     Dim captureErrDesc As String: captureErrDesc = Err.description
+    Resume NewContextFailureCleanup
 
+NewContextFailureCleanup:
     On Error Resume Next
     ResetNewContextCaptureState
     EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
@@ -4162,6 +4168,9 @@ Failed:
     primaryErrDesc = Err.description
 
     Dim cleanupConfirmed As Boolean
+    Resume FileDialogFailureCleanup
+
+FileDialogFailureCleanup:
     On Error Resume Next
     ResetFileDialogCaptureState
     cleanupConfirmed = ReleaseTrackedFileChooserInterceptionBestEffort(True)
@@ -8733,7 +8742,8 @@ Private Function BuildAiNormalizedJsonObject(ByVal node As Object, _
                     Dim normEmbeddedDict As Object
                     Set normEmbeddedDict = BuildAiNormalizedJsonObject(dictEmbedded, currentDepth + 1)
 
-                    Dim embeddedDictMarker As New Dictionary
+                    Dim embeddedDictMarker As Dictionary
+                    Set embeddedDictMarker = New Dictionary
                     Dim embeddedDictValue As Variant
                     Set embeddedDictValue = normEmbeddedDict
                     Call AssignValue(embeddedDictMarker, "__ai_embedded_json__", embeddedDictValue)
@@ -8775,7 +8785,8 @@ Private Function BuildAiNormalizedJsonObject(ByVal node As Object, _
                     Dim normEmbeddedList As Object
                     Set normEmbeddedList = BuildAiNormalizedJsonObject(listEmbedded, currentDepth + 1)
 
-                    Dim embeddedListMarker As New Dictionary
+                    Dim embeddedListMarker As Dictionary
+                    Set embeddedListMarker = New Dictionary
                     Dim embeddedListValue As Variant
                     Set embeddedListValue = normEmbeddedList
                     Call AssignValue(embeddedListMarker, "__ai_embedded_json__", embeddedListValue)
@@ -9638,6 +9649,9 @@ StartFailed:
     Dim errSrc As String: errSrc = Err.source
     Dim errDesc As String: errDesc = Err.description
 
+    Resume DiscoveryStartFailureCleanup
+
+DiscoveryStartFailureCleanup:
     ' If staging created a remote collector but a later start step failed, remove it before
     ' surfacing the original recorder-start error. Cleanup failure is diagnostic only here.
     If Len(stagedBodyCollectorId) > 0 Then
@@ -12431,6 +12445,9 @@ InjectFailed:
     ' and misleads timeout tuning. Recording must not alter the wait control flow.
     injectErrNum = Err.Number
     injectErrDesc = Err.description
+    Resume ProbeInjectionFailureCleanup
+
+ProbeInjectionFailureCleanup:
     On Error Resume Next
     If m_debugMode Then
         Debug.Print "BiDi: [PROBE-INJECT-FAIL] ctx=" & Left$(targetCtx, 16) & _

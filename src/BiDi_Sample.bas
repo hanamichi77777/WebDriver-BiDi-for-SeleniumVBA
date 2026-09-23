@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 5.4 / MIT License / Copyright (c) hanamichi77777
+' Version 5.5 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -293,6 +293,8 @@ End Sub
 ' change; use a fresh Discovery Log. --lang=en supports the English ARIA labels.
 ' Blocking removes non-essential traffic; idle-ignore retains required telemetry.
 ' Arm* completion signals are one-shot.
+' Observed: with navigator.webdriver=true, Google Flights silently returns a degraded
+' list for both Best and Cheapest; AutomationControlled keeps it false.
 
 Public Sub Main08()
     Dim driver As WebDriver: Set driver = New WebDriver
@@ -302,6 +304,7 @@ Public Sub Main08()
         Dim caps As WebCapabilities: Set caps = .CreateCapabilities
         caps.AddArguments "--start-maximized"
         caps.AddArguments "--lang=en"
+        caps.AddArguments "--disable-blink-features=AutomationControlled"
         caps.EnableBiDiMode
         
         .OpenBrowser caps
