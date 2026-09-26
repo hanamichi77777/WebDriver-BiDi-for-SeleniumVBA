@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 5.7 / MIT License / Copyright (c) hanamichi77777
+' Version 5.8 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -128,8 +128,8 @@ Public Sub Main03()
     Dim url As String: url = "https://world.jorudan.co.jp/mln/en/"
     bidi.ExecuteNavigateAndGetStatus url
     bidi.StartDiscoveryLog
-    bidi.ExecuteInputValueByXPath "//input[@id='from_value']", "Tokyo"
-    bidi.ExecuteInputValueByXPath "//input[@id='to_value']", "Shinjuku"
+    bidi.ExecuteInputValueByXPath "//input[@id='from_value']", "Tokyo", useKeyEvents:=False
+    bidi.ExecuteInputValueByXPath "//input[@id='to_value']", "Shinjuku", useKeyEvents:=False
     bidi.ExecuteClickByXPath "//button[starts-with(@id, 'search_button_main')]"
     bidi.ExecuteClickByXPath "//button[@id='search_button_main']"
     Dim logPath As String
@@ -331,7 +331,7 @@ Public Sub Main08()
         depSuggestXPath = _
             "//*[@role='listbox' and not(@aria-hidden='true')]" & _
             "//li[@role='option' and contains(@aria-label, 'Sapporo')][1]"
-        bidi.ExecuteInputValueByXPath depXPath, "Sapporo"
+        bidi.ExecuteInputValueByXPath depXPath, "Sapporo", useKeyEvents:=False
         
         bidi.ArmNetworkSignal "rpcids=tDoGIe"
         bidi.ExecuteClickByXPath depSuggestXPath, minStableMs:=1000
@@ -344,7 +344,7 @@ Public Sub Main08()
         destSuggestXPath = _
             "//*[@role='listbox' and not(@aria-hidden='true')]" & _
             "//li[@role='option' and contains(@aria-label, 'Paris')][1]"
-        bidi.ExecuteInputValueByXPath destXPath, "Paris"
+        bidi.ExecuteInputValueByXPath destXPath, "Paris", useKeyEvents:=False
         
         bidi.ArmNetworkSignal "rpcids=BVAT3"
         bidi.ExecuteClickByXPath destSuggestXPath, minStableMs:=1000
@@ -364,7 +364,7 @@ Public Sub Main08()
 
 
         bidi.ArmNetworkSignal "GetShoppingResults"
-        bidi.ExecuteClickByXPath searchXPath, searchTimeoutMs:=30000
+        bidi.ExecuteClickByXPath searchXPath, maxTimeoutMs:=30000
         
         ' Saves discovery_log.txt in the same folder as the current VBA host file.
         bidi.StopAndSaveDiscoveryLog

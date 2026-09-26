@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.7"
+Private Const BIDI_WRAPPER_VERSION As String = "5.8"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -3971,6 +3971,79 @@ Failed:
     If m_debugMode Then Debug.Print "BiDi: navigate settle best-effort skip: " & errorDescription
 End Sub
 
+Private Function ExecuteBulkInputWithKeyFallback(ByVal targetCtx As String, _
+                                                   ByVal args As Collection, _
+                                                   ByVal waitNetworkIdle As Boolean, _
+                                                   ByVal minStableMs As Long, _
+                                                   ByVal maxTimeoutMs As Long, _
+                                                   ByVal locatorKind As ElementLocatorKind, _
+                                                   ByVal locator As Variant, _
+                                                   ByVal searchTimeoutMs As Long, _
+                                                   ByVal callerName As String) As String
+    On Error GoTo BulkFailed
+
+    ExecuteBulkInputWithKeyFallback = ExecuteBaseAction( _
+        targetCtx, "input", args, waitNetworkIdle, minStableMs, True, _
+        DEFAULT_STALE_RETRIES, maxTimeoutMs, False, locatorKind, locator, _
+        searchTimeoutMs, callerName)
+
+    If m_debugMode Then
+        Debug.Print "BiDi: Action 'input' completed after activeElement stabilization."
+    End If
+    Exit Function
+
+BulkFailed:
+    Dim bulkErrNumber As Long
+    Dim bulkErrSource As String
+    Dim bulkErrDescription As String
+
+    bulkErrNumber = Err.Number
+    bulkErrSource = Err.source
+    bulkErrDescription = Err.description
+
+    If bulkErrNumber = ERR_CONSENSUS_HALT Then
+        Err.Raise bulkErrNumber, bulkErrSource, bulkErrDescription
+    End If
+
+    On Error Resume Next
+    LogActionDiagnosticLine "[INPUT-BULK-FALLBACK] reason=" & _
+                            Replace(bulkErrDescription, vbCrLf, " ")
+    Err.Clear
+    On Error GoTo FallbackFailed
+
+    Dim keySafetyMs As Long
+    keySafetyMs = maxTimeoutMs
+    If keySafetyMs < 20000 Then keySafetyMs = 20000
+
+    Dim keyResult As String
+    keyResult = ExecuteBaseAction( _
+        targetCtx, "input_keys", args, False, minStableMs, False, _
+        DEFAULT_STALE_RETRIES, keySafetyMs, False, locatorKind, locator, _
+        searchTimeoutMs, callerName & ":bulk-fallback")
+
+    Call TrySyncPhase(targetCtx, waitNetworkIdle, _
+                      SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
+                      SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS), False)
+
+    ExecuteBulkInputWithKeyFallback = keyResult
+    If m_debugMode Then
+        Debug.Print "BiDi: Action 'input_keys' completed as bulk-input fallback."
+    End If
+    Exit Function
+
+FallbackFailed:
+    Dim fallbackErrNumber As Long
+    Dim fallbackErrSource As String
+    Dim fallbackErrDescription As String
+
+    fallbackErrNumber = Err.Number
+    fallbackErrSource = Err.source
+    fallbackErrDescription = Err.description
+
+    Err.Raise fallbackErrNumber, fallbackErrSource, _
+              fallbackErrDescription & " | bulk-input failure: " & bulkErrDescription
+End Function
+
 Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, _
                                        ByVal locator As Variant, _
                                        ByVal valueToSet As String, _
@@ -4002,15 +4075,9 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
             targetCtx, nativeKeyActions, maxTimeoutMs, waitNetworkIdle, minStableMs)
         If m_debugMode Then Debug.Print "BiDi: Action 'native_keys' completed."
     ElseIf Not useKeyEvents Then
-        Dim inputResult As String
-        inputResult = ExecuteBaseAction( _
-            targetCtx, "input", args, waitNetworkIdle, minStableMs, True, _
-            DEFAULT_STALE_RETRIES, maxTimeoutMs, False, locatorKind, locator, _
-            searchTimeoutMs, callerName)
-
-        LogInputValueMismatchBestEffort locatorKind, locator, valueToSet, _
-                                        searchTimeoutMs, targetCtx, callerName
-        ExecuteInputValueCore = inputResult
+        ExecuteInputValueCore = ExecuteBulkInputWithKeyFallback( _
+            targetCtx, args, waitNetworkIdle, minStableMs, maxTimeoutMs, _
+            locatorKind, locator, searchTimeoutMs, callerName)
     Else
         Dim keySafetyMs As Long: keySafetyMs = maxTimeoutMs
         If keySafetyMs < 20000 Then keySafetyMs = 20000
@@ -12888,11 +12955,27 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & rp & "e.click(); return true; } catch(err) { throw err; }"
                  
         Case "input"
-            js = js & "try { const e=arguments[0],v=arguments[1]; if(!e||!e.isConnected)throw new Error('STALE_ELEMENT'); "
-            js = js & "e.scrollIntoView({block:'center',inline:'center'}); if(!e.isConnected)throw new Error('STALE_ELEMENT'); e.click(); e.focus(); " & rp & "e.select(); "
-            js = js & "const s=document.execCommand('insertText',false,v); if(!s){e.value='';e.value=v;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));} "
-            js = js & "e.blur(); return true;} catch(err){throw err;}"
-                 
+            js = js & "try{let e=arguments[0],v=arguments[1];"
+            js = js & "const da=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement){a=a.shadowRoot.activeElement;}return a;};"
+            js = js & "const isTextTarget=(a)=>!!(a&&a.isConnected&&!a.disabled&&!a.readOnly&&(a.tagName==='TEXTAREA'||(a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type))));"
+            js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
+            js = js & "e.scrollIntoView({block:'center',inline:'center'});if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
+            js = js & "e.click();e.focus();"
+            js = js & "let target=null,prev=null,stable=0;"
+            js = js & "for(let t=performance.now();performance.now()-t<3000;){hb();let a=da();"
+            js = js & "if(isTextTarget(a)){if(a===prev){stable++;}else{prev=a;stable=1;}if(stable>=3){target=a;break;}}else{prev=null;stable=0;}"
+            js = js & "await new Promise(r=>setTimeout(r,20));}"
+            js = js & "if(!target)throw new Error('ACTIVE_INPUT_NOT_STABLE');"
+            js = js & "if(!target.isConnected)throw new Error('STALE_ACTIVE_INPUT');"
+            js = js & "target.focus();if(target.select)target.select();"
+            js = js & rp
+            js = js & "const s=document.execCommand('insertText',false,v);"
+            js = js & "if(!s){target.value='';target.value=v;target.dispatchEvent(new Event('input',{bubbles:true}));target.dispatchEvent(new Event('change',{bubbles:true}));}"
+            js = js & "await new Promise(r=>setTimeout(r,40));hb();"
+            js = js & "if(!target.isConnected)throw new Error('BULK_INPUT_TARGET_DISCONNECTED');"
+            js = js & "if(String(target.value||'')!==String(v))throw new Error('BULK_INPUT_VALUE_MISMATCH');"
+            js = js & "return true;}catch(err){throw err;}"
+
         Case "select"
             js = js & "try { const s=arguments[0],v=arguments[1]; if(!s||!s.isConnected)throw new Error('STALE_ELEMENT'); "
             js = js & "s.scrollIntoView({block:'center',inline:'center'}); s.focus(); if(!s.isConnected)throw new Error('STALE_ELEMENT'); " & rp & "const f=Array.from(s.options).some(o=>o.value===String(v)); if(!f)throw new Error('Option value not found: '+v); s.value=v; "
