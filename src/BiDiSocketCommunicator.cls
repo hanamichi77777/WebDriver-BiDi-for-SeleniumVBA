@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "5.8"
+Private Const BIDI_SOCKET_VERSION As String = "5.9"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -2556,6 +2556,9 @@ End Sub
 ' the caller's explicit isCritical classification; the trace file is created lazily
 ' on the first critical diagnostic and is absent for a clean direct-connect session.
 Public Sub trace(ByVal msg As String, Optional ByVal isCritical As Boolean = False)
+    ' Diagnostics must never mask or replace the transport error being handled.
+    On Error Resume Next
+
     If Not COMMUNICATOR_DEBUG_ENABLED And Not isCritical Then Exit Sub
     
     Dim logMsg As String: logMsg = "[" & Format(Now, "hh:mm:ss") & "] " & msg
@@ -2577,12 +2580,12 @@ Public Sub trace(ByVal msg As String, Optional ByVal isCritical As Boolean = Fal
         Dim logPath As String: logPath = localDir & "bidi_socket_trace.log"
         Dim fNum As Integer: fNum = FreeFile
         
-        On Error Resume Next
         Open logPath For Append As #fNum
         Print #fNum, logMsg & " (LOG_EVENT)"
         Close #fNum
-        On Error GoTo 0
     End If
+
+    On Error GoTo 0
 End Sub
 
 Public Sub LogEvent(ByVal Header As String, ByVal Body As String, _

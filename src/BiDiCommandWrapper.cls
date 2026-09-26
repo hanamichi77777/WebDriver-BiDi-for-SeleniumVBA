@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.8"
+Private Const BIDI_WRAPPER_VERSION As String = "5.9"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -2899,7 +2899,6 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME
 
     Dim responseCompletedAvailableForStatus As Boolean
-    Dim deferSettlementForEarlyResponseStartedRelease As Boolean
 
     If Not (m_activeSubscriptions Is Nothing) Then
         responseCompletedAvailableForStatus = _
@@ -2925,16 +2924,8 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         ResetNavigationHttpCaptureState
     End If
 
-    ' If this transaction created responseStarted and responseCompleted is already available, the
-    ' protocol-level navigation can stop at interactive. Settlement is then performed explicitly
-    ' after responseStarted is released, avoiding duplicate network event payloads during the wait.
-    deferSettlementForEarlyResponseStartedRelease = _
-        (waitNetworkIdle And requireHttpStatus And _
-         Len(temporaryResponseStartedSubscriptionId) > 0 And _
-         responseCompletedAvailableForStatus)
-
     Dim modeStr As String
-    If waitNetworkIdle And Not deferSettlementForEarlyResponseStartedRelease Then
+    If waitNetworkIdle Then
         modeStr = "complete"
     Else
         modeStr = "none"
@@ -2978,7 +2969,7 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         If IsConcurrentNavigationSupersession(navErr, navSrc, navDesc) Then
             If TryAdoptConcurrentNavigation( _
                    targetCtx, targetUrl, _
-                   (waitNetworkIdle And Not deferSettlementForEarlyResponseStartedRelease), _
+                   waitNetworkIdle, _
                    vMinStable, vMaxTimeout) Then
                 navigationAccepted = True
                 navigationAcceptedViaSupersession = True
@@ -3001,27 +2992,6 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         If Len(navSrc) = 0 Then navSrc = "BiDi:" & METHOD_NAME
         If Len(navDesc) = 0 Then navDesc = "Navigation command failed."
         Err.Raise navErr, navSrc, navDesc
-    End If
-
-    If deferSettlementForEarlyResponseStartedRelease Then
-        ' The browser has reached interactive. Release only the responseStarted subscription owned
-        ' by this transaction; responseCompleted remains available for status capture.
-        ReleaseNavigationResponseStartedSubscriptionBestEffort _
-            temporaryResponseStartedSubscriptionId
-
-        If Not (m_activeSubscriptions Is Nothing) Then
-            If Not m_activeSubscriptions.Exists("network.responseStarted") Then
-                temporaryResponseStartedSubscriptionId = vbNullString
-            End If
-        End If
-
-        ' Keep GLOBAL network.responseCompleted subscribed through URL stability.
-        ' Discovery recording prioritizes complete RES/BODY observation over the former
-        ' payload-reduction optimization that temporarily paused this event stream.
-        SettleAfterNavigation targetCtx, vMinStable, vMaxTimeout
-        RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
-            "browsingContext.navigate may already have been accepted; do not blindly retry " & _
-            "the operation."
     End If
 
     Dim resultText As String
@@ -3947,7 +3917,9 @@ Private Sub SettleAfterNavigation(ByVal contextId As String, _
 
     Dim urlStable As Boolean
     urlStable = WaitForUrlStability(contextId, 1000, maxTimeoutMs)
-    UpdateMainContextId True, True
+    If StrComp(contextId, m_mainContextId, vbBinaryCompare) = 0 Then
+        UpdateMainContextId True, True
+    End If
     WaitForNetworkIdleSpa minStableMs, maxTimeoutMs, contextId
 
     m_lastSyncSucceeded = urlStable
@@ -4001,7 +3973,18 @@ BulkFailed:
     bulkErrSource = Err.source
     bulkErrDescription = Err.description
 
-    If bulkErrNumber = ERR_CONSENSUS_HALT Then
+    ' Leave the active error handler before deciding whether fallback is safe.
+    ' This also makes the FallbackFailed handler below effective.
+    Resume BulkFallback
+
+BulkFallback:
+    ' Resume re-enables the procedure's original handler; disable it before
+    ' re-raising any non-replayable failure to the caller.
+    On Error GoTo 0
+
+    If bulkErrNumber = ERR_CONSENSUS_HALT Or _
+       bulkErrNumber = ERR_SESSION_CONTINUITY_LOST Or _
+       IsAmbiguousDispatchFailure(bulkErrNumber, bulkErrSource, bulkErrDescription) Then
         Err.Raise bulkErrNumber, bulkErrSource, bulkErrDescription
     End If
 
@@ -4275,6 +4258,8 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
     targetCtx = ResolveTargetContext(contextId)
     RequireCurrentCaptureGeneration captureGeneration, methodName
 
+    Dim signalsAdopted As Boolean
+
     If AnySignalArmed() Then
         If Len(m_signalOwnerContextId) = 0 Or _
            StrComp(targetCtx, m_signalOwnerContextId, vbBinaryCompare) <> 0 Then
@@ -4285,6 +4270,11 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
                       "Target: " & targetCtx
         End If
     End If
+
+    ' Any active completion signals have now been validated as belonging to
+    ' this file-selection operation. From this point, failure cleanup may
+    ' consume them; failures before this point must leave unrelated arms intact.
+    signalsAdopted = True
 
     If m_fileChooserInterceptMayBeActive Then
         If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
@@ -4384,7 +4374,9 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
     ResetFileDialogCaptureState
 
     If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
-        Me.DisarmSignal
+        If signalsAdopted And AnySignalArmed() Then
+            Me.DisarmSignal
+        End If
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "PostSelectionInterceptionCleanupFailed: input.setFiles succeeded, but native " & _
                   "file-chooser interception could not be confirmed disabled. The selection may " & _
@@ -4416,7 +4408,7 @@ FileDialogFailureCleanup:
     On Error Resume Next
     ResetFileDialogCaptureState
     cleanupConfirmed = ReleaseTrackedFileChooserInterceptionBestEffort(True)
-    Me.DisarmSignal
+    If signalsAdopted Then Me.DisarmSignal
     If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation methodName
     On Error GoTo 0
 
@@ -5478,6 +5470,18 @@ Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
     Dim strRes As String, json As Object, nodes As Collection
     Dim sid As String, attemptCount As Long
     Dim pendingTransient As String, lastLoggedTransient As String
+    Dim initialUrl As String
+    Dim initialUrlKnown As Boolean
+
+    If Not isImmediate Then
+        ' Best-effort baseline; a URL probe failure must not abort element polling.
+        On Error Resume Next
+        Err.Clear
+        initialUrl = GetCurrentUrl(targetCtx, True)
+        initialUrlKnown = (Err.Number = 0)
+        Err.Clear
+        On Error GoTo 0
+    End If
 
     If m_debugMode Then
         Debug.Print "BiDi: Searching for [" & xpath & "] (Timeout: " & _
@@ -5488,10 +5492,31 @@ Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
         attemptCount = attemptCount + 1
 
         If attemptCount Mod 5 = 0 Then
-            Dim currentUrl As String: currentUrl = GetCurrentUrl(targetCtx, True)
-            If InStr(1, currentUrl, "about:blank", vbTextCompare) > 0 Or currentUrl = "" Then
-                Debug.Print "BiDi: Aborting search. Target context navigated away."
-                Exit Do
+            Dim currentUrl As String
+            Dim urlProbeSucceeded As Boolean
+            Dim navigatedToBlank As Boolean
+
+            currentUrl = vbNullString
+            urlProbeSucceeded = False
+
+            ' Best-effort navigation check; a transient context/realm loss must not
+            ' turn into an element-search failure. Skip this check for this round.
+            On Error Resume Next
+            Err.Clear
+            currentUrl = GetCurrentUrl(targetCtx, True)
+            urlProbeSucceeded = (Err.Number = 0)
+            Err.Clear
+            On Error GoTo 0
+
+            If urlProbeSucceeded Then
+                navigatedToBlank = (initialUrlKnown And _
+                                    InStr(1, currentUrl, "about:blank", vbTextCompare) > 0 And _
+                                    InStr(1, initialUrl, "about:blank", vbTextCompare) = 0 And _
+                                    StrComp(currentUrl, initialUrl, vbBinaryCompare) <> 0)
+                If currentUrl = "" Or navigatedToBlank Then
+                    If m_debugMode Then Debug.Print "BiDi: Aborting search. Target context navigated away."
+                    Exit Do
+                End If
             End If
         End If
 
@@ -7933,6 +7958,7 @@ Private Function ReleaseAllAutoClickersBestEffort() As Long
         registrationKey = CStr(key)
 
         Dim removalFailed As Boolean
+        removalFailed = False
         If m_autoClickerScriptIds.Exists(registrationKey) Then
             Dim activeId As String
             activeId = CStr(m_autoClickerScriptIds(registrationKey))
@@ -9918,6 +9944,16 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     Dim perfWallStartSec As Double
     Dim perfLine As String
 
+    ' Keep stream references visible to the failure-cleanup path.
+    Dim stm As ADODB.stream
+    Dim outStm As ADODB.stream
+
+    Dim stopErrNumber As Long
+    Dim stopErrSource As String
+    Dim stopErrDescription As String
+
+    On Error GoTo StopFailed
+
     perfWallStartSec = Timer
     perfStopStartMs = socket_.nowMs()
 
@@ -10001,7 +10037,6 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         filePath = WebShared.getFullLocalPath(filePath, targetExists:=False)
 
         ' ADODB.Stream is used to write UTF-8 without a BOM.
-        Dim stm As ADODB.stream
         Set stm = New ADODB.stream
         stm.Type = 2                      ' adTypeText
         stm.Charset = "utf-8"
@@ -10197,7 +10232,6 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         perfReportBuildMs = socket_.nowMs() - perfPhaseStartMs
 
         perfPhaseStartMs = socket_.nowMs()
-        Dim outStm As ADODB.stream
         Set outStm = New ADODB.stream
         outStm.Type = 1                   ' adTypeBinary
         outStm.Open
@@ -10250,6 +10284,55 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         Debug.Print "BiDi Recorder: Log saved to " & filePath
         Debug.Print perfLine
     End If
+
+    Exit Sub
+
+StopFailed:
+    ' Preserve the primary Stop/Save error before leaving VBA's active handler.
+    stopErrNumber = Err.Number
+    stopErrSource = Err.source
+    stopErrDescription = Err.description
+    Resume StopFailedCleanup
+
+StopFailedCleanup:
+    ' Stop/Save is terminal for the current recording attempt. Cleanup must be
+    ' best-effort and must never replace the original failure (for example,
+    ' a locked output file). BODY STORE output already materialized in local
+    ' memory cannot be recovered after this procedure exits, so callers should
+    ' treat the raised save error as authoritative.
+    On Error Resume Next
+
+    If Not stm Is Nothing Then stm.Close
+    If Not outStm Is Nothing Then outStm.Close
+
+    m_isRecording = False
+
+    Dim stopBodyCleanupFailure As String
+    Call ReleaseBodyDataCollectorBestEffort(stopBodyCleanupFailure)
+
+    Dim stopRequestBodyCleanupFailure As String
+    Call ReleaseRequestBodyDataCollectorBestEffort(stopRequestBodyCleanupFailure)
+
+    Set m_recorderLogs = Nothing
+    Set m_recSuppByKey = Nothing
+    Set m_recRequestUrlById = Nothing
+    Set m_recRequestKeyById = Nothing
+    m_recSuppOverflowCount = 0
+    m_discoveryDomCaptureEnabled = False
+    m_discoveryManualPumpActive = False
+    m_discoveryDomContextId = vbNullString
+    m_nextDiscoveryDomPollMs = 0#
+
+    ResetDiscoveryBodyRunState
+    ResetRecorderRequestHopRunState
+
+    On Error GoTo 0
+
+    If stopErrNumber = 0 Then stopErrNumber = ERR_ACTION_FAILED
+    If Len(stopErrSource) = 0 Then stopErrSource = "BiDi:StopAndSaveDiscoveryLog"
+    If Len(stopErrDescription) = 0 Then stopErrDescription = "Discovery Log stop/save failed."
+
+    Err.Raise stopErrNumber, stopErrSource, stopErrDescription
 End Sub
 
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
@@ -13893,7 +13976,9 @@ Private Sub SyncAfterAction(ByVal contextId As String, _
         urlErrSrc = Err.source
         urlErrDesc = Err.description
         Err.Clear
-        UpdateMainContextId True
+        If StrComp(contextId, m_mainContextId, vbBinaryCompare) = 0 Then
+            UpdateMainContextId True
+        End If
         If urlErrNum = 0 And Err.Number <> 0 Then
             urlErrNum = Err.Number
             urlErrSrc = Err.source
@@ -14976,7 +15061,14 @@ Private Function TryPreparePhase(ByVal ctx As String, _
     
     If isRetry Then
         On Error Resume Next
-        Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
+        If StrComp(ctx, m_mainContextId, vbBinaryCompare) = 0 Then
+            Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
+        Else
+            If Not m_validatedContexts Is Nothing Then
+                If m_validatedContexts.Exists(ctx) Then m_validatedContexts.Remove ctx
+            End If
+            Call ResolveTargetContext(ctx)
+        End If
         capturedErr = Err.Number
         If capturedErr <> 0 Then
             outErrNum = capturedErr: outErrDesc = Err.description: outErrSrc = Err.source
