@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "5.6"
+Private Const BIDI_SOCKET_VERSION As String = "5.7"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -109,6 +109,11 @@ Private Enum IncomingMessageClass
 End Enum
 
 Private m_state As BiDiSocketState
+' Transport epoch. Incremented on every successful OPEN, including AttemptRecovery reconnects.
+' Measured with msedgedriver: event subscriptions issued on one connection are not delivered to
+' a later connection of the same session, so owners compare this value to detect that a
+' recovered transport no longer carries the events they subscribed to.
+Private m_connectionGeneration As Long
 Public Event StateChanged(ByVal NewState As BiDiSocketState, ByVal StateName As String)
 
 Private m_EventBuffer As Collection
@@ -516,6 +521,7 @@ Public Property Get PollingInterval() As Long: PollingInterval = m_PollingInterv
 Public Property Let AllowUiPump(ByVal v As Boolean): m_AllowUiPump = v: End Property
 Public Property Get AllowUiPump() As Boolean: AllowUiPump = m_AllowUiPump: End Property
 Public Property Get state() As BiDiSocketState: state = m_state: End Property
+Public Property Get ConnectionGeneration() As Long: ConnectionGeneration = m_connectionGeneration: End Property
 Public Property Get MaxCommandCorrelationWaitMs() As Long: MaxCommandCorrelationWaitMs = MAX_COMMAND_CORRELATION_WAIT_MS: End Property
 Public Property Get LastCommandRequestedWaitMs() As Long: LastCommandRequestedWaitMs = m_LastCommandRequestedWaitMs: End Property
 Public Property Get LastCommandEffectiveWaitMs() As Long: LastCommandEffectiveWaitMs = m_LastCommandEffectiveWaitMs: End Property
@@ -994,6 +1000,12 @@ Private Sub FinalizeConnectedState()
     ' A successful OPEN begins a new transport epoch. Recovery preserves cumulative counters,
     ' but a later independent discontinuity must be counted once again.
     m_transportDiscontinuityLatched = False
+    ' Advance the epoch before StateChanged so subscribers observe the new generation.
+    If m_connectionGeneration >= 2147483647 Then
+        m_connectionGeneration = 1
+    Else
+        m_connectionGeneration = m_connectionGeneration + 1
+    End If
     SetState StateConnected
 End Sub
 

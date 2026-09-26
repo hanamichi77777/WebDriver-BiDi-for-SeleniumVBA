@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.6"
+Private Const BIDI_WRAPPER_VERSION As String = "5.7"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -36,6 +36,10 @@ Private Const BIDI_WRAPPER_VERSION As String = "5.6"
 ' OERN is limited to captured or deliberately best-effort scopes; it must not hide
 ' the primary action result or structural response errors.
 Private socket_ As BiDiSocketCommunicator
+' socket_.ConnectionGeneration captured by ConnectTo; 0 = no bound session (guard inactive).
+' A different value means the transport was silently reconnected and the subscriptions made
+' by ConnectTo no longer deliver events on it.
+Private m_boundConnectionGeneration As Long
 ' True when no live session still requires teardown.
 Private m_shutdownCompleted As Boolean
 Private m_useTrustedClick As Boolean        ' default False -> synthetic JS clicks (proven path); True = trusted pointer clicks (opt-in)
@@ -393,6 +397,8 @@ Private Const ERR_NEW_CONTEXT_DESTROYED As Long = vbObjectError + 1026
 Private Const ERR_REENTRANT_CAPTURE As Long = vbObjectError + 1027
 Private Const ERR_DOWNLOAD_BATCH_COUNT_MISMATCH As Long = vbObjectError + 1028
 Private Const ERR_DOWNLOAD_BATCH_FILENAME_COLLISION As Long = vbObjectError + 1029
+Private Const ERR_SESSION_CONTINUITY_LOST As Long = vbObjectError + 1030 ' transport lost or silently reconnected
+Private Const PEER_LIVENESS_PROBE_MS As Long = 3000 ' session.status normally answers in a few ms
 
 Private Enum MainContextState
     MainContextUnbound = 0
@@ -592,6 +598,8 @@ Public Sub ConnectTo(ByVal webSocketUrl As String, _
 
     m_shutdownCompleted = False
     m_currentSessionIdentity = requestedSessionIdentity
+    ' Bind before the mandatory subscribe: every later command/wait verifies this epoch.
+    m_boundConnectionGeneration = socket_.ConnectionGeneration
 
     ' A normal Shutdown can lose only the acknowledgement, not necessarily the unsubscribe itself.
     ' Reconcile those issued IDs before creating any new subscriptions in the same BiDi session.
@@ -637,6 +645,7 @@ InitializationFailed:
 
 InitializationCleanup:
     On Error Resume Next
+    m_boundConnectionGeneration = 0
 
     ' Initialization may already have created session-side state before a later mandatory step
     ' failed. Contain/restore Shadow DOM hooks and release subscriptions while the socket is live.
@@ -678,6 +687,58 @@ End Sub
 Public Property Get GetSocket() As BiDiSocketCommunicator
     Set GetSocket = socket_
 End Property
+
+' Liveness check for long gaps (heavy VBA work, manual waits) before the next action.
+' True only when the bound transport is still the one ConnectTo subscribed on AND the peer
+' answers session.status within timeoutMs. IsConnected alone is cached state and stays True
+' for a dead or suspended peer until the next socket I/O. Never raises.
+Public Function CheckAlive(Optional ByVal timeoutMs As Long = PEER_LIVENESS_PROBE_MS) As Boolean
+    Dim reason As String
+    If socket_ Is Nothing Then Exit Function
+    If m_boundConnectionGeneration = 0 Then Exit Function
+    If IsSessionContinuityLost(reason) Then Exit Function
+    If timeoutMs <= 0 Then timeoutMs = PEER_LIVENESS_PROBE_MS
+
+    Dim params As Object: Set params = New Dictionary
+    Dim res As String
+    Dim probeErr As Long
+
+    On Error Resume Next
+    res = socket_.SendCommand("session.status", params, True, timeoutMs)
+    probeErr = Err.Number
+    Err.Clear
+    On Error GoTo 0
+
+    If probeErr <> 0 Then Exit Function
+    If InStr(1, res, """result""", vbBinaryCompare) = 0 Then Exit Function
+    CheckAlive = Not IsSessionContinuityLost(reason)
+End Function
+
+Private Function IsSessionContinuityLost(ByRef reason As String) As Boolean
+    reason = vbNullString
+    If m_boundConnectionGeneration = 0 Then Exit Function
+
+    If socket_ Is Nothing Then
+        reason = "communicator released"
+    ElseIf socket_.ConnectionGeneration <> m_boundConnectionGeneration Then
+        reason = "transport reconnected (generation " & CStr(m_boundConnectionGeneration) & _
+                 " -> " & CStr(socket_.ConnectionGeneration) & "); subscribed events are not " & _
+                 "delivered to the new connection"
+    ElseIf socket_.state <> StateConnected Then
+        reason = "transport is not connected (state=" & CStr(socket_.state) & ")"
+    Else
+        Exit Function
+    End If
+    IsSessionContinuityLost = True
+End Function
+
+Private Sub AssertSessionContinuity(ByVal source As String)
+    Dim reason As String
+    If IsSessionContinuityLost(reason) Then
+        Err.Raise ERR_SESSION_CONTINUITY_LOST, source, _
+            "SessionContinuityLost: " & reason & ". The BiDi session cannot continue on this connection."
+    End If
+End Sub
 Public Property Set SetSocket(ByVal socket As BiDiSocketCommunicator)
     If socket Is Nothing Then
         Err.Raise ERR_ACTION_FAILED, "BiDiCommandWrapper:SetSocket", _
@@ -706,6 +767,7 @@ Public Property Set SetSocket(ByVal socket As BiDiSocketCommunicator)
     ClearState
     Set socket_ = socket
     m_currentSessionIdentity = vbNullString
+    m_boundConnectionGeneration = 0
     m_shutdownCompleted = True
 End Property
 
@@ -6017,6 +6079,9 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
     
     Do While retryCount <= MAX_CONTEXT_RECOVERY_RETRIES
         
+        ' Fail closed before sending on a lost or silently reconnected transport.
+        AssertSessionContinuity "BiDi:ExecuteBiDiCommand:" & method
+
         On Error Resume Next
         strRes = socket_.SendCommand(method, params, Silent, commandTimeoutMs)
         localErrNum = Err.Number: localErrDesc = Err.description
@@ -6055,6 +6120,19 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                           " | requestedWaitMs=" & CStr(socket_.LastCommandRequestedWaitMs) & _
                           " | effectiveWaitMs=" & CStr(socket_.LastCommandEffectiveWaitMs) & _
                           " | capMs=" & CStr(socket_.MaxCommandCorrelationWaitMs)
+            ' A silent peer is detected by the transport only after up to ~25s (WS Ping 15s +
+            ' Pong 10s). For shorter waits, classify the timeout with one bounded probe.
+            localErrDesc = localErrDesc & " | PeerLiveness=" & _
+                           IIf(CheckAlive(PEER_LIVENESS_PROBE_MS), "responsive", "unresponsive")
+            Exit Do
+        End If
+
+        ' Transport loss or a silent reconnect cannot be healed by context recovery/retry:
+        ' the reconnected transport answers commands but no longer delivers subscribed events.
+        Dim continuityReason As String
+        If IsSessionContinuityLost(continuityReason) Then
+            localErrDesc = "SessionContinuityLost: " & continuityReason & " | " & localErrDesc
+            localErrNum = ERR_SESSION_CONTINUITY_LOST
             Exit Do
         End If
 
@@ -13000,6 +13078,9 @@ Private Sub WaitHeartbeat(Optional ByVal sleepMs As Long = 50)
     ProcessRecorderQueue
 
     socket_.PumpMessages 100
+    ' Event-driven waits must not keep waiting (or judge idle) on a transport that can no
+    ' longer deliver their events.
+    AssertSessionContinuity "BiDi:WaitHeartbeat"
 
     Dim vSleep As Long: vSleep = sleepMs
     If vSleep < 50 Then vSleep = 50
@@ -13012,6 +13093,7 @@ Private Sub WaitHeartbeatBounded(Optional ByVal sleepMs As Long = 50)
     DrainNonBlockingRecorderQueue
 
     socket_.PumpMessages 100
+    AssertSessionContinuity "BiDi:WaitHeartbeatBounded"
 
     Dim vSleep As Long: vSleep = sleepMs
     If vSleep < 50 Then vSleep = 50
@@ -14178,6 +14260,10 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
         Exit Sub
     End If
 
+    ' Teardown is best-effort and may legitimately run on a degraded session; release the
+    ' continuity guard so cleanup commands can still use the communicator's recovery path.
+    m_boundConnectionGeneration = 0
+
     ' Shutdown is teardown, not a competing capture operation. If a host interruption or a
     ' re-entrant teardown leaves an exclusive owner active, abandon that transaction and continue
     ' cleanup rather than blocking the only path that can release browser-side residual state.
@@ -14246,7 +14332,10 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
         End If
     End If
 
-    ' Subscriptions belong to the BiDi session, not the WebSocket transport. Use one bounded
+    ' Subscription OWNERSHIP belongs to the BiDi session: IDs issued on an earlier connection
+    ' can be unsubscribed from a later one. Event DELIVERY does not survive a reconnect
+    ' (measured with msedgedriver), which is why ConnectTo binds m_boundConnectionGeneration.
+    ' Use one bounded
     ' unsubscribe while the socket is still live. If acknowledgement is lost, retain only the
     ' issued IDs and session identity so a same-session ConnectTo must reconcile them first.
     If Not ReleaseTrackedSubscriptionsBeforeClearBestEffort(2000) Then
@@ -14969,8 +15058,9 @@ Private Sub TrySyncPhase(ByVal ctx As String, _
         If syncErrNum <> 0 Then RecordSyncFailure syncErrNum, syncErrSrc, syncErrDesc
     End If
     
-    ' Never absorb ERR_CONSENSUS_HALT.
-    If syncErrNum = ERR_CONSENSUS_HALT Then
+    ' Never absorb ERR_CONSENSUS_HALT or a lost session: the action completed, but the
+    ' caller must not continue on a transport that can no longer confirm anything.
+    If syncErrNum = ERR_CONSENSUS_HALT Or syncErrNum = ERR_SESSION_CONTINUITY_LOST Then
         Err.Raise syncErrNum, syncErrSrc, syncErrDesc
     End If
     
