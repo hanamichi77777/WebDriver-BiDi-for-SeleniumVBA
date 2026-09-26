@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v5.5
+# WebDriver BiDi for SeleniumVBA v5.6
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.

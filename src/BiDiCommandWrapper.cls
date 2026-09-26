@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.5"
+Private Const BIDI_WRAPPER_VERSION As String = "5.6"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -22,6 +22,8 @@ Private Const BIDI_WRAPPER_VERSION As String = "5.5"
 '   SPA wait: MasterWaitEngine -> EvaluateWaitCondition -> EvaluateSpaIdleCondition.
 '
 ' Preserve these invariants:
+'   - JSON field access follows the three-category policy above TryGetObjectField.
+'   - Abandoned capture cleanup may still touch shared signal/diagnostic state from a newer generation; keep such cleanup generation-aware when extending it.
 '   - m_waitStackDepth tracks nested active wait loops.
 '   - SendAndReceive pumps Office messages only when AllowUiPump is explicitly enabled (default False).
 '   - Ambiguous outcomes are never replayed when they may duplicate state or overlap.
@@ -358,6 +360,9 @@ Private m_fileChooserInterceptContextId As String
 ' object from Application.OnTime, UserForm/worksheet events, Win32 timers, etc. A second
 ' composite capture operation must be rejected before it can reset the first operation's state.
 Private m_exclusiveCaptureOperationOwner As String
+' Incremented when Shutdown abandons an owned capture. Re-entered stale continuations must reject
+' shared capture state from a later generation before issuing side effects or returning results.
+Private m_exclusiveCaptureGeneration As Long
 
 ' B4: Fatal Reset must never erase one-shot transaction state while an exclusive capture owns it.
 ' A fatal reset requested during capture is applied only after the owning operation releases its
@@ -466,6 +471,18 @@ Private Sub RejectIfExclusiveCaptureActive(ByVal methodName As String)
               "' owns wrapper capture state."
 End Sub
 
+Private Sub RequireCurrentCaptureGeneration(ByVal expectedGeneration As Long, _
+                                            ByVal methodName As String, _
+                                            Optional ByVal sideEffectDetail As String = "")
+    If expectedGeneration = m_exclusiveCaptureGeneration Then Exit Sub
+
+    Dim detail As String
+    If Len(sideEffectDetail) > 0 Then detail = " " & sideEffectDetail
+
+    Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
+              "CaptureAbandoned: the transaction was abandoned by Shutdown." & detail
+End Sub
+
 Private Sub AbandonExclusiveCaptureForShutdownBestEffort()
     Dim abandonedOwner As String
     abandonedOwner = m_exclusiveCaptureOperationOwner
@@ -474,6 +491,10 @@ Private Sub AbandonExclusiveCaptureForShutdownBestEffort()
     hadDeferredFatalReset = m_fatalResetDeferred
 
     If Len(abandonedOwner) = 0 And Not hadDeferredFatalReset Then Exit Sub
+
+    If Len(abandonedOwner) > 0 Then
+        m_exclusiveCaptureGeneration = m_exclusiveCaptureGeneration + 1
+    End If
 
     ' Shutdown itself clears volatile/session state, so a deferred fatal reset has no later
     ' transaction to protect. Drop both ownership and deferred-reset residue before teardown.
@@ -699,7 +720,12 @@ End Property
 
 Private Sub DispatchGlobalEvents(ByVal json As Object)
     If Not json.Exists("method") Then Exit Sub
-    Dim method As String: method = json("method")
+
+    Dim method As String
+    If Not TryGetScalarTextField(json, "method", method) Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:DispatchGlobalEvents", _
+                  "Event 'method' is not a scalar value."
+    End If
 
     ' Blocked requests surface as fetchError. They remain visible to diagnostics but do
     ' not participate in SPA-idle consensus because blocking is browser-side.
@@ -853,27 +879,32 @@ Private Sub HandleFileDialogOpenedEvent(ByVal json As Object)
         Exit Sub
     End If
 
-    m_fileDlgSeen = True
-    m_fileDlgArmed = False
+    ' Validate the event payload before committing capture state. If conversion fails,
+    ' the caller can record event loss without leaving the file-dialog state half committed.
+    Dim multipleKnown As Boolean
+    Dim multipleValue As Boolean
+    multipleKnown = p.Exists("multiple")
+    If multipleKnown Then multipleValue = CBool(p("multiple"))
 
-    m_fileDlgMultipleKnown = p.Exists("multiple")
-    If m_fileDlgMultipleKnown Then m_fileDlgMultiple = CBool(p("multiple"))
+    Dim hasElement As Boolean
+    Dim sharedId As String
+    hasElement = False
+    sharedId = vbNullString
 
-    m_fileDlgHasElement = False
-    m_fileDlgSharedId = vbNullString
-
-    If p.Exists("element") Then
-        If IsObject(p("element")) Then
-            Dim elementRef As Object
-            Set elementRef = p("element")
-            If Not elementRef Is Nothing Then
-                If elementRef.Exists("sharedId") Then
-                    m_fileDlgSharedId = CStr(elementRef("sharedId"))
-                    m_fileDlgHasElement = (Len(m_fileDlgSharedId) > 0)
-                End If
-            End If
+    Dim elementRef As Object
+    If TryGetObjectField(p, "element", elementRef) Then
+        If elementRef.Exists("sharedId") Then
+            sharedId = CStr(elementRef("sharedId"))
+            hasElement = (Len(sharedId) > 0)
         End If
     End If
+
+    m_fileDlgSeen = True
+    m_fileDlgArmed = False
+    m_fileDlgMultipleKnown = multipleKnown
+    m_fileDlgMultiple = multipleValue
+    m_fileDlgHasElement = hasElement
+    m_fileDlgSharedId = sharedId
 
     LogSignalLine "[FILE-DIALOG-HIT] ctx=" & eventCtx & _
                   " | hasElement=" & LCase$(CStr(m_fileDlgHasElement)) & _
@@ -1045,11 +1076,14 @@ Private Sub ResetNewContextCaptureState()
     Set m_newContextBaseline = New Dictionary
 End Sub
 
-Private Sub ArmNewContextCapture(ByVal ownerContextId As String)
+Private Sub ArmNewContextCapture(ByVal ownerContextId As String, _
+                                        ByVal captureGeneration As Long, _
+                                        ByVal methodName As String)
     ResetNewContextCaptureState
 
     Dim rawTree As String
     rawTree = ExecuteBiDiCommand("browsingContext.getTree", New Dictionary, True)
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     Dim tree As Object
     Set tree = ValidateProtocolResponse(rawTree, "browsingContext.getTree")
@@ -1080,6 +1114,7 @@ Private Sub ArmNewContextCapture(ByVal ownerContextId As String)
     ' Drain events accumulated during getTree while the local capture arm is still down.
     ' This narrows the stale baseline-diff window without adding a queue watermark.
     ProcessRecorderQueue
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     m_newContextOwnerContextId = ownerContextId
     m_newContextOwnerClientWindow = GetPathString(ownerInfo, "clientWindow")
@@ -1097,7 +1132,9 @@ Private Function NewContextDroppedEventsSinceArm() As Long
     NewContextDroppedEventsSinceArm = delta
 End Function
 
-Private Sub WaitForNewContextCapture(ByVal timeoutMs As Long, ByVal methodName As String)
+Private Sub WaitForNewContextCapture(ByVal timeoutMs As Long, _
+                                     ByVal methodName As String, _
+                                     ByVal captureGeneration As Long)
     Dim startTick As Currency
     startTick = socket_.NowTicks()
 
@@ -1106,6 +1143,9 @@ Private Sub WaitForNewContextCapture(ByVal timeoutMs As Long, ByVal methodName A
 
     Do
         ProcessRecorderQueue
+        RequireCurrentCaptureGeneration captureGeneration, methodName, _
+            "The trigger click may already have been dispatched and a new browsing context may " & _
+            "already exist; do not blindly retry the operation."
 
         Dim droppedSinceArm As Long
         droppedSinceArm = NewContextDroppedEventsSinceArm()
@@ -1214,12 +1254,7 @@ End Function
 Private Function TryGetDownloadCorrelationValue(ByVal p As Object, _
                                                 ByVal key As String, _
                                                 ByRef value As String) As Boolean
-    value = vbNullString
-    If p Is Nothing Then Exit Function
-    If Not p.Exists(key) Then Exit Function
-    If IsObject(p(key)) Or IsNull(p(key)) Then Exit Function
-
-    value = CStr(p(key))
+    If Not TryGetScalarTextField(p, key, value) Then Exit Function
     TryGetDownloadCorrelationValue = (Len(value) > 0)
 End Function
 
@@ -1543,7 +1578,9 @@ Private Sub RaiseDownloadBatchFilenameCollision(ByVal methodName As String)
               IIf(Len(m_downloadBatchCollisionSecondCorrelationKey) > 0, m_downloadBatchCollisionSecondCorrelationKey, "(none)") & "."
 End Sub
 
-Private Sub WaitForDownloadBatch(ByVal timeoutMs As Long, ByVal methodName As String)
+Private Sub WaitForDownloadBatch(ByVal timeoutMs As Long, _
+                                 ByVal methodName As String, _
+                                 ByVal captureGeneration As Long)
     Dim stageTick As Currency
     stageTick = socket_.NowTicks()
 
@@ -1551,6 +1588,9 @@ Private Sub WaitForDownloadBatch(ByVal timeoutMs As Long, ByVal methodName As St
     ' already been dispatched, but no download completion has been awaited, so transfers can overlap.
     Do
         ProcessRecorderQueue
+        RequireCurrentCaptureGeneration captureGeneration, methodName, _
+            "Trigger clicks may already have been dispatched and downloads may already have " & _
+            "started; do not blindly retry the operation."
 
         Dim downloadLossStart As Long
         downloadLossStart = DownloadDroppedEventsSinceArm()
@@ -1596,6 +1636,8 @@ Private Sub WaitForDownloadBatch(ByVal timeoutMs As Long, ByVal methodName As St
     ' Stage 2: wait for every accepted transaction to reach a browser-authoritative terminal state.
     Do
         ProcessRecorderQueue
+        RequireCurrentCaptureGeneration captureGeneration, methodName, _
+            "Downloads may already have started or completed; do not blindly retry the operation."
 
         Dim downloadLossCompletion As Long
         downloadLossCompletion = DownloadDroppedEventsSinceArm()
@@ -2108,6 +2150,10 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
     Dim exclusiveCaptureEntered As Boolean
     EnterExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = True
+
+    Dim captureGeneration As Long
+    captureGeneration = m_exclusiveCaptureGeneration
+
     On Error GoTo Failed
 
     ResetDownloadCaptureState
@@ -2136,6 +2182,7 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
     Me.ExecuteSessionSubscribe Array( _
         "browsingContext.downloadWillBegin", _
         "browsingContext.downloadEnd"), , True
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     ' Resolve every trigger before arming so a locator failure causes no download side effect.
     Dim resolvedTriggerIds As New Collection
@@ -2143,9 +2190,11 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
     For Each trigger In triggers
         resolvedTriggerIds.Add ResolveElementSharedId( _
             triggerLocatorKind, trigger, targetCtx, searchTimeoutMs, methodName)
+        RequireCurrentCaptureGeneration captureGeneration, methodName
     Next trigger
 
     ProcessRecorderQueue
+    RequireCurrentCaptureGeneration captureGeneration, methodName
     ArmDownloadBatch targetCtx, resolvedTriggerIds.count, allowCrossContext
     downloadCaptureInitialized = True
 
@@ -2158,6 +2207,10 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
 
     For Each triggerSharedId In resolvedTriggerIds
         ProcessRecorderQueue
+        RequireCurrentCaptureGeneration captureGeneration, methodName, _
+            IIf(m_downloadBatchDispatchCount > 0, _
+                "Earlier trigger clicks may already have been dispatched and downloads may already " & _
+                "have started; do not blindly retry the operation.", vbNullString)
         If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision methodName
 
         Set clickArgs = NewElementArgs(CStr(triggerSharedId))
@@ -2171,6 +2224,10 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
         Err.Clear
         On Error GoTo Failed
 
+        RequireCurrentCaptureGeneration captureGeneration, methodName, _
+            "The trigger click may already have been dispatched and a download may already have " & _
+            "started; do not blindly retry the operation."
+
         If clickErrNum <> 0 Then
             ProcessRecorderQueue
             m_downloadArmed = False
@@ -2181,14 +2238,19 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
         m_downloadBatchDispatchCount = m_downloadBatchDispatchCount + 1
 
         ProcessRecorderQueue
+        RequireCurrentCaptureGeneration captureGeneration, methodName, _
+            "Trigger clicks may already have been dispatched and downloads may already have " & _
+            "started; do not blindly retry the operation."
         If m_downloadBatchFilenameCollision Then RaiseDownloadBatchFilenameCollision methodName
     Next triggerSharedId
 
-    WaitForDownloadBatch vTimeout, methodName
+    WaitForDownloadBatch vTimeout, methodName, captureGeneration
 
     EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
 
     Dim result As Dictionary
+    RequireCurrentCaptureGeneration captureGeneration, methodName, _
+        "Downloads may already have started or completed; do not blindly retry the operation."
     Set result = BuildDownloadBatchResult()
 
     m_downloadBatchActive = False
@@ -2281,15 +2343,12 @@ Private Function RecursiveFrameSearch(ByVal contextList As Collection, _
             Exit Function
         End If
 
-        If ctx.Exists("children") Then
-            If IsObject(ctx("children")) Then
-                If Not ctx("children") Is Nothing Then
-                    childRes = RecursiveFrameSearch(ctx("children"), partialUrl, currentDepth + 1)
-                    If childRes <> "" Then
-                        RecursiveFrameSearch = childRes
-                        Exit Function
-                    End If
-                End If
+        Dim childContexts As Object
+        If TryGetObjectField(ctx, "children", childContexts) Then
+            childRes = RecursiveFrameSearch(childContexts, partialUrl, currentDepth + 1)
+            If childRes <> "" Then
+                RecursiveFrameSearch = childRes
+                Exit Function
             End If
         End If
     Next ctx
@@ -2506,6 +2565,10 @@ Private Function ExecuteOpenNewContextCore(ByVal triggerLocatorKind As ElementLo
     Dim exclusiveCaptureEntered As Boolean
     EnterExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = True
+
+    Dim captureGeneration As Long
+    captureGeneration = m_exclusiveCaptureGeneration
+
     On Error GoTo Failed
 
     Dim vTimeout As Long
@@ -2513,6 +2576,7 @@ Private Function ExecuteOpenNewContextCore(ByVal triggerLocatorKind As ElementLo
 
     Dim ownerCtx As String
     ownerCtx = ResolveTargetContext(ownerContextId)
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     Dim carryoverDiagnosticActive As Boolean
     Dim carryDomSeenBefore As Boolean
@@ -2525,9 +2589,12 @@ Private Function ExecuteOpenNewContextCore(ByVal triggerLocatorKind As ElementLo
     Dim triggerSharedId As String
     triggerSharedId = ResolveElementSharedId( _
         triggerLocatorKind, triggerLocator, ownerCtx, searchTimeoutMs, methodName)
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     ProcessRecorderQueue
-    ArmNewContextCapture ownerCtx
+    RequireCurrentCaptureGeneration captureGeneration, methodName
+    ArmNewContextCapture ownerCtx, captureGeneration, methodName
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     Dim clickArgs As Collection
     Set clickArgs = NewElementArgs(triggerSharedId)
@@ -2544,13 +2611,20 @@ Private Function ExecuteOpenNewContextCore(ByVal triggerLocatorKind As ElementLo
     clickErrDesc = Err.description
     On Error GoTo Failed
 
+    RequireCurrentCaptureGeneration captureGeneration, methodName, _
+        "The trigger click may already have been dispatched and a new browsing context may " & _
+        "already exist; do not blindly retry the operation."
+
     If clickErrNum <> 0 Then
         Err.Raise clickErrNum, clickErrSrc, clickErrDesc
     End If
 
-    WaitForNewContextCapture vTimeout, methodName
+    WaitForNewContextCapture vTimeout, methodName, captureGeneration
 
     Dim result As Dictionary
+    RequireCurrentCaptureGeneration captureGeneration, methodName, _
+        "The trigger click may already have been dispatched and a new browsing context may " & _
+        "already exist; do not blindly retry the operation."
     Set result = BuildNewContextResult()
     ResetNewContextCaptureState
     EndSignalCarryoverDiagnostic methodName, carryoverDiagnosticActive, carryDomSeenBefore, carryNetSeenBefore, carryVisSeenBefore
@@ -2593,7 +2667,11 @@ Public Function ExecuteCreateContext(Optional ByVal createType As BiDiContextTyp
     
     Dim json As Object
     Set json = ValidateProtocolResponse(strRes, "browsingContext.create")
-    ExecuteCreateContext = GetPathString(json, "result.context")
+    ExecuteCreateContext = RequirePathString( _
+        json, "result.context", ERR_BIDI_PROTOCOL, _
+        "BiDi:Protocol:browsingContext.create", _
+        "Successful browsingContext.create response omitted result.context. " & _
+        "A browsing context may have been created but cannot be identified.")
 End Function
 
 Public Function ExecuteCloseContext(ByVal contextId As String) As String
@@ -2663,10 +2741,10 @@ Private Function IsExpectedNoUserPromptResponse(ByVal jsonRaw As String) As Bool
     On Error GoTo 0
 
     If parseErr <> 0 Or json Is Nothing Then Exit Function
-    If Not json.Exists("error") Then Exit Function
-    If IsNull(json("error")) Or IsObject(json("error")) Then Exit Function
 
-    Dim errType As String: errType = LCase$(CStr(json("error")))
+    Dim errType As String
+    If Not TryGetScalarTextField(json, "error", errType) Then Exit Function
+    errType = LCase$(errType)
     IsExpectedNoUserPromptResponse = _
         (StrComp(errType, "no such alert", vbBinaryCompare) = 0 Or _
          StrComp(errType, "no user prompt", vbBinaryCompare) = 0)
@@ -2736,6 +2814,10 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     Dim exclusiveCaptureEntered As Boolean
     EnterExclusiveCaptureOperation METHOD_NAME
     exclusiveCaptureEntered = True
+
+    Dim captureGeneration As Long
+    captureGeneration = m_exclusiveCaptureGeneration
+
     On Error GoTo Failed
 
     If m_navHttpCaptureInProgress Then
@@ -2752,6 +2834,7 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     vMinStable = SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS)
     vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
     targetCtx = ResolveTargetContext(contextId)
+    RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME
 
     Dim responseCompletedAvailableForStatus As Boolean
     Dim deferSettlementForEarlyResponseStartedRelease As Boolean
@@ -2768,11 +2851,13 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         ' navigation/response fields used by HandleNavigationResponseStartedEvent.
         If Not responseCompletedAvailableForStatus Then
             AcquireNavigationResponseStartedSubscription temporaryResponseStartedSubscriptionId
+            RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME
         End If
 
         ' Drain stale events before arming so only events after the arm boundary can satisfy this
         ' transaction.
         ProcessRecorderQueue
+        RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME
         ArmNavigationHttpCapture targetCtx
     Else
         ResetNavigationHttpCaptureState
@@ -2802,6 +2887,10 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     Dim navigationAcceptedViaSupersession As Boolean
 
     For attempt = 0 To MAX_NAV_RETRIES
+        RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
+            IIf(navigationAccepted, _
+                "browsingContext.navigate may already have been accepted; do not blindly retry " & _
+                "the operation.", vbNullString)
         On Error Resume Next
         Err.Clear
         rawNavigate = ExecuteBrowsingContextNavigate(targetUrl, modeStr, _
@@ -2811,6 +2900,9 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         navSrc = Err.source
         Err.Clear
         On Error GoTo Failed
+
+        RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
+            "browsingContext.navigate may already have been accepted; do not blindly retry the operation."
 
         If navErr = ERR_CONSENSUS_HALT Then Err.Raise navErr, navSrc, navDesc
 
@@ -2834,6 +2926,9 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
 
         If IsRetryableNavFailure(navDesc) And attempt < MAX_NAV_RETRIES Then
             WaitHeartbeat 1000
+            RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
+                "browsingContext.navigate may already have been accepted; do not blindly retry " & _
+                "the operation."
         Else
             Exit For
         End If
@@ -2862,6 +2957,9 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
         ' Discovery recording prioritizes complete RES/BODY observation over the former
         ' payload-reduction optimization that temporarily paused this event stream.
         SettleAfterNavigation targetCtx, vMinStable, vMaxTimeout
+        RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
+            "browsingContext.navigate may already have been accepted; do not blindly retry " & _
+            "the operation."
     End If
 
     Dim resultText As String
@@ -2873,6 +2971,8 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
 
     ' Drain buffered correlated network response events before deciding status availability.
     ProcessRecorderQueue
+    RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
+        "browsingContext.navigate may already have been accepted; do not blindly retry the operation."
 
     If m_navHttpCaptureStatusKnown Then
         resultText = CStr(m_navHttpCaptureStatus)
@@ -2905,6 +3005,8 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
               "; URL=" & m_navHttpCaptureExpectedUrl & "."
 
 succeeded:
+    RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
+        "browsingContext.navigate may already have been accepted; do not blindly retry the operation."
     ExecuteNavigateAndGetStatus = resultText
     GoTo Cleanup
 
@@ -3295,11 +3397,10 @@ Public Function ExecuteSessionSubscribe(ByVal events As Variant, _
 
             Dim subscribeJson As Object
             Set subscribeJson = ValidateProtocolResponse(strRes, "session.subscribe")
-            subId = GetPathString(subscribeJson, "result.subscription")
-            If Len(subId) = 0 Then
-                Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:session.subscribe", _
-                          "Successful session.subscribe response omitted result.subscription."
-            End If
+            subId = RequirePathString( _
+                subscribeJson, "result.subscription", ERR_BIDI_PROTOCOL, _
+                "BiDi:Protocol:session.subscribe", _
+                "Successful session.subscribe response omitted result.subscription.")
 
             For i = 0 To UBound(finalArr)
                 m_activeSubscriptions(finalArr(i) & ctxId) = subId
@@ -3746,11 +3847,7 @@ Private Sub HandleNavigationResponseStartedEvent(ByVal json As Object)
     If responseObj Is Nothing Then Exit Sub
 
     Dim responseUrl As String
-    If responseObj.Exists("url") Then
-        If Not IsObject(responseObj("url")) And Not IsNull(responseObj("url")) Then
-            responseUrl = CStr(responseObj("url"))
-        End If
-    End If
+    Call TryGetScalarTextField(responseObj, "url", responseUrl)
 
     ' The network event itself must also identify an HTTP(S) response. This prevents a synthetic
     ' response.status attached to a non-HTTP scheme from being exposed as an HTTP status code.
@@ -3775,11 +3872,7 @@ Private Sub HandleNavigationResponseStartedEvent(ByVal json As Object)
     m_navHttpCaptureStatus = CLng(responseObj("status"))
     m_navHttpCaptureRedirectCount = redirectCount
 
-    If responseObj.Exists("statusText") Then
-        If Not IsObject(responseObj("statusText")) And Not IsNull(responseObj("statusText")) Then
-            m_navHttpCaptureStatusText = CStr(responseObj("statusText"))
-        End If
-    End If
+    Call TryGetScalarTextField(responseObj, "statusText", m_navHttpCaptureStatusText)
 
     m_navHttpCaptureResponseUrl = responseUrl
 End Sub
@@ -4041,12 +4134,17 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
     Dim exclusiveCaptureEntered As Boolean
     EnterExclusiveCaptureOperation methodName
     exclusiveCaptureEntered = True
+
+    Dim captureGeneration As Long
+    captureGeneration = m_exclusiveCaptureGeneration
+
     On Error GoTo Failed
 
     ResetLastSyncState
 
     Dim targetCtx As String
     targetCtx = ResolveTargetContext(contextId)
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     If AnySignalArmed() Then
         If Len(m_signalOwnerContextId) = 0 Or _
@@ -4066,6 +4164,7 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
                       "interception could not be confirmed disabled. Call Shutdown or " & _
                       "reconnect before starting another file-selection operation."
         End If
+        RequireCurrentCaptureGeneration captureGeneration, methodName
     End If
 
     Dim paths As Variant
@@ -4086,27 +4185,37 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
     vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
 
     Me.ExecuteSessionSubscribe Array("input.fileDialogOpened"), , True
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     ' Resolve before arming so locator work cannot consume an unrelated chooser event.
     Dim triggerSharedId As String
     triggerSharedId = ResolveElementSharedId( _
         triggerLocatorKind, triggerLocator, targetCtx, searchTimeoutMs, callerName)
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     Dim fileChooserCdpSessionId As String
     fileChooserCdpSessionId = GetCdpSessionIdForContext(targetCtx)
+    RequireCurrentCaptureGeneration captureGeneration, methodName
     BeginNativeFileChooserInterception targetCtx, fileChooserCdpSessionId
+    RequireCurrentCaptureGeneration captureGeneration, methodName, _
+        "Native file-chooser interception may already be active; do not blindly retry the operation."
 
     ProcessRecorderQueue
+    RequireCurrentCaptureGeneration captureGeneration, methodName
     ArmFileDialogCapture targetCtx
+    RequireCurrentCaptureGeneration captureGeneration, methodName
 
     Dim clickArgs As Collection
     Set clickArgs = NewElementArgs(triggerSharedId)
 
     ' The chooser trigger requires real user activation.
     Dim clickResult As String
+    RequireCurrentCaptureGeneration captureGeneration, methodName
     clickResult = PerformTrustedClick(targetCtx, clickArgs, vMaxTimeout, False)
+    RequireCurrentCaptureGeneration captureGeneration, methodName, _
+        "The chooser trigger may already have been dispatched; do not blindly retry the operation."
 
-    If Not WaitForFileDialogCapture(vDialogTimeout) Then
+    If Not WaitForFileDialogCapture(vDialogTimeout, captureGeneration, methodName) Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "FileDialogTimeout: input.fileDialogOpened was not observed within " & _
                   vDialogTimeout & "ms."
@@ -4133,12 +4242,16 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
     capturedSharedId = m_fileDlgSharedId
 
     Dim setFilesResult As String
+    RequireCurrentCaptureGeneration captureGeneration, methodName, _
+        "The chooser trigger may already have been dispatched; do not blindly retry the operation."
     setFilesResult = PerformSetFiles(targetCtx, capturedSharedId, paths, _
                                      vMaxTimeout, False, vMinStable)
 
     Dim selectionApplied As Boolean
     selectionApplied = True
 
+    RequireCurrentCaptureGeneration captureGeneration, methodName, _
+        "input.setFiles may already have been applied; do not blindly retry the operation."
     ResetFileDialogCaptureState
 
     If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
@@ -4274,12 +4387,16 @@ Private Function FileDialogDroppedEventsSinceArm() As Long
     FileDialogDroppedEventsSinceArm = delta
 End Function
 
-Private Function WaitForFileDialogCapture(ByVal timeoutMs As Long) As Boolean
+Private Function WaitForFileDialogCapture(ByVal timeoutMs As Long, _
+                                          ByVal captureGeneration As Long, _
+                                          ByVal methodName As String) As Boolean
     Dim startTick As Currency
     startTick = socket_.NowTicks()
 
     Do
         ProcessRecorderQueue
+        RequireCurrentCaptureGeneration captureGeneration, methodName, _
+            "The chooser trigger may already have been dispatched; do not blindly retry the operation."
 
         Dim droppedSinceArm As Long
         droppedSinceArm = FileDialogDroppedEventsSinceArm()
@@ -4338,12 +4455,11 @@ Private Function GetCdpSessionIdForContext(ByVal contextId As String) As String
     Set json = ValidateProtocolResponse(raw, "goog:cdp.getSession")
 
     Dim sessionId As String
-    sessionId = GetPathString(json, "result.session")
-    If Len(sessionId) = 0 Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:ExecuteSetFileSelectionViaDialog", _
-                  "NativeFileChooserInterceptionUnavailable: goog:cdp.getSession returned no " & _
-                  "CDP session for context " & targetCtx & "."
-    End If
+    sessionId = RequirePathString( _
+        json, "result.session", ERR_BIDI_PROTOCOL, _
+        "BiDi:ExecuteSetFileSelectionViaDialog", _
+        "NativeFileChooserInterceptionUnavailable: goog:cdp.getSession returned no " & _
+        "CDP session for context " & targetCtx & ".")
 
     ' Keep the existing main-context cache coherent for unrelated CDP features.
     If StrComp(targetCtx, m_mainContextId, vbBinaryCompare) = 0 Then
@@ -4633,12 +4749,9 @@ Private Sub CollectContextIdsForCleanup(ByVal nodes As Collection, ByRef output 
     For Each node In nodes
         If IsObject(node) Then
             If node.Exists("context") Then output.Add CStr(node("context"))
-            If node.Exists("children") Then
-                If IsObject(node("children")) Then
-                    If Not node("children") Is Nothing Then
-                        CollectContextIdsForCleanup node("children"), output
-                    End If
-                End If
+            Dim childContexts As Object
+            If TryGetObjectField(node, "children", childContexts) Then
+                CollectContextIdsForCleanup childContexts, output
             End If
         End If
     Next node
@@ -5057,11 +5170,10 @@ Private Function TryResolveUniqueVisibleRoleOptionDeepOnce(ByVal optionText As S
 
     If resultType = "node" Then
         Dim sid As String
-        sid = GetPathString(json, "result.result.sharedId")
-        If Len(sid) = 0 Then
-            Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveUniqueVisibleRoleOptionDeepOnce", _
-                      "Deep role-option resolver returned a node without sharedId."
-        End If
+        sid = RequirePathString( _
+            json, "result.result.sharedId", ERR_BIDI_PROTOCOL, _
+            "BiDi:TryResolveUniqueVisibleRoleOptionDeepOnce", _
+            "Deep role-option resolver returned a node without sharedId.")
 
         state = "unique"
         candidateCount = 1
@@ -5342,11 +5454,10 @@ Private Function TryResolveShadowElementSharedIdOnce(ByVal selectorsArray As Var
     End If
 
     Dim sid As String
-    sid = GetPathString(json, "result.result.sharedId")
-    If Len(sid) = 0 Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveShadowElementSharedIdOnce", _
-                  "Shadow resolver returned a node without sharedId."
-    End If
+    sid = RequirePathString( _
+        json, "result.result.sharedId", ERR_BIDI_PROTOCOL, _
+        "BiDi:TryResolveShadowElementSharedIdOnce", _
+        "Shadow resolver returned a node without sharedId.")
 
     TryResolveShadowElementSharedIdOnce = sid
 End Function
@@ -6385,10 +6496,11 @@ Private Function TryReleaseDeferredSubscriptionId(ByVal subscriptionId As String
                   "session.unsubscribe returned malformed JSON during deferred cleanup."
     End If
 
-    If json.Exists("error") Then
+    Dim errType As String
+    If TryGetScalarTextField(json, "error", errType) Then
         ' By-ID unsubscribe reports invalid argument when this one ID is no longer known. For a
         ' single server-issued ID that is exactly the cleanup condition we need to establish.
-        If StrComp(LCase$(CStr(json("error"))), "invalid argument", vbBinaryCompare) = 0 Then
+        If StrComp(LCase$(errType), "invalid argument", vbBinaryCompare) = 0 Then
             TryReleaseDeferredSubscriptionId = True
             Exit Function
         End If
@@ -6729,11 +6841,10 @@ Public Function UpdateMainContextId(Optional ByVal forceRefresh As Boolean = Fal
     End If
 
     Dim contextId As String
-    contextId = GetPathString(onlyContext, "context")
-    If Len(contextId) = 0 Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:UpdateMainContextId", _
-                  "The only top-level browsing context has no context ID."
-    End If
+    contextId = RequirePathString( _
+        onlyContext, "context", ERR_ACTION_FAILED, _
+        "BiDi:UpdateMainContextId", _
+        "The only top-level browsing context has no context ID.")
 
     m_mainContextId = contextId
     m_lostMainContextId = ""
@@ -6902,12 +7013,9 @@ Private Sub CacheContextTreeIds(ByVal contextList As Collection, _
         contextId = GetPathString(ctx, "context")
         If Len(contextId) > 0 Then m_validatedContexts(contextId) = True
 
-        If ctx.Exists("children") Then
-            If IsObject(ctx("children")) Then
-                If Not ctx("children") Is Nothing Then
-                    CacheContextTreeIds ctx("children"), currentDepth + 1
-                End If
-            End If
+        Dim childContexts As Object
+        If TryGetObjectField(ctx, "children", childContexts) Then
+            CacheContextTreeIds childContexts, currentDepth + 1
         End If
     Next ctx
     Exit Sub
@@ -6951,16 +7059,13 @@ Private Function FindContextInfoExactId(ByVal contextList As Collection, _
             Exit Function
         End If
 
-        If ctx.Exists("children") Then
-            If IsObject(ctx("children")) Then
-                If Not ctx("children") Is Nothing Then
-                    Dim childMatch As Dictionary
-                    Set childMatch = FindContextInfoExactId(ctx("children"), targetContextId, currentDepth + 1)
-                    If Not childMatch Is Nothing Then
-                        Set FindContextInfoExactId = childMatch
-                        Exit Function
-                    End If
-                End If
+        Dim childContexts As Object
+        If TryGetObjectField(ctx, "children", childContexts) Then
+            Dim childMatch As Dictionary
+            Set childMatch = FindContextInfoExactId(childContexts, targetContextId, currentDepth + 1)
+            If Not childMatch Is Nothing Then
+                Set FindContextInfoExactId = childMatch
+                Exit Function
             End If
         End If
     Next ctx
@@ -6998,15 +7103,12 @@ Private Function ContextTreeContainsExactId(ByVal contextList As Collection, _
             End If
         End If
 
-        If ctx.Exists("children") Then
-            If IsObject(ctx("children")) Then
-                If Not ctx("children") Is Nothing Then
-                    If ContextTreeContainsExactId(ctx("children"), targetContextId, _
-                                                 currentDepth + 1) Then
-                        ContextTreeContainsExactId = True
-                        Exit Function
-                    End If
-                End If
+        Dim childContexts As Object
+        If TryGetObjectField(ctx, "children", childContexts) Then
+            If ContextTreeContainsExactId(childContexts, targetContextId, _
+                                         currentDepth + 1) Then
+                ContextTreeContainsExactId = True
+                Exit Function
             End If
         End If
     Next ctx
@@ -7532,11 +7634,10 @@ Private Function TryAddAutoClickerPreload(ByVal registrationKey As String, _
     Dim json As Object
     Set json = ValidateProtocolResponse(strRes, "script.addPreloadScript")
 
-    scriptId = GetPathString(json, "result.script")
-    If Len(scriptId) = 0 Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:script.addPreloadScript", _
-                  "AutoClicker preload registration succeeded without returning result.script."
-    End If
+    scriptId = RequirePathString( _
+        json, "result.script", ERR_BIDI_PROTOCOL, _
+        "BiDi:Protocol:script.addPreloadScript", _
+        "AutoClicker preload registration succeeded without returning result.script.")
 
     TryAddAutoClickerPreload = True
     Exit Function
@@ -7647,8 +7748,9 @@ Private Function TryRemovePreloadScript(ByVal scriptId As String, _
                   "script.removePreloadScript returned malformed JSON."
     End If
 
-    If json.Exists("error") Then
-        If StrComp(LCase$(CStr(json("error"))), "no such script", vbBinaryCompare) = 0 Then
+    Dim errType As String
+    If TryGetScalarTextField(json, "error", errType) Then
+        If StrComp(LCase$(errType), "no such script", vbBinaryCompare) = 0 Then
             TryRemovePreloadScript = True
             Exit Function
         End If
@@ -7817,11 +7919,11 @@ Private Function GetRequestHeaderValue(ByVal reqObj As Object, _
                                        ByVal headerNameWanted As String) As String
     On Error GoTo CleanFail
     If reqObj Is Nothing Then Exit Function
-    If Not reqObj.Exists("headers") Then Exit Function
-    If Not IsObject(reqObj("headers")) Then Exit Function
+    Dim headersObj As Object
+    If Not TryGetObjectField(reqObj, "headers", headersObj) Then Exit Function
 
     Dim hdr As Variant
-    For Each hdr In reqObj("headers")
+    For Each hdr In headersObj
         If IsObject(hdr) Then
             Dim headerName As String
             headerName = GetPathString(hdr, "name")
@@ -8091,19 +8193,20 @@ Public Function ProbeNetworkDataCollection(ByVal dataType As String, _
     If m_debugMode Then Debug.Print "BiDi Body Probe: network.addDataCollector(" & dataType & ") supported."
 End Function
 
-Private Sub BumpBodySkipSummary(ByVal reason As String, _
-                                ByVal method As String, _
-                                ByVal normalizedKey As String, _
-                                ByVal mime As String, _
-                                ByVal requestId As String)
-    If m_bodySkipSummary Is Nothing Then Set m_bodySkipSummary = New Dictionary
+Private Sub BumpBodySkipSummaryCore(ByRef summary As Dictionary, _
+                                    ByVal reason As String, _
+                                    ByVal method As String, _
+                                    ByVal normalizedKey As String, _
+                                    ByVal mime As String, _
+                                    ByVal requestId As String)
+    If summary Is Nothing Then Set summary = New Dictionary
 
     Dim summaryKey As String
     summaryKey = LCase$(reason) & "|" & UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(mime)
 
     Dim item As Dictionary
-    If m_bodySkipSummary.Exists(summaryKey) Then
-        Set item = m_bodySkipSummary(summaryKey)
+    If summary.Exists(summaryKey) Then
+        Set item = summary(summaryKey)
         item("count") = CLng(item("count")) + 1
         Exit Sub
     End If
@@ -8115,7 +8218,15 @@ Private Sub BumpBodySkipSummary(ByVal reason As String, _
     item.Add "mime", mime
     item.Add "firstId", requestId
     item.Add "count", 1
-    m_bodySkipSummary.Add summaryKey, item
+    summary.Add summaryKey, item
+End Sub
+
+Private Sub BumpBodySkipSummary(ByVal reason As String, _
+                                ByVal method As String, _
+                                ByVal normalizedKey As String, _
+                                ByVal mime As String, _
+                                ByVal requestId As String)
+    BumpBodySkipSummaryCore m_bodySkipSummary, reason, method, normalizedKey, mime, requestId
 End Sub
 
 Private Sub ConsiderResponseBodyCandidate(ByVal params As Object, _
@@ -8219,26 +8330,7 @@ Private Sub BumpRequestBodySkipSummary(ByVal reason As String, _
                                        ByVal normalizedKey As String, _
                                        ByVal contentType As String, _
                                        ByVal requestId As String)
-    If m_requestBodySkipSummary Is Nothing Then Set m_requestBodySkipSummary = New Dictionary
-
-    Dim summaryKey As String
-    summaryKey = LCase$(reason) & "|" & UCase$(method) & "|" & LCase$(normalizedKey) & "|" & LCase$(contentType)
-
-    Dim item As Dictionary
-    If m_requestBodySkipSummary.Exists(summaryKey) Then
-        Set item = m_requestBodySkipSummary(summaryKey)
-        item("count") = CLng(item("count")) + 1
-        Exit Sub
-    End If
-
-    Set item = New Dictionary
-    item.Add "reason", reason
-    item.Add "method", method
-    item.Add "key", normalizedKey
-    item.Add "mime", contentType
-    item.Add "firstId", requestId
-    item.Add "count", 1
-    m_requestBodySkipSummary.Add summaryKey, item
+    BumpBodySkipSummaryCore m_requestBodySkipSummary, reason, method, normalizedKey, contentType, requestId
 End Sub
 
 Private Sub ConsiderRequestBodyCandidate(ByVal params As Object, _
@@ -8338,22 +8430,24 @@ Private Function CompactBodyDiagnostic(ByVal value As String) As String
     CompactBodyDiagnostic = s
 End Function
 
-Private Function TryGetCapturedResponseBody(ByVal candidate As Dictionary, _
-                                            ByRef bodyText As String, _
-                                            ByRef failureReason As String, _
-                                            ByRef failureDetail As String) As Boolean
+Private Function TryGetCapturedBody(ByVal dataType As String, _
+                                    ByVal collectorId As String, _
+                                    ByVal candidate As Dictionary, _
+                                    ByRef bodyText As String, _
+                                    ByRef failureReason As String, _
+                                    ByRef failureDetail As String) As Boolean
     bodyText = vbNullString
     failureReason = vbNullString
     failureDetail = vbNullString
 
-    If Len(m_bodyCollectorId) = 0 Then
+    If Len(collectorId) = 0 Then
         failureReason = "collector-unavailable"
         Exit Function
     End If
 
     Dim params As New Dictionary
-    params.Add "dataType", "response"
-    params.Add "collector", m_bodyCollectorId
+    params.Add "dataType", dataType
+    params.Add "collector", collectorId
     params.Add "disown", True
     params.Add "request", CStr(candidate("requestId"))
 
@@ -8410,94 +8504,25 @@ Private Function TryGetCapturedResponseBody(ByVal candidate As Dictionary, _
         Exit Function
     End If
 
-    If bytesObj.Exists("value") Then
-        If Not IsObject(bytesObj("value")) And Not IsNull(bytesObj("value")) Then
-            bodyText = CStr(bytesObj("value"))
-        End If
-    End If
+    Call TryGetScalarTextField(bytesObj, "value", bodyText)
 
-    TryGetCapturedResponseBody = True
+    TryGetCapturedBody = True
+End Function
+
+Private Function TryGetCapturedResponseBody(ByVal candidate As Dictionary, _
+                                            ByRef bodyText As String, _
+                                            ByRef failureReason As String, _
+                                            ByRef failureDetail As String) As Boolean
+    TryGetCapturedResponseBody = TryGetCapturedBody( _
+        "response", m_bodyCollectorId, candidate, bodyText, failureReason, failureDetail)
 End Function
 
 Private Function TryGetCapturedRequestBody(ByVal candidate As Dictionary, _
                                            ByRef bodyText As String, _
                                            ByRef failureReason As String, _
                                            ByRef failureDetail As String) As Boolean
-    bodyText = vbNullString
-    failureReason = vbNullString
-    failureDetail = vbNullString
-
-    If Len(m_requestBodyCollectorId) = 0 Then
-        failureReason = "collector-unavailable"
-        Exit Function
-    End If
-
-    Dim params As New Dictionary
-    params.Add "dataType", "request"
-    params.Add "collector", m_requestBodyCollectorId
-    params.Add "disown", True
-    params.Add "request", CStr(candidate("requestId"))
-
-    Dim rawRes As String
-    Dim parsed As Object
-    Dim errNum As Long
-    Dim errDesc As String
-
-    On Error Resume Next
-    rawRes = ExecuteBiDiCommand("network.getData", params, True, _
-                                allowAmbiguousRetry:=False, _
-                                allowRecoveryRetry:=False, _
-                                allowContextRetarget:=False, _
-                                commandTimeoutMs:=BODY_GETDATA_TIMEOUT_MS)
-    errNum = Err.Number
-    errDesc = Err.description
-    Err.Clear
-    If errNum = 0 Then Set parsed = ValidateProtocolResponse(rawRes, "network.getData")
-    If Err.Number <> 0 Then
-        errNum = Err.Number
-        errDesc = Err.description
-        Err.Clear
-    End If
-    On Error GoTo 0
-
-    If errNum <> 0 Or parsed Is Nothing Then
-        failureDetail = CompactBodyDiagnostic(errDesc)
-        If errNum = 608 Then
-            failureReason = "transport-oversize"
-        ElseIf InStr(1, errDesc, "CommandCorrelationTimeout:", vbBinaryCompare) > 0 Then
-            failureReason = "timeout"
-        ElseIf InStr(1, LCase$(errDesc), "unavailable network data", vbBinaryCompare) > 0 Or _
-               InStr(1, LCase$(errDesc), "no such network data", vbBinaryCompare) > 0 Then
-            failureReason = "unavailable"
-        Else
-            failureReason = "protocol"
-        End If
-        Exit Function
-    End If
-
-    Dim bytesObj As Object
-    Set bytesObj = GetPathObject(parsed, "result.bytes")
-    If bytesObj Is Nothing Then
-        failureReason = "invalid-result"
-        failureDetail = "network.getData returned no result.bytes object."
-        Exit Function
-    End If
-
-    Dim bytesType As String
-    bytesType = GetPathString(bytesObj, "type")
-    If StrComp(bytesType, "string", vbBinaryCompare) <> 0 Then
-        failureReason = "non-text"
-        failureDetail = "BytesValue type=" & IIf(Len(bytesType) > 0, bytesType, "(missing)")
-        Exit Function
-    End If
-
-    If bytesObj.Exists("value") Then
-        If Not IsObject(bytesObj("value")) And Not IsNull(bytesObj("value")) Then
-            bodyText = CStr(bytesObj("value"))
-        End If
-    End If
-
-    TryGetCapturedRequestBody = True
+    TryGetCapturedRequestBody = TryGetCapturedBody( _
+        "request", m_requestBodyCollectorId, candidate, bodyText, failureReason, failureDetail)
 End Function
 
 
@@ -10240,12 +10265,10 @@ Private Sub ProcessDiscoverySpaProbeChanges(ByVal probe As Dictionary)
     If probe Is Nothing Then Exit Sub
     If Not probe.Exists("version") Then Exit Sub
     If CLng(probe("version")) <> SPA_PROBE_VERSION Then Exit Sub
-    If Not probe.Exists("changes") Then Exit Sub
-    If Not IsObject(probe("changes")) Then Exit Sub
-
+    Dim changesObj As Object
+    If Not TryGetObjectField(probe, "changes", changesObj) Then Exit Sub
     Dim changes As Collection
-    Set changes = probe("changes")
-    If changes Is Nothing Then Exit Sub
+    Set changes = changesObj
     If changes.count = 0 Then Exit Sub
 
     Dim v As Variant
@@ -10286,17 +10309,10 @@ Private Sub RecordDispatchEventLoss(ByVal json As Object, ByRef detectedMethod A
         Exit Sub
     End If
 
-    If Not json.Exists("method") Then
+    If Not TryGetScalarTextField(json, "method", detectedMethod) Then
         IncrementDispatchLossCounter m_dispatchUnknownCriticalEventLossCount
         Exit Sub
     End If
-
-    If IsObject(json("method")) Or IsNull(json("method")) Or IsEmpty(json("method")) Then
-        IncrementDispatchLossCounter m_dispatchUnknownCriticalEventLossCount
-        Exit Sub
-    End If
-
-    detectedMethod = CStr(json("method"))
     If Len(detectedMethod) = 0 Then
         IncrementDispatchLossCounter m_dispatchUnknownCriticalEventLossCount
         Exit Sub
@@ -10429,11 +10445,50 @@ Private Function TryGetCachedRecorderRequest(ByVal requestId As String, _
     TryGetCachedRecorderRequest = (Len(rawUrl) > 0 Or Len(normalizedKey) > 0)
 End Function
 
+' JSON field access policy (keep these three categories distinct):
+'   TryGet...Field   : optional field. Missing/Null/wrong kind -> False, caller decides.
+'   Require...       : mandatory field. Missing/Null/Object/empty -> raise with (path: state).
+'   Direct CStr(...) : intentionally left where an invalid type MUST raise and flow into
+'                      the existing error/event-loss path. Do not convert these to TryGet;
+'                      doing so silently turns a detected protocol violation into a skip.
+Private Function TryGetObjectField(ByVal source As Object, _
+                                   ByVal key As String, _
+                                   ByRef value As Object) As Boolean
+    Set value = Nothing
+    If source Is Nothing Then Exit Function
+    If Not source.Exists(key) Then Exit Function
+    If Not IsObject(source(key)) Then Exit Function
+
+    Dim candidate As Object
+    Set candidate = source(key)
+    If candidate Is Nothing Then Exit Function
+
+    Set value = candidate
+    TryGetObjectField = True
+End Function
+
+Private Function TryGetScalarTextField(ByVal source As Object, _
+                                   ByVal key As String, _
+                                   ByRef value As String) As Boolean
+    ' Accepts any non-Null, non-object scalar that CStr can represent.
+    ' This is intentionally not a strict vbString validator.
+    value = vbNullString
+    If source Is Nothing Then Exit Function
+    If Not source.Exists(key) Then Exit Function
+
+    Dim v As Variant
+    Assign v, source(key)
+    If IsObject(v) Or IsNull(v) Or IsEmpty(v) Or IsError(v) Then Exit Function
+
+    value = CStr(v)
+    TryGetScalarTextField = True
+End Function
+
 Private Sub FormatAndStoreLog(ByVal json As Object)
     ' Guard keys explicitly; blanket OERN would hide malformed event structures.
 
-    If Not json.Exists("method") Then Exit Sub
-    Dim method As String: method = json("method")
+    Dim method As String
+    If Not TryGetScalarTextField(json, "method", method) Then Exit Sub
 
     Select Case method
         Case "network.responseCompleted", "network.fetchError", "browsingContext.load", "browsingContext.domContentLoaded", "log.entryAdded", "network.beforeRequestSent"
@@ -10445,27 +10500,23 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
     Dim LogLine As String
     Dim relTime As String
 
-    If Not json.Exists("params") Then Exit Sub
-    Set params = json("params")
+    If Not TryGetObjectField(json, "params", params) Then Exit Sub
 
     relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
 
     Select Case method
         Case "network.responseCompleted"
-            If Not params.Exists("response") Then Exit Sub
-            If Not IsObject(params("response")) Then Exit Sub
-            Dim res As Object: Set res = params("response")
-            If Not res.Exists("url") Then Exit Sub
-            If Not res.Exists("mimeType") Then Exit Sub
-            Dim resUrl As String: resUrl = CStr(res("url"))
-            Dim mime As String: mime = CStr(res("mimeType"))
+            Dim res As Object
+            If Not TryGetObjectField(params, "response", res) Then Exit Sub
+            Dim resUrl As String
+            Dim mime As String
+            If Not TryGetScalarTextField(res, "url", resUrl) Then Exit Sub
+            If Not TryGetScalarTextField(res, "mimeType", mime) Then Exit Sub
             Dim resKey As String: resKey = NormalizeEndpointKey(resUrl)
             Dim resId As String: resId = ""
-            If params.Exists("request") Then
-                If IsObject(params("request")) Then
-                    If params("request").Exists("request") Then resId = CStr(params("request")("request"))
-                End If
-            End If
+            Dim resReq As Object
+            If TryGetObjectField(params, "request", resReq) Then _
+                Call TryGetScalarTextField(resReq, "request", resId)
             TrackRecorderRequestHopTerminal params, resId
 
             If m_excludeResources Then
@@ -10476,7 +10527,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             End If
 
             Dim resStatus As String: resStatus = ""
-            If res.Exists("status") Then resStatus = CStr(res("status"))
+            Call TryGetScalarTextField(res, "status", resStatus)
             LogLine = "[" & relTime & "] [RES] " & resStatus & " [" & mime & "] | id=" & ShortId(resId) & _
                       " | key=" & resKey & " | idle=" & IIf(IsIdleIgnored(resUrl), "skip", "track")
 
@@ -10499,13 +10550,12 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             End If
 
         Case "network.beforeRequestSent"
-            If Not params.Exists("request") Then Exit Sub
-            If Not IsObject(params("request")) Then Exit Sub
-            Dim reqObj As Object: Set reqObj = params("request")
-            If Not reqObj.Exists("url") Then Exit Sub
-            Dim reqUrl As String: reqUrl = CStr(reqObj("url"))
+            Dim reqObj As Object
+            If Not TryGetObjectField(params, "request", reqObj) Then Exit Sub
+            Dim reqUrl As String
+            If Not TryGetScalarTextField(reqObj, "url", reqUrl) Then Exit Sub
             Dim reqId As String: reqId = ""
-            If reqObj.Exists("request") Then reqId = CStr(reqObj("request"))
+            Call TryGetScalarTextField(reqObj, "request", reqId)
             TrackRecorderRequestHopStart params, reqId
 
             ' Cache correlation before output suppression. fetchError may omit/replace URL even when
@@ -10516,7 +10566,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                 If IsNoiseUrl(reqUrl) Then BumpSuppressed NormalizeEndpointKey(reqUrl), IIf(IsIdleIgnored(reqUrl), "skip", "track"): Exit Sub
             End If
             Dim reqMethod As String: reqMethod = ""
-            If reqObj.Exists("method") Then reqMethod = CStr(reqObj("method"))
+            Call TryGetScalarTextField(reqObj, "method", reqMethod)
             LogLine = "[" & relTime & "] [REQ] " & reqMethod & " | id=" & ShortId(reqId) & _
                       " | key=" & NormalizeEndpointKey(reqUrl) & _
                       " | idle=" & IIf(IsIdleIgnored(reqUrl), "skip", "track")
@@ -10530,16 +10580,15 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
         Case "network.fetchError"
             ' Log blocker matches as [BLOCK] and all other fetch failures as [ERR]. Chromium can
             ' omit the URL here, so fall back to the beforeRequestSent correlation cache.
-            If Not params.Exists("request") Then Exit Sub
-            If Not IsObject(params("request")) Then Exit Sub
-            Dim ferReq As Object: Set ferReq = params("request")
+            Dim ferReq As Object
+            If Not TryGetObjectField(params, "request", ferReq) Then Exit Sub
 
             Dim ferId As String: ferId = ""
-            If ferReq.Exists("request") Then ferId = CStr(ferReq("request"))
+            Call TryGetScalarTextField(ferReq, "request", ferId)
             TrackRecorderRequestHopTerminal params, ferId
 
             Dim ferUrl As String
-            If ferReq.Exists("url") Then ferUrl = CStr(ferReq("url"))
+            Call TryGetScalarTextField(ferReq, "url", ferUrl)
             Dim ferKey As String
             If Len(ferUrl) > 0 And StrComp(ferUrl, "UNKNOWN", vbTextCompare) <> 0 Then
                 ferKey = NormalizeEndpointKey(ferUrl)
@@ -10578,7 +10627,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                           " | idle=" & ferIdle
             Else
                 Dim ferErr As String: ferErr = ""
-                If params.Exists("errorText") Then ferErr = CStr(params("errorText"))
+                Call TryGetScalarTextField(params, "errorText", ferErr)
                 If Len(ferErr) = 0 Then ferErr = "(empty)"
                 LogLine = "[" & relTime & "] [ERR] " & ferErr & _
                           " | id=" & ShortId(ferId) & _
@@ -10587,19 +10636,21 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             End If
 
         Case "browsingContext.load", "browsingContext.domContentLoaded"
-            If Not params.Exists("url") Then Exit Sub
+            Dim navUrl As String
+            If Not TryGetScalarTextField(params, "url", navUrl) Then Exit Sub
             ' Normalize navigation URLs so opaque authentication payloads cannot bloat the log.
-            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(CStr(params("url")))
+            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(navUrl)
 
             ' A document load clears all carryover state; same-document SPA transitions do not.
             m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
             m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
 
         Case "log.entryAdded"
-            If Not params.Exists("level") Then Exit Sub
-            If CStr(params("level")) = "error" Then
+            Dim logLevel As String
+            If Not TryGetScalarTextField(params, "level", logLevel) Then Exit Sub
+            If logLevel = "error" Then
                 Dim logText As String: logText = ""
-                If params.Exists("text") Then logText = CStr(params("text"))
+                Call TryGetScalarTextField(params, "text", logText)
                 If Len(logText) > MAX_CONSOLE_LOG_TEXT_SIZE Then _
                     logText = Left$(logText, MAX_CONSOLE_LOG_TEXT_SIZE) & "...(truncated)"
                 LogLine = "[" & relTime & "] [CONSOLE-ERR] " & logText
@@ -11042,12 +11093,11 @@ Private Function IsSpaProbeReady(ByVal probe As Dictionary) As Boolean
     If Not CBool(probe("active")) Then Exit Function
     If Not probe.Exists("version") Then Exit Function
     If CLng(probe("version")) <> SPA_PROBE_VERSION Then Exit Function
-    If Not probe.Exists("health") Then Exit Function
-    If Not IsObject(probe("health")) Then Exit Function
+    Dim healthObj As Object
+    If Not TryGetObjectField(probe, "health", healthObj) Then Exit Function
 
     Dim health As Dictionary
-    Set health = probe("health")
-    If health Is Nothing Then Exit Function
+    Set health = healthObj
 
     If Not health.Exists("versionOk") Then Exit Function
     If Not health.Exists("fetchWrapped") Then Exit Function
@@ -11117,9 +11167,7 @@ Private Function BuildSpaProbeHealthSummary(ByVal probe As Dictionary) As String
     End If
 
     Dim health As Object
-    If probe.Exists("health") Then
-        If IsObject(probe("health")) Then Set health = probe("health")
-    End If
+    Call TryGetObjectField(probe, "health", health)
 
     Dim falseFlags As String
     falseFlags = BuildSpaProbeFalseFlags(health)
@@ -11135,11 +11183,7 @@ Private Function BuildSpaProbeHealthSummary(ByVal probe As Dictionary) As String
         " | falseFlags=" & falseFlags
 
     Dim lastHealthError As String
-    If probe.Exists("lastHealthError") Then
-        If Not IsObject(probe("lastHealthError")) Then
-            lastHealthError = CStr(probe("lastHealthError") & "")
-        End If
-    End If
+    Call TryGetScalarTextField(probe, "lastHealthError", lastHealthError)
     lastHealthError = CompactProbeDiagnosticText(lastHealthError)
     If Len(lastHealthError) > 0 Then s = s & " | lastHealthError=" & lastHealthError
 
@@ -11205,12 +11249,10 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
     If probe Is Nothing Then Exit Sub
     If Not probe.Exists("version") Then Exit Sub
     If CLng(probe("version")) <> SPA_PROBE_VERSION Then Exit Sub
-    If Not probe.Exists("changes") Then Exit Sub
-    If Not IsObject(probe("changes")) Then Exit Sub
-
+    Dim changesObj As Object
+    If Not TryGetObjectField(probe, "changes", changesObj) Then Exit Sub
     Dim changes As Collection
-    Set changes = probe("changes")
-    If changes Is Nothing Then Exit Sub
+    Set changes = changesObj
     If changes.count = 0 Then Exit Sub
 
     Dim v As Variant
@@ -11231,10 +11273,10 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
 
     ' A render observed during an unhealthy sample is diagnostic evidence only. It may clear
     ' the unresolved-json advisory state, but no timing/idle metric from this sample is used.
+    Dim changeTimesObj As Object
+    Call TryGetObjectField(probe, "changeTimes", changeTimesObj)
     Dim changeTimes As Dictionary
-    If probe.Exists("changeTimes") Then
-        If IsObject(probe("changeTimes")) Then Set changeTimes = probe("changeTimes")
-    End If
+    If Not changeTimesObj Is Nothing Then Set changeTimes = changeTimesObj
 
     Dim netTimingEligible As Boolean
     netTimingEligible = m_sigNetArmed And m_sigNetSeen And Not m_sigNetContentObserved And m_sigNetHitMs > 0
@@ -14240,6 +14282,18 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
         socket_.Disconnect
     End If
 
+    ' The communicator may reject teardown during command-correlation UI yield or while raising
+    ' StateChanged. Do not mark shutdown complete while the transport can still block ConnectTo.
+    Select Case socket_.state
+        Case StateConnected, StateConnecting
+            If m_debugMode Then
+                Debug.Print "BiDi CRITICAL: Transport teardown was rejected by the communicator " & _
+                            "(state=" & CStr(socket_.state) & "). Call Shutdown again after the " & _
+                            "current command or StateChanged handler returns."
+            End If
+            Exit Sub
+    End Select
+
     ' Retain the disconnected communicator so this wrapper remains reusable, as ConnectTo's
     ' own error message promises. ForceClose and Disconnect are both idempotent. Deferred
     ' subscription cleanup carries its own session identity, so the active identity can be dropped.
@@ -14416,11 +14470,10 @@ Private Function TryAddShadowUnlockerPreload(ByVal generation As Double, _
     Dim json As Object
     Set json = ValidateProtocolResponse(raw, "script.addPreloadScript")
 
-    scriptId = GetPathString(json, "result.script")
-    If Len(scriptId) = 0 Then
-        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:Protocol:script.addPreloadScript", _
-                  "Shadow Unlocker preload registration succeeded without returning result.script."
-    End If
+    scriptId = RequirePathString( _
+        json, "result.script", ERR_BIDI_PROTOCOL, _
+        "BiDi:Protocol:script.addPreloadScript", _
+        "Shadow Unlocker preload registration succeeded without returning result.script.")
 
     TryAddShadowUnlockerPreload = True
     Exit Function
@@ -15043,6 +15096,32 @@ Private Function GetPathString(ByVal root As Object, ByVal path As String) As St
     If IsObject(v) Or IsNull(v) Or IsEmpty(v) Then Exit Function
 
     GetPathString = CStr(v)
+End Function
+
+' See "JSON field access policy" above TryGetObjectField.
+Private Function RequirePathString(ByVal root As Object, _
+                                   ByVal path As String, _
+                                   ByVal errorNumber As Long, _
+                                   ByVal errorSource As String, _
+                                   ByVal errorDescription As String) As String
+    Dim v As Variant: Assign v, GetPathValue(root, path)
+    Dim state As String
+
+    If IsEmpty(v) Then
+        state = "missing"
+    ElseIf IsNull(v) Then
+        state = "null"
+    ElseIf IsObject(v) Then
+        state = "object"
+    ElseIf Len(CStr(v)) = 0 Then
+        state = "empty"
+    Else
+        RequirePathString = CStr(v)
+        Exit Function
+    End If
+
+    Err.Raise errorNumber, errorSource, _
+              errorDescription & " (" & path & ": " & state & ")"
 End Function
 
 Private Function GetPathObject(ByVal root As Object, ByVal path As String) As Object

@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 5.5 / MIT License / Copyright (c) hanamichi77777
+' Version 5.6 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -364,7 +364,7 @@ Public Sub Main08()
 
 
         bidi.ArmNetworkSignal "GetShoppingResults"
-        bidi.ExecuteClickByXPath searchXPath
+        bidi.ExecuteClickByXPath searchXPath, searchTimeoutMs:=30000
         
         ' Saves discovery_log.txt in the same folder as the current VBA host file.
         bidi.StopAndSaveDiscoveryLog
