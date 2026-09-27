@@ -2246,8 +2246,17 @@ Public Sub IdleReceive(ByVal ms As Long)
 
         remainingMs = deadline - nowMs()
         If remainingMs <= 0 Then Exit Do
-        If remainingMs > READ_WAIT_MAX_MS Then waitMs = READ_WAIT_MAX_MS Else waitMs = CLng(remainingMs) + 1
-        If Not WsWaitForSocketActivity(waitMs) Then SleepWinAPI 1
+
+        ' A pump that stopped at the completed-message cap can still have complete frames
+        ' buffered in user space. Repump immediately instead of waiting for kernel readiness.
+        If m_ws_currentPumpCompletedMessages < WS_MAX_COMPLETED_MESSAGES_PER_PUMP Then
+            If remainingMs > READ_WAIT_MAX_MS Then
+                waitMs = READ_WAIT_MAX_MS
+            Else
+                waitMs = CLng(remainingMs) + 1
+            End If
+            If Not WsWaitForSocketActivity(waitMs) Then SleepWinAPI 1
+        End If
     Loop
 
 FinalCleanup:

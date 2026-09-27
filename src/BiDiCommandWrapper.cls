@@ -12516,7 +12516,17 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     ' next wait consumes (drops) the reservation rather than extending it further.
     Dim carryoverOwnerCtx As String
     carryoverOwnerCtx = m_carryoverContextId
+
+    ' Render timing evidence belongs to one browsing context. A different-context wait must
+    ' not reuse the previous context's render history or probe observation start. The page/QPC
+    ' clock mapping is intentionally retained because it is not render-history ownership state.
+    If StrComp(m_renderEvidenceContextId, targetCtx, vbBinaryCompare) <> 0 Then
+        m_lastContentRenderEpochMs = 0#
+        m_renderRingCount = 0
+        m_probeObserveStartEpochMs = 0#
+    End If
     m_renderEvidenceContextId = targetCtx
+
     m_carryoverNoteArmedThisWait = m_hasCarryoverHintForNextWait And _
                                     Len(carryoverOwnerCtx) > 0 And _
                                     (StrComp(carryoverOwnerCtx, targetCtx, vbBinaryCompare) = 0)
