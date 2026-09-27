@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "6.0"
+Private Const BIDI_SOCKET_VERSION As String = "6.1"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -73,6 +73,7 @@ Private Const WINSOCK_CONNECT_TIMEOUT_MS As Long = 2000
 Private Const WINSOCK_HANDSHAKE_TIMEOUT_MS As Long = 5000
 Private Const WINSOCK_SEND_TIMEOUT_MS As Long = 5000
 Private Const WINSOCK_PUMP_MAX_MS As Long = 10
+Private Const READ_WAIT_MAX_MS As Long = 15  ' Upper bound of one idle select() wait
 Private Const WINSOCK_PUMP_MAX_BYTES As Long = 262144
 Private Const WINSOCK_PUMP_MAX_CALLS As Long = 16
 
@@ -116,8 +117,13 @@ Private m_state As BiDiSocketState
 Private m_connectionGeneration As Long
 Public Event StateChanged(ByVal NewState As BiDiSocketState, ByVal StateName As String)
 
+' Each FIFO item is Array(message, arrivalMs); one item keeps text and arrival time inseparable
+' through enqueue, eviction, dequeue, reset and teardown.
 Private m_EventBuffer As Collection
 Private m_EventBufferBytes As Long
+Private Const EVENT_ITEM_MSG As Long = 0
+Private Const EVENT_ITEM_ARRIVAL As Long = 1
+Private m_lastEventArrivalMs As Double ' nowMs() at which the most recently returned event reached VBA
 
 Private m_DefaultTimeout As Long
 Private m_PollingInterval As Long
@@ -1451,8 +1457,10 @@ Private Sub DropOldestBufferedEvent()
     If m_EventBuffer Is Nothing Then Exit Sub
     If m_EventBuffer.count = 0 Then Exit Sub
 
+    Dim entry As Variant
     Dim dropped As String
-    dropped = CStr(m_EventBuffer(1))
+    entry = m_EventBuffer(1)
+    dropped = CStr(entry(EVENT_ITEM_MSG))
     m_EventBuffer.Remove 1
 
     m_EventBufferBytes = m_EventBufferBytes - LenB(dropped)
@@ -1491,7 +1499,7 @@ Private Sub EnqueueEventBounded(ByVal msg As String)
         DropOldestBufferedEvent
     Loop
 
-    m_EventBuffer.Add msg
+    m_EventBuffer.Add Array(msg, nowMs())
     m_EventBufferBytes = m_EventBufferBytes + msgBytes
 End Sub
 
@@ -1502,7 +1510,10 @@ Private Function TryDequeueBufferedEvent(ByRef msg As String) As Boolean
         Exit Function
     End If
 
-    msg = CStr(m_EventBuffer(1))
+    Dim entry As Variant
+    entry = m_EventBuffer(1)
+    msg = CStr(entry(EVENT_ITEM_MSG))
+    m_lastEventArrivalMs = CDbl(entry(EVENT_ITEM_ARRIVAL))
     m_EventBuffer.Remove 1
 
     m_EventBufferBytes = m_EventBufferBytes - LenB(msg)
@@ -1671,7 +1682,7 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
     Dim msg As String, inId As String
     Dim cmdId As String
     
-    On Error GoTo Cleanup
+    On Error GoTo CleanUp
 
     ' Validate before recovery or any transport work: an invalid public call must fail
     ' without changing connection state.
@@ -1786,7 +1797,7 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
                 Case IncomingClass_MatchingCommandResponse
                     SendAndReceive = msg
                     succeeded = True
-                    GoTo Cleanup
+                    GoTo CleanUp
 
                 Case IncomingClass_ReservedSystemResponse
                     ProcessReservedSystemResponse inId, msg, False
@@ -1827,7 +1838,7 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
         If Len(msg) = 0 Then YieldExecution 5, False
     Loop
 
-Cleanup:
+CleanUp:
     Dim savedErrNum As Long: savedErrNum = Err.Number
     Dim savedErrDesc As String: savedErrDesc = Err.description
     Dim savedErrSrc As String: savedErrSrc = Err.source
@@ -1999,6 +2010,7 @@ DrainCompleted:
             Case IncomingClass_Event
                 ObserveWinsockMessage candidate
                 realMsg = candidate
+                m_lastEventArrivalMs = nowMs()  ' Read directly, not via the FIFO
                 TryReadWinsockBeforeHeartbeat = True
                 GoTo FinalCleanup
         End Select
@@ -2171,9 +2183,82 @@ Public Function GetMessage() As String
             DropLateOrUnknownResponse inId
 
         Case IncomingClass_Event
+            m_lastEventArrivalMs = nowMs()
             GetMessage = rawMsg
     End Select
 End Function
+
+' nowMs() at which the most recently returned event reached VBA (FIFO enqueue time, or the
+' read time for an event returned directly). Valid immediately after GetMessage,
+' GetMessageNonBlocking or TryGetParsedEvent returns an event; 0 before any event.
+Public Property Get LastEventArrivalMs() As Double
+    LastEventArrivalMs = m_lastEventArrivalMs
+End Property
+
+' Idle wait that keeps receiving: completed events are enqueued (not returned), so dispatch
+' order and timing are unchanged while arrival times stay close to the wire. Falls back to
+' YieldExecution whenever another path owns the receive side or the transport is not usable.
+Public Sub IdleReceive(ByVal ms As Long)
+    If ms <= 0 Then Exit Sub
+    If m_isReading Or m_isSendReceiving Or m_isRecovering Or m_isRaisingStateChanged _
+       Or m_isCommandUiYielding Or m_isConnectUiYielding Or m_isTerminating Then
+        YieldExecution ms, False
+        Exit Sub
+    End If
+    If Not IsConnected Then
+        YieldExecution ms, False
+        Exit Sub
+    End If
+
+    On Error GoTo ErrorHandler
+    m_isReading = True
+
+    Dim deadline As Double
+    Dim remainingMs As Double
+    Dim waitMs As Long
+    Dim rawMsg As String
+    Dim inId As String
+    deadline = nowMs() + ms
+
+    Do
+        WsPump WINSOCK_PUMP_MAX_MS, WINSOCK_PUMP_MAX_BYTES, WINSOCK_PUMP_MAX_CALLS
+
+        Do While WsTryDequeueText(rawMsg)
+            ObserveWinsockMessage rawMsg
+            inId = ExtractJsonId(rawMsg)
+            Select Case ClassifyIncomingMessage(inId)
+                Case IncomingClass_ReservedSystemResponse
+                    ProcessReservedSystemResponse inId, rawMsg, False
+                Case IncomingClass_LateOrUnknownResponse
+                    DropLateOrUnknownResponse inId
+                Case IncomingClass_Event
+                    EnqueueEventBounded rawMsg
+            End Select
+            rawMsg = vbNullString
+        Loop
+
+        If Wsstate = WsTransportFailed Or Not WsIsOpen Then
+            trace ">>> [Socket] Winsock transport failed during idle receive. " & _
+                  GetWinsockFailureText(), True
+            SetState StateError
+            Exit Do
+        End If
+
+        remainingMs = deadline - nowMs()
+        If remainingMs <= 0 Then Exit Do
+        If remainingMs > READ_WAIT_MAX_MS Then waitMs = READ_WAIT_MAX_MS Else waitMs = CLng(remainingMs) + 1
+        If Not WsWaitForSocketActivity(waitMs) Then SleepWinAPI 1
+    Loop
+
+FinalCleanup:
+    m_isReading = False
+    Exit Sub
+
+ErrorHandler:
+    Debug.Print "[" & Format(Now, "hh:nn:ss") & "] [Winsock] Idle receive error: " & Err.description
+    SetState StateError
+    Resume FinalCleanup
+End Sub
 
 ' Three-state parsed-event reader:
 '   False                     = no message was available.
@@ -2333,7 +2418,10 @@ Private Function ReadFromWinsock(Optional ByVal deadline As Double = 0) As Strin
         If remainingMs <= 0 Then Exit Do
 
         If remainingMs > 20 Then
-            SleepWinAPI 1
+            ' Wake on socket activity instead of the next timer tick; never wait longer than one tick.
+            Dim readWaitMs As Long
+            If remainingMs - 20 > READ_WAIT_MAX_MS Then readWaitMs = READ_WAIT_MAX_MS Else readWaitMs = CLng(remainingMs - 20)
+            If Not WsWaitForSocketActivity(readWaitMs) Then SleepWinAPI 1
         Else
             SleepWinAPI 0
         End If
@@ -3327,6 +3415,31 @@ Private Sub WsForceClose(Optional ByVal preserveDeferredText As Boolean = False)
 
     On Error GoTo 0
 End Sub
+' Waits until the socket is readable, or writable while a send is pending, bounded by maxWaitMs.
+' Returns False when select() fails so the caller can fall back to Sleep; failure handling stays in WsPump.
+Private Function WsWaitForSocketActivity(ByVal maxWaitMs As Long) As Boolean
+    Dim readSet As WsFD_SET
+    Dim writeSet As WsFD_SET
+    Dim exceptSet As WsFD_SET
+    Dim waitTime As WsTIMEVAL
+
+    If maxWaitMs < 1 Then maxWaitMs = 1
+
+    readSet.count = 1
+    readSet.sockets(0) = m_ws_socket
+    exceptSet.count = 1
+    exceptSet.sockets(0) = m_ws_socket
+    If WsHasPendingSend Then
+        writeSet.count = 1
+        writeSet.sockets(0) = m_ws_socket
+    End If
+
+    waitTime.seconds = 0
+    waitTime.microseconds = maxWaitMs * 1000&
+
+    WsWaitForSocketActivity = (WsApi_selectSocket(0, readSet, writeSet, exceptSet, waitTime) <> WS_SOCKET_ERROR)
+End Function
+
 Private Sub WsPumpConnect()
     If WsMonotonicMs() >= m_ws_phaseDeadlineMs Then
         WsSetFailure 9202, "Connect timeout."
@@ -3619,7 +3732,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
         failureText = _
             "BCryptOpenAlgorithmProvider NTSTATUS=0x" & _
             Right$("00000000" & Hex$(status), 8)
-        GoTo Cleanup
+        GoTo CleanUp
     End If
 
     Dim objectProperty As String
@@ -3636,7 +3749,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
         failureText = _
             "ObjectLength query NTSTATUS=0x" & _
             Right$("00000000" & Hex$(status), 8)
-        GoTo Cleanup
+        GoTo CleanUp
     End If
 
     Dim hashProperty As String
@@ -3653,7 +3766,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
         failureText = _
             "HashDigestLength query NTSTATUS=0x" & _
             Right$("00000000" & Hex$(status), 8)
-        GoTo Cleanup
+        GoTo CleanUp
     End If
 
     Dim hashObject() As Byte
@@ -3668,7 +3781,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
         failureText = _
             "BCryptCreateHash NTSTATUS=0x" & _
             Right$("00000000" & Hex$(status), 8)
-        GoTo Cleanup
+        GoTo CleanUp
     End If
 
     Dim inputLength As Long
@@ -3676,7 +3789,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
 
     If inputLength <= 0 Then
         failureText = "SHA-1 input is empty"
-        GoTo Cleanup
+        GoTo CleanUp
     End If
 
     status = WsApi_BCryptHashData( _
@@ -3686,7 +3799,7 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
         failureText = _
             "BCryptHashData NTSTATUS=0x" & _
             Right$("00000000" & Hex$(status), 8)
-        GoTo Cleanup
+        GoTo CleanUp
     End If
 
     status = WsApi_BCryptFinishHash( _
@@ -3696,12 +3809,12 @@ Private Function WsTrySha1(ByRef inputBytes() As Byte, _
         failureText = _
             "BCryptFinishHash NTSTATUS=0x" & _
             Right$("00000000" & Hex$(status), 8)
-        GoTo Cleanup
+        GoTo CleanUp
     End If
 
     Completed = True
 
-Cleanup:
+CleanUp:
     On Error Resume Next
 
     If hashHandle <> 0 Then

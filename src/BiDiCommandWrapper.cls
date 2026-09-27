@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "6.0"
+Private Const BIDI_WRAPPER_VERSION As String = "6.1"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -197,7 +197,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const SPA_PROBE_VERSION As Long = 42 ' Internal probe generation/quiet/filter/health-diagnostic contract
+Private Const SPA_PROBE_VERSION As Long = 43 ' Internal probe generation/quiet/filter/health-diagnostic/observation-start contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
 Private m_idleFilterRevision As Long          ' increments whenever VBA-side ignore filters change
@@ -278,6 +278,8 @@ Private m_lastProbeContextId As String      ' context associated with the last S
 Private m_sigNetHitMs As Double             ' VBA monotonic time when the armed network signal matched
 Private m_sigNetHitKey As String            ' normalized key for the matched armed network response
 Private m_sigNetContentObserved As Boolean  ' first post-hit content render diagnostic already emitted
+Private m_sigNetLoEpochMs As Double         ' armed net HIT completion interval (page epoch ms; 0 = unbounded)
+Private m_sigNetHiEpochMs As Double
 
 ' Short-lived file-input capture. input.fileDialogOpened is subscribed persistently;
 ' this local arm is one-shot and owned by exactly one browsing context.
@@ -376,9 +378,19 @@ Private m_fatalResetDeferredOwner As String
 Private m_fatalResetDeferredDroppedArms As String
 
 ' Carryover is a one-wait diagnostic hint and never changes consensus.
-Private m_unresolvedJsonThisWait As Boolean       ' this wait saw a tracked json/API, no content render yet
-Private m_unresolvedJsonFirstKeyThisWait As String ' first such json's key (SUSPECT line only; NOT used by NOTE)
-Private m_unresolvedJsonFirstSecThisWait As Double ' first such json's arrival relTime (SUSPECT line only)
+' Network completion interval model. A response completed within [lo, hi] in page epoch ms:
+' lo = request.timings responseEnd (network clock; header receipt for streamed bodies),
+' hi = communicator arrival mapped to the page clock plus mapping uncertainty. 0 = unbounded side.
+Private m_waitJsonRecords As Collection       ' tracked json/API in this wait: Array(key, relSec, lo, hi)
+Private m_lastContentRenderEpochMs As Double  ' latest observed content-render mutation (page epoch ms)
+Private Const RENDER_RING_SIZE As Long = 256
+Private m_renderEpochRing(0 To 255) As Double ' recent content-render mutations for NET-TO-CONTENT
+Private m_renderPathRing(0 To 255) As String
+Private m_renderRingCount As Long
+Private m_pageEpochOffsetMs As Double         ' page epoch ms minus VBA nowMs, from the latest probe sample
+Private m_pageEpochUncertaintyMs As Double    ' half probe round trip of that sample
+Private m_pageEpochOffsetKnown As Boolean
+Private m_probeObserveStartEpochMs As Double  ' probe (re)install time in the latest sampled document
 Private m_hasCarryoverHintForNextWait As Boolean  ' reservation: hand a one-shot NOTE arm to the NEXT wait
 Private m_carryoverNoteArmedThisWait As Boolean   ' this wait may emit ONE carryover note (consumed from the reservation)
 Private m_carryoverNoteEmittedThisWait As Boolean ' this wait already emitted its one note (1-per-wait cap)
@@ -861,6 +873,7 @@ Private Sub DispatchGlobalEvents(ByVal json As Object)
                         m_sigNetHitMs = socket_.nowMs()
                         m_sigNetHitKey = NormalizeEndpointKey(sigUrl)
                         m_sigNetContentObserved = False
+                        GetCompletionInterval json, m_sigNetLoEpochMs, m_sigNetHiEpochMs
                         Dim sigStatus As String: sigStatus = GetPathString(json, "params.response.status")
                         Dim netQuietDiag As String
                         netQuietDiag = " | quietAtHit=unknown"
@@ -3040,7 +3053,7 @@ succeeded:
     RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME, _
         "browsingContext.navigate may already have been accepted; do not blindly retry the operation."
     ExecuteNavigateAndGetStatus = resultText
-    GoTo Cleanup
+    GoTo CleanUp
 
 Failed:
     Dim savedErrNum As Long
@@ -3049,9 +3062,9 @@ Failed:
     savedErrNum = Err.Number
     savedErrSrc = Err.source
     savedErrDesc = Err.description
-    Resume Cleanup
+    Resume CleanUp
 
-Cleanup:
+CleanUp:
     ' Cleanup must never replace an already-determined navigation outcome.
     On Error Resume Next
 
@@ -6860,9 +6873,7 @@ Private Sub ResetSessionBoundaryState()
     m_downloadBehaviorCleanupRequired = False
     m_downloadBehaviorStateUnknown = False
 
-    m_unresolvedJsonThisWait = False
-    m_unresolvedJsonFirstKeyThisWait = ""
-    m_unresolvedJsonFirstSecThisWait = 0#
+    ClearRenderEvidenceState
     m_hasCarryoverHintForNextWait = False
     m_carryoverNoteArmedThisWait = False
     m_carryoverNoteEmittedThisWait = False
@@ -9816,9 +9827,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_nextDiscoveryDomPollMs = 0#
 
     ' A reused wrapper starts recording with all carryover diagnostics cleared.
-    m_unresolvedJsonThisWait = False
-    m_unresolvedJsonFirstKeyThisWait = ""
-    m_unresolvedJsonFirstSecThisWait = 0#
+    Set m_waitJsonRecords = Nothing
     m_hasCarryoverHintForNextWait = False
     m_carryoverNoteArmedThisWait = False
     m_carryoverNoteEmittedThisWait = False
@@ -10097,12 +10106,12 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | [SPA-ACT]=sampled/coalesced DOM mutation burst (NOT an exhaustive event stream; absence does not prove no mutation)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has achieved quiet + observed confirmation-window duration; neither is a safety-margin score)  [SUPPRESSED]=filtered-noise tally aggregated by normalized host+path; query presence '?' is retained but query parameter names/values are omitted; idle=skip|track" & vbCrLf
         stm.writeText "LEGEND | [SPA-PROBE-INITIALIZING]/[SPA-PROBE-READY]=normal first-use/new-document lazy initialization. [SPA-PROBE-UNHEALTHY]/[SPA-PROBE-RECOVERED]=a probe already verified healthy in the same document was later missing/unhealthy and recovered. Unverified samples contribute NO stability evidence; READY/RECOVERED restart the full confirmation window. WAIT-END reports probeHealthy, probeInitializations, probeRecoveries, and detectedUnhealthyMs." & vbCrLf
         stm.writeText "LEGEND | times are VBA poll-based (~100ms granularity), do not over-trust sub-100ms gaps. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
-        stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate and resets the consensus stability window. dom/vis quietAtHit is measured on the poll that detects the hit (~100ms). net HITs are event-triggered between polls, so quietAtHit=unknown; lastPolledQuietMs/sampleAgeMs are diagnostic samples only and MUST NOT be treated as quiet at the network event. [SPA-NET-TO-CONTENT] is the first content mutation whose browser timestamp is safely after an armed net HIT and is later OBSERVED by a poll; mutationAfterHitMs is the cross-clock estimated event delay, timingUncertaintyMs is the mapping uncertainty, observedMs is only HIT-to-poll observation delay, and owner is not asserted. Gated waits carry signal=<armed types> on BEGIN and hit|miss on END." & vbCrLf
+        stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate and resets the consensus stability window. dom/vis quietAtHit is measured on the poll that detects the hit (~100ms). net HITs are event-triggered between polls, so quietAtHit=unknown; lastPolledQuietMs/sampleAgeMs are diagnostic samples only and MUST NOT be treated as quiet at the network event. [SPA-NET-TO-CONTENT] is the earliest content mutation at/after the armed net response's completion lower bound. A response completes within [lo, hi]: lo = request timings responseEnd (header receipt for streamed bodies), hi = event arrival mapped to the page clock. relation=AFTER (mutation after hi) or INDETERMINATE (inside the interval; order not determinable); delayMs=min..max is completion-to-mutation delay, widthMs=hi-lo; observedMs is only HIT-to-poll observation delay; owner is not asserted. Gated waits carry signal=<armed types> on BEGIN and hit|miss on END." & vbCrLf
         stm.writeText "LEGEND | If a net HIT occurs before SPA-WAIT-BEGIN, the net gate is already open when the wait starts. The wait's stability window starts at SPA-WAIT-BEGIN (after the HIT), so no separate HIT reset is needed. SPA-NET-TO-CONTENT is NOT measured for such a HIT. Completion then relies on the idle/DOM-quiet/probe state observed during the wait; the net gate itself does NOT link that HIT to any specific render." & vbCrLf
         stm.writeText "LEGEND | For dom signals, count= is the cumulative number of MutationRecords observed by the armed MutationObserver from ARM until the polling cycle that first detects the HIT. The observer watches the subtree of the single target node resolved at ARM (the FIRST node matched by xpath=, or the node resolved by shadowPath=). Attribute mutations are included only when the ARM line shows attributes=true. count= is NOT the number of matched elements, rendered rows, page-wide mutations, or mutations attributable only to the subsequent action." & vbCrLf
         stm.writeText "LEGEND | stableWindowMs is elapsed time since the most recent of: wait start, a poll that observed the combined idle/quiet condition as false, or an explicit reset (dom/vis HIT; net HIT at the first poll that observes it, not its event timestamp; probe READY/RECOVERED; navigation reset; probe missing/unhealthy detection). It is NOT an exact post-threshold dwell time or a safety margin; the true condition may have become satisfied between polls." & vbCrLf
         stm.writeText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
-        stm.writeText "LEGEND | [SPA-CONSENSUS-SUSPECT]=this wait reached STABLE while a tracked json/API it saw had NO content render -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CARRYOVER-NOTE]=the IMMEDIATELY next wait then showed a content render that MAY be that previous action's delayed paint. Both are heads-up markers only: no owner is asserted, no gap is computed, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
+        stm.writeText "LEGEND | At STABLE each tracked json/API seen in the wait is checked against the latest observed content render using its completion interval [lo, hi]. [SPA-CONSENSUS-SUSPECT]=at least one response completed inside probe observation with NO content render at/after lo -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CONSENSUS-UNRESOLVED] verdict=INDETERMINATE (latest render inside [lo, hi]) or UNOBSERVED (no render seen, but the response may have completed before the probe started observing) = render order cannot be determined; it is NOT a failure and NOT a suspect. No line = every response had a render after hi. [SPA-CARRYOVER-NOTE]=after a SUSPECT only, the IMMEDIATELY next wait showed a content render that MAY be that previous action's delayed paint. All are heads-up markers: no owner is asserted, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
             stm.writeText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. With no explicit body patterns, JSON retrieval/logging requires BOTH the recorder top-level browsing context and Sec-Fetch-Site same-origin/same-site/none. Child-frame, cross-site, and unknown-context/site bodies are not pulled into the log. Explicit AddBodyCapturePattern entries act as the body allow-list and may intentionally override those defaults. The browser-side BiDi collector may still temporarily retain other data until cleanup." & vbCrLf
             stm.writeText "LEGEND | BODY maxPerMethodKeyMime uses an internal method + fragment-free full URL + MIME identity, separate from the public normalized key. Query values remain private but different query values count as distinct BODY capture identities; repeated requests to the same URL still share the cap." & vbCrLf
@@ -10159,24 +10168,26 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "     pattern or the action instead. For vis HITs, quietAtHit is measured at poll time. For" & vbCrLf
         stm.writeText "     net HITs, quietAtHit=unknown by design: lastPolledQuietMs/sampleAgeMs are stale-sample" & vbCrLf
         stm.writeText "     diagnostics only and MUST NOT be used to infer a settle-to-render gap. If a" & vbCrLf
-        stm.writeText "     [SPA-NET-TO-CONTENT] line exists, mutationAfterHitMs is the estimated delay to the first" & vbCrLf
-        stm.writeText "     content mutation known to postdate the net HIT; interpret it with timingUncertaintyMs." & vbCrLf
+        stm.writeText "     [SPA-NET-TO-CONTENT] line exists, delayMs=min..max bounds the delay from response completion" & vbCrLf
+        stm.writeText "     to the first content mutation; relation=INDETERMINATE means the order itself is not determinable." & vbCrLf
         stm.writeText "     observedMs is only the later poll-observation delay and may be much larger when polling or" & vbCrLf
-        stm.writeText "     recorder-queue work is delayed. mutationAfterHitMs near/above minStableMs is a warning/uncertain" & vbCrLf
+        stm.writeText "     recorder-queue work is delayed. A delayMs max near/above minStableMs is a warning/uncertain" & vbCrLf
         stm.writeText "     zone, not proof of early completion. Prefer a stable content/visibility gate or a larger" & vbCrLf
         stm.writeText "     per-action minStableMs when capture correctness matters. For dom HITs, quietAtHit is" & vbCrLf
         stm.writeText "     structurally near zero because the hit itself is a mutation." & vbCrLf
         stm.writeText vbCrLf
         stm.writeText "3) Settle-to-render suspicion check (early-STABLE warning; the tool pre-computes this)" & vbCrLf
-        stm.writeText "   - The tool already emits two advisory markers; you do NOT re-derive them by pairing:" & vbCrLf
+        stm.writeText "   - The tool already emits these advisory markers; you do NOT re-derive them by pairing:" & vbCrLf
         stm.writeText "     [SPA-CONSENSUS-SUSPECT] = this wait hit STABLE while a tracked json/API it saw produced" & vbCrLf
         stm.writeText "       no content render -> treat that STABLE as possibly premature (NOT clean for capture)." & vbCrLf
+        stm.writeText "     [SPA-CONSENSUS-UNRESOLVED] = the render order could not be determined from the network" & vbCrLf
+        stm.writeText "       completion interval (INDETERMINATE) or observation window (UNOBSERVED); not a suspect." & vbCrLf
         stm.writeText "     [SPA-CARRYOVER-NOTE] = the immediately next wait then showed a content render that MAY be" & vbCrLf
         stm.writeText "       the previous action's delayed paint. It is a heads-up, not an attribution." & vbCrLf
-        stm.writeText "   - Deliberately NOT provided: an exact OWNER-ATTRIBUTED settle-to-render gap, a pairing" & vbCrLf
-        stm.writeText "     proving which json produced which render, or an AMBIGUOUS/CONFIRMED verdict." & vbCrLf
-        stm.writeText "     [SPA-NET-TO-CONTENT] may provide a timestamped first-render delay for an explicitly armed" & vbCrLf
-        stm.writeText "     net signal, but timingUncertaintyMs applies and owner=not-asserted remains important." & vbCrLf
+        stm.writeText "   - Deliberately NOT provided: an exact OWNER-ATTRIBUTED settle-to-render gap or a pairing" & vbCrLf
+        stm.writeText "     proving which json produced which render. Network completion is an interval, not a point:" & vbCrLf
+        stm.writeText "     [SPA-NET-TO-CONTENT] gives a delay range for an explicitly armed net signal, and" & vbCrLf
+        stm.writeText "     owner=not-asserted remains important." & vbCrLf
         stm.writeText "   - The check is adjacent-wait only: a hint lives for exactly ONE following wait, so a SUSPECT" & vbCrLf
         stm.writeText "     with no NOTE in the very next wait is not chased further. Absence of a NOTE is not 'safe'." & vbCrLf
         stm.writeText "   - Absence of [SPA-CONSENSUS-SUSPECT] does NOT prove render safety, especially when the relevant" & vbCrLf
@@ -10194,7 +10205,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "     With net+content armed, the HITs provide cleaner action-scoped evidence than ungated inference," & vbCrLf
         stm.writeText "     but they still do NOT prove that a specific network response caused a specific render." & vbCrLf
         stm.writeText "     Fallback: on a net-armed wait with no stable DOM selector, an observed" & vbCrLf
-        stm.writeText "     NET-TO-CONTENT mutationAfterHitMs near/above minStableMs can justify a more conservative per-action" & vbCrLf
+        stm.writeText "     NET-TO-CONTENT delayMs max near/above minStableMs can justify a more conservative per-action" & vbCrLf
         stm.writeText "     minStableMs, but include poll uncertainty rather than treating observedMs as exact." & vbCrLf
         stm.writeText "   - Beware a stale render tripping a naive gate: arming a bare content xpath can HIT on the" & vbCrLf
         stm.writeText "     PREVIOUS action's late paint. Prefer a value-identifying selector for the expected content." & vbCrLf
@@ -10367,7 +10378,7 @@ Public Sub RecordEventsForSeconds(ByVal seconds As Long)
         End If
     Loop
 
-Cleanup:
+CleanUp:
     ' Capture the tail while the manual-pump guard is still active, then release it even on an
     ' error. These calls are best-effort and must not replace the original recorder error.
     On Error Resume Next
@@ -10386,7 +10397,7 @@ ErrorHandler:
     ' Use Resume before Cleanup to deactivate VBA's active error handler; otherwise an error
     ' inside Cleanup can terminate the call stack instead of being handled.
     Debug.Print "BiDi Warning in RecordEventsForSeconds: " & Err.description
-    Resume Cleanup
+    Resume CleanUp
 End Sub
 
 Public Sub ProcessRecorderQueue()
@@ -10488,7 +10499,7 @@ ProbeUnavailable:
 End Function
 
 ' Manual Discovery has different semantics from ProcessSpaProbeChangesForDiagnostics: this is a
-' pure recorder sink. It MUST NOT clear unresolved-json/carryover state or influence consensus
+' pure recorder sink. It MUST NOT record render evidence, touch carryover state or influence consensus
 ' merely because the user opened a manual recording window.
 Private Sub ProcessDiscoverySpaProbeChanges(ByVal probe As Dictionary)
     On Error GoTo Done
@@ -10578,7 +10589,7 @@ Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
     Const MAX_DROP_LOGS_PER_BATCH As Long = 5
 
     batchStartMs = socket_.nowMs()
-    On Error GoTo Cleanup
+    On Error GoTo CleanUp
 
     Do While processedCount < MAX_MESSAGES_PER_BATCH
         Set json = Nothing
@@ -10622,7 +10633,7 @@ Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
             Else
                 consecutiveErrors = 0
             End If
-            On Error GoTo Cleanup
+            On Error GoTo CleanUp
 
             If consecutiveErrors >= 10 Then
                 Debug.Print "BiDi Critical: 10 consecutive dispatch errors. Abandoning queue."
@@ -10643,7 +10654,7 @@ Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
                     " additional recorder event drop(s) suppressed in this batch."
     End If
 
-Cleanup:
+CleanUp:
     m_isProcessingQueue = False
 
     If Err.Number <> 0 Then
@@ -10768,15 +10779,11 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
                 ConsiderResponseBodyCandidate params, res, mime, resUrl, resId, resStatus
             End If
 
-            ' Only tracked API responses arriving during an active wait can create this wait's
-            ' unresolved-render hint.
+            ' Only tracked API responses arriving during an active wait enter this wait's
+            ' render-evidence check (completion interval taken at dispatch).
             If m_isRecording And m_waitStackDepth > 0 And Not IsIdleIgnored(resUrl) Then
                 If InStr(1, LCase$(mime), "json") > 0 Then
-                    If Not m_unresolvedJsonThisWait Then
-                        m_unresolvedJsonFirstKeyThisWait = resKey
-                        m_unresolvedJsonFirstSecThisWait = (socket_.nowMs() / 1000) - m_recorderStartTime
-                    End If
-                    m_unresolvedJsonThisWait = True
+                    RecordWaitJson json, resKey
                 End If
             End If
 
@@ -10873,7 +10880,7 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(navUrl)
 
             ' A document load clears all carryover state; same-document SPA transitions do not.
-            m_unresolvedJsonThisWait = False: m_unresolvedJsonFirstKeyThisWait = "": m_unresolvedJsonFirstSecThisWait = 0#
+            Set m_waitJsonRecords = Nothing
             m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
 
         Case "log.entryAdded"
@@ -11480,11 +11487,13 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
     If probe Is Nothing Then Exit Sub
     If Not probe.Exists("version") Then Exit Sub
     If CLng(probe("version")) <> SPA_PROBE_VERSION Then Exit Sub
+    UpdatePageClockFromProbe probe, probeSampleVbaMs, probeSampleUncertaintyMs
+
     Dim changesObj As Object
-    If Not TryGetObjectField(probe, "changes", changesObj) Then Exit Sub
+    If Not TryGetObjectField(probe, "changes", changesObj) Then GoTo EvaluateNet
     Dim changes As Collection
     Set changes = changesObj
-    If changes.count = 0 Then Exit Sub
+    If changes.count = 0 Then GoTo EvaluateNet
 
     Dim v As Variant
     Dim logSummary As String
@@ -11502,51 +11511,25 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
         PushTimelineLine "[" & relTime & "] [SPA-ACT] " & logSummary
     End If
 
-    ' A render observed during an unhealthy sample is diagnostic evidence only. It may clear
-    ' the unresolved-json advisory state, but no timing/idle metric from this sample is used.
+    ' Renders from an unhealthy sample are still render evidence; no idle metric uses them.
     Dim changeTimesObj As Object
     Call TryGetObjectField(probe, "changeTimes", changeTimesObj)
     Dim changeTimes As Dictionary
     If Not changeTimesObj Is Nothing Then Set changeTimes = changeTimesObj
-
-    Dim netTimingEligible As Boolean
-    netTimingEligible = m_sigNetArmed And m_sigNetSeen And Not m_sigNetContentObserved And m_sigNetHitMs > 0
-    If Not ctx Is Nothing Then
-        If ctx.Exists("sigNetHitWasPreWait") Then
-            If CBool(ctx("sigNetHitWasPreWait")) Then netTimingEligible = False
-        End If
-    End If
-
-    ' Map the VBA network-hit timestamp into the page's performance.now() clock using the
-    ' current probe query midpoint. The half-roundtrip is treated as uncertainty; only changes
-    ' definitely newer than the hit are eligible for NET-TO-CONTENT.
-    Dim netHitJsMs As Double
-    Dim haveNetHitJsMs As Boolean
-    If netTimingEligible And probe.Exists("now") Then
-        netHitJsMs = CDbl(probe("now")) - (probeSampleVbaMs - m_sigNetHitMs)
-        If netHitJsMs >= 0 And netHitJsMs <= CDbl(probe("now")) Then haveNetHitJsMs = True
-    End If
+    Dim pageOrigin As Double
+    If probe.Exists("timeOrigin") Then pageOrigin = ProbeMs(probe("timeOrigin"))
 
     Dim ce As Variant
     Dim renderXPath As String
-    Dim netRenderXPath As String
-    Dim netRenderAfterHitMs As Double
     renderXPath = vbNullString
-    netRenderXPath = vbNullString
 
     For Each ce In changes
         If Left$(CStr(ce), 4) = "DOM:" Then
             If IsContentRenderPath(Mid$(CStr(ce), 5)) Then
                 If Len(renderXPath) = 0 Then renderXPath = CStr(ce)
-
-                If haveNetHitJsMs And Len(netRenderXPath) = 0 And Not changeTimes Is Nothing Then
+                If pageOrigin > 0 And Not changeTimes Is Nothing Then
                     If changeTimes.Exists(CStr(ce)) Then
-                        Dim changeJsMs As Double
-                        changeJsMs = CDbl(changeTimes(CStr(ce)))
-                        If changeJsMs > (netHitJsMs + probeSampleUncertaintyMs) Then
-                            netRenderXPath = CStr(ce)
-                            netRenderAfterHitMs = changeJsMs - netHitJsMs
-                        End If
+                        RecordContentRender pageOrigin + ProbeMs(changeTimes(CStr(ce))), CStr(ce)
                     End If
                 End If
             End If
@@ -11554,45 +11537,235 @@ Private Sub ProcessSpaProbeChangesForDiagnostics(ByVal probe As Dictionary, _
     Next ce
 
     If Len(renderXPath) > 0 Then
-        m_unresolvedJsonThisWait = False
-
-        ' Advisory only: emit NET-TO-CONTENT only for a content mutation that is known to have
-        ' occurred after a network hit that itself occurred after WAIT-BEGIN. This prevents stale
-        ' changeList entries (and pre-wait hits) from being presented as post-hit render evidence.
-        If Len(netRenderXPath) > 0 Then
-            Dim netToContentMs As Double
-            netToContentMs = socket_.nowMs() - m_sigNetHitMs
-            If netToContentMs < 0 Then netToContentMs = 0
-
-            Dim netToContentMinStableMs As Long
-            If Not ctx Is Nothing Then
-                If ctx.Exists("minStableMs") Then netToContentMinStableMs = CLng(ctx("minStableMs"))
-            End If
-
-            LogSignalLine "[SPA-NET-TO-CONTENT] key=" & m_sigNetHitKey & _
-                          " | mutationAfterHitMs=" & Format(netRenderAfterHitMs, "0") & _
-                          " | timingUncertaintyMs=" & Format(probeSampleUncertaintyMs, "0") & _
-                          " | observedMs=" & Format(netToContentMs, "0") & _
-                          " | render=" & netRenderXPath & _
-                          " | detection=poll" & _
-                          " | owner=not-asserted" & _
-                          IIf(netToContentMinStableMs > 0, " | minStableMs=" & CStr(netToContentMinStableMs), "")
-            m_sigNetContentObserved = True
-        End If
-
         If m_carryoverNoteArmedThisWait And Not m_carryoverNoteEmittedThisWait And m_isRecording Then
             Dim rt As String
             rt = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
             PushTimelineLine "[" & rt & "] [SPA-CARRYOVER-NOTE]" & _
-                             " reason=prev-wait-unresolved-json | render=" & renderXPath & _
+                             " reason=prev-wait-suspect | render=" & renderXPath & _
                              " | note=this-render-may-belong-to-the-previous-action"
             m_carryoverNoteEmittedThisWait = True
             m_carryoverNoteArmedThisWait = False
         End If
     End If
 
+EvaluateNet:
+    ' Renders polled before the HIT was dispatched are kept in the ring, so evaluate every sample.
+    EvaluateNetToContent ctx
+
 Done:
     Err.Clear
+End Sub
+
+' --- Network completion interval model ---
+
+' JSON numbers with long fractions may arrive as strings; Val parses them locale-independently.
+Private Function ProbeMs(ByVal v As Variant) As Double
+    If IsObject(v) Then Exit Function
+    If IsEmpty(v) Or IsNull(v) Then Exit Function
+    If VarType(v) = vbString Then ProbeMs = val(v) Else ProbeMs = CDbl(v)
+End Function
+
+' Maps VBA nowMs to page epoch ms from the probe query midpoint; also takes the probe's
+' observation start for the sampled document.
+Private Sub UpdatePageClockFromProbe(ByVal probe As Dictionary, ByVal probeSampleVbaMs As Double, _
+                                     ByVal probeSampleUncertaintyMs As Double)
+    If Not (probe.Exists("timeOrigin") And probe.Exists("now")) Then Exit Sub
+    Dim origin As Double
+    origin = ProbeMs(probe("timeOrigin"))
+    If origin <= 0 Then Exit Sub
+    m_pageEpochOffsetMs = origin + ProbeMs(probe("now")) - probeSampleVbaMs
+    m_pageEpochUncertaintyMs = probeSampleUncertaintyMs
+    m_pageEpochOffsetKnown = True
+    If probe.Exists("observeStart") Then m_probeObserveStartEpochMs = ProbeMs(probe("observeStart"))
+End Sub
+
+' Completion interval of the network event being dispatched. Call only during dispatch, so that
+' LastEventArrivalMs belongs to this event.
+' lo: request.timings.timeOrigin + responseEnd (a few ms early vs the page clock; header receipt
+'     for streamed bodies). hi: arrival mapped to the page clock plus mapping uncertainty, valid
+'     because responseCompleted is emitted after completion.
+Private Sub GetCompletionInterval(ByVal json As Object, ByRef lo As Double, ByRef hi As Double)
+    Dim vOrigin As Variant, vEnd As Variant
+    Dim arrivalMs As Double
+    lo = 0#: hi = 0#
+    On Error Resume Next
+    Assign vOrigin, GetPathValue(json, "params.request.timings.timeOrigin")
+    Assign vEnd, GetPathValue(json, "params.request.timings.responseEnd")
+    If ProbeMs(vOrigin) > 0 And ProbeMs(vEnd) > 0 Then lo = ProbeMs(vOrigin) + ProbeMs(vEnd)
+    Err.Clear
+    On Error GoTo 0
+
+    If m_pageEpochOffsetKnown Then
+        arrivalMs = socket_.LastEventArrivalMs
+        If arrivalMs > 0 Then hi = arrivalMs + m_pageEpochOffsetMs + m_pageEpochUncertaintyMs
+    End If
+    If lo > 0 And hi > 0 And lo > hi Then
+        hi = 0#
+    End If
+End Sub
+
+' NONE (no render), BEFORE (< lo), AFTER (> hi) or INDETERMINATE (inside the interval).
+Private Function RenderRelation(ByVal renderEpochMs As Double, ByVal lo As Double, ByVal hi As Double) As String
+    If renderEpochMs <= 0 Then RenderRelation = "NONE": Exit Function
+    If lo > 0 And renderEpochMs < lo Then RenderRelation = "BEFORE": Exit Function
+    If hi > 0 And renderEpochMs > hi Then RenderRelation = "AFTER": Exit Function
+    RenderRelation = "INDETERMINATE"
+End Function
+
+' A missing render can be proven only when the whole completion interval lies within probe observation.
+Private Function CompletionMayPrecedeObservation(ByVal lo As Double) As Boolean
+    If m_probeObserveStartEpochMs <= 0 Or lo <= 0 Then
+        CompletionMayPrecedeObservation = True
+    Else
+        CompletionMayPrecedeObservation = (lo < m_probeObserveStartEpochMs)
+    End If
+End Function
+
+Private Function DeltaText(ByVal a As Double, ByVal b As Double) As String
+    If a > 0 And b > 0 Then DeltaText = Format(a - b, "0.0") Else DeltaText = "n/a"
+End Function
+
+Private Function WidthText(ByVal lo As Double, ByVal hi As Double) As String
+    If lo > 0 And hi > 0 Then WidthText = Format(hi - lo, "0.0") Else WidthText = "unbounded"
+End Function
+
+Private Sub RecordContentRender(ByVal epochMs As Double, ByVal path As String)
+    If epochMs <= 0 Then Exit Sub
+    m_renderEpochRing(m_renderRingCount Mod RENDER_RING_SIZE) = epochMs
+    m_renderPathRing(m_renderRingCount Mod RENDER_RING_SIZE) = path
+    If m_renderRingCount < 2147483647 Then m_renderRingCount = m_renderRingCount + 1
+    If epochMs > m_lastContentRenderEpochMs Then m_lastContentRenderEpochMs = epochMs
+End Sub
+
+Private Sub RecordWaitJson(ByVal json As Object, ByVal key As String)
+    Dim lo As Double, hi As Double
+    GetCompletionInterval json, lo, hi
+    If m_waitJsonRecords Is Nothing Then Set m_waitJsonRecords = New Collection
+    If m_waitJsonRecords.count >= 100 Then Exit Sub
+    m_waitJsonRecords.Add Array(key, (socket_.nowMs() / 1000) - m_recorderStartTime, lo, hi)
+End Sub
+
+Private Sub ClearRenderEvidenceState()
+    Set m_waitJsonRecords = Nothing
+    m_lastContentRenderEpochMs = 0#
+    m_renderRingCount = 0
+    m_pageEpochOffsetKnown = False
+    m_pageEpochOffsetMs = 0#
+    m_pageEpochUncertaintyMs = 0#
+    m_probeObserveStartEpochMs = 0#
+End Sub
+
+' Emits the earliest known content render at or after the armed net HIT's lower bound (or after
+' its upper bound when no lower bound exists), with a delay range. Pre-wait HITs are excluded.
+Private Sub EvaluateNetToContent(ByRef ctx As Dictionary)
+    If Not (m_sigNetArmed And m_sigNetSeen) Then Exit Sub
+    If m_sigNetContentObserved Or m_sigNetHitMs <= 0 Then Exit Sub
+    If Not ctx Is Nothing Then
+        If ctx.Exists("sigNetHitWasPreWait") Then
+            If CBool(ctx("sigNetHitWasPreWait")) Then Exit Sub
+        End If
+    End If
+
+    Dim lo As Double, hi As Double
+    lo = m_sigNetLoEpochMs: hi = m_sigNetHiEpochMs
+    If lo <= 0 And hi <= 0 Then Exit Sub
+
+    Dim i As Long, n As Long
+    Dim e As Double, best As Double
+    Dim bestPath As String
+    Dim eligible As Boolean
+    n = m_renderRingCount
+    If n > RENDER_RING_SIZE Then n = RENDER_RING_SIZE
+    For i = 0 To n - 1
+        e = m_renderEpochRing(i)
+        If lo > 0 Then eligible = (e >= lo) Else eligible = (e > hi)
+        If eligible Then
+            If best = 0 Or e < best Then
+                best = e
+                bestPath = m_renderPathRing(i)
+            End If
+        End If
+    Next i
+    If best = 0 Then Exit Sub
+
+    Dim rel As String
+    Dim minDelay As Double
+    Dim maxDelayText As String
+    rel = RenderRelation(best, lo, hi)
+    If rel = "AFTER" Then minDelay = best - hi
+    If lo > 0 Then maxDelayText = Format(best - lo, "0.0") Else maxDelayText = "unbounded"
+
+    Dim observedMs As Double
+    observedMs = socket_.nowMs() - m_sigNetHitMs
+    If observedMs < 0 Then observedMs = 0
+
+    Dim line As String
+    line = "[SPA-NET-TO-CONTENT] key=" & m_sigNetHitKey & _
+           " | relation=" & rel & _
+           " | delayMs=" & Format(minDelay, "0.0") & ".." & maxDelayText & _
+           " | widthMs=" & WidthText(lo, hi) & _
+           " | observedMs=" & Format(observedMs, "0") & _
+           " | render=" & bestPath & _
+           " | detection=poll | owner=not-asserted"
+    If Not ctx Is Nothing Then
+        If ctx.Exists("minStableMs") Then line = line & " | minStableMs=" & CStr(CLng(ctx("minStableMs")))
+    End If
+    LogSignalLine line
+    m_sigNetContentObserved = True
+End Sub
+
+' Verdict over this wait's tracked json/API at STABLE. Per response, the latest observed content
+' render is compared with the completion interval:
+'   AFTER -> RESOLVED; inside -> INDETERMINATE; none/before -> SUSPECT, or UNOBSERVED when the
+'   completion may precede probe observation. Only SUSPECT reserves the adjacent-wait hint.
+Private Sub EmitRenderEvidenceVerdict(ByVal relTime As String)
+    If m_waitJsonRecords Is Nothing Then Exit Sub
+    If m_waitJsonRecords.count = 0 Then Exit Sub
+
+    Dim rec As Variant, firstSuspect As Variant, firstUnresolved As Variant
+    Dim rel As String, unresolvedRel As String
+    Dim nAfter As Long, nInd As Long, nUnobs As Long, nSuspect As Long
+    For Each rec In m_waitJsonRecords
+        rel = RenderRelation(m_lastContentRenderEpochMs, CDbl(rec(2)), CDbl(rec(3)))
+        If rel = "BEFORE" Or rel = "NONE" Then
+            If CompletionMayPrecedeObservation(CDbl(rec(2))) Then rel = "UNOBSERVED" Else rel = "SUSPECT"
+        End If
+        Select Case rel
+            Case "AFTER"
+                nAfter = nAfter + 1
+            Case "INDETERMINATE"
+                nInd = nInd + 1
+                If IsEmpty(firstUnresolved) Then firstUnresolved = rec: unresolvedRel = rel
+            Case "UNOBSERVED"
+                nUnobs = nUnobs + 1
+                If IsEmpty(firstUnresolved) Or unresolvedRel = "INDETERMINATE" Then firstUnresolved = rec: unresolvedRel = rel
+            Case Else
+                nSuspect = nSuspect + 1
+                If IsEmpty(firstSuspect) Then firstSuspect = rec
+        End Select
+    Next rec
+
+    Dim counts As String
+    counts = " | json=" & m_waitJsonRecords.count & " | resolved=" & nAfter & _
+             " | indeterminate=" & nInd & " | unobserved=" & nUnobs & " | suspect=" & nSuspect
+
+    If nSuspect > 0 Then
+        PushTimelineLine "[" & relTime & "] [SPA-CONSENSUS-SUSPECT]" & _
+                         " reason=track-json-no-content-render" & _
+                         " | firstJson=" & CStr(firstSuspect(0)) & "@" & Format(firstSuspect(1), "0.00") & "s" & _
+                         " | renderMinusLoMs=" & DeltaText(m_lastContentRenderEpochMs, CDbl(firstSuspect(2))) & _
+                         " | widthMs=" & WidthText(CDbl(firstSuspect(2)), CDbl(firstSuspect(3))) & _
+                         counts & " | note=next-content-render-may-be-stale"
+        m_hasCarryoverHintForNextWait = True
+    ElseIf nInd + nUnobs > 0 Then
+        PushTimelineLine "[" & relTime & "] [SPA-CONSENSUS-UNRESOLVED]" & _
+                         " verdict=" & unresolvedRel & _
+                         " | firstJson=" & CStr(firstUnresolved(0)) & "@" & Format(firstUnresolved(1), "0.00") & "s" & _
+                         " | renderMinusLoMs=" & DeltaText(m_lastContentRenderEpochMs, CDbl(firstUnresolved(2))) & _
+                         " | renderMinusHiMs=" & DeltaText(m_lastContentRenderEpochMs, CDbl(firstUnresolved(3))) & _
+                         " | widthMs=" & WidthText(CDbl(firstUnresolved(2)), CDbl(firstUnresolved(3))) & _
+                         counts & " | note=render-order-not-determinable"
+    End If
 End Sub
 
 Private Sub LogInvalidProbeSelectors(ByVal probe As Dictionary, ByVal contextId As String)
@@ -11742,7 +11915,7 @@ Public Sub ArmNetworkSignal(ByVal urlPattern As String, _
     ClaimSignalOwner targetCtx
     If m_sigNetArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=net | overwrite=true (previous net arm replaced)"
     m_sigNetArmed = True: m_sigNetSeen = False: m_sigNetPattern = urlPattern
-    m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False
+    m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False: m_sigNetLoEpochMs = 0#: m_sigNetHiEpochMs = 0#
     m_sigNetContextMissWarned = False
     LogSignalLine "[SPA-SIGNAL-ARM] type=net | pattern=" & urlPattern & _
                   " | ctx=" & targetCtx
@@ -12003,7 +12176,7 @@ End Sub
 Private Sub ResetSignalState()
     m_sigDomArmed = False: m_sigDomSeen = False: m_sigDomXPath = ""
     m_sigNetArmed = False: m_sigNetSeen = False: m_sigNetPattern = ""
-    m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False
+    m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False: m_sigNetLoEpochMs = 0#: m_sigNetHiEpochMs = 0#
     m_sigVisArmed = False: m_sigVisSeen = False: m_sigVisXPath = ""
     m_signalOwnerContextId = ""
     m_sigLostWarned = False
@@ -12313,9 +12486,7 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     m_carryoverNoteArmedThisWait = m_hasCarryoverHintForNextWait
     m_carryoverNoteEmittedThisWait = False
     m_hasCarryoverHintForNextWait = False
-    m_unresolvedJsonThisWait = False
-    m_unresolvedJsonFirstKeyThisWait = ""
-    m_unresolvedJsonFirstSecThisWait = 0#
+    Set m_waitJsonRecords = Nothing
     
     ' Log effective per-operation minStableMs/maxTimeoutMs, not only class defaults.
     If m_isRecording Then
@@ -12440,15 +12611,9 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                 successRelTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
                 PushTimelineLine "[" & successRelTime & "] [SPA-STABLE] Consensus reached (minStableMs=" & minStableMs & ")"
 
-                ' Consensus with a tracked response but no content render emits a diagnostic SUSPECT and
-                ' reserves one adjacent-wait hint. It does not change the successful result.
-                If m_unresolvedJsonThisWait Then
-                    PushTimelineLine "[" & successRelTime & "] [SPA-CONSENSUS-SUSPECT]" & _
-                                     " reason=track-json-no-content-render" & _
-                                     " | firstJson=" & m_unresolvedJsonFirstKeyThisWait & "@" & Format(m_unresolvedJsonFirstSecThisWait, "0.00") & "s" & _
-                                     " | note=next-content-render-may-be-stale"
-                    m_hasCarryoverHintForNextWait = True
-                End If
+                ' Render-evidence verdict for tracked responses; only SUSPECT reserves the one
+                ' adjacent-wait hint. It does not change the successful result.
+                EmitRenderEvidenceVerdict successRelTime
             End If
             
             EvaluateSpaIdleCondition = True ' Stability confirmed
@@ -13254,7 +13419,8 @@ Private Sub WaitHeartbeat(Optional ByVal sleepMs As Long = 50)
     Dim vSleep As Long: vSleep = sleepMs
     If vSleep < 50 Then vSleep = 50
 
-    socket_.YieldExecution vSleep, False
+    ' Keep receiving while idle so event arrival times stay close to the wire.
+    socket_.IdleReceive vSleep
 End Sub
 
 ' URL-stability polling needs queue fairness, while other waits retain the historical full drain.
@@ -13267,7 +13433,8 @@ Private Sub WaitHeartbeatBounded(Optional ByVal sleepMs As Long = 50)
     Dim vSleep As Long: vSleep = sleepMs
     If vSleep < 50 Then vSleep = 50
 
-    socket_.YieldExecution vSleep, False
+    ' Keep receiving while idle so event arrival times stay close to the wire.
+    socket_.IdleReceive vSleep
 End Sub
 
 Private Function GetProbeJs(ByVal probeType As String) As String
@@ -13287,7 +13454,7 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "apper)}};"
             js = js & "if(p){p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';var h0=probeHealth();if(h0.versionOk&&h0.fetchWrapped&&h0.xhrWrapped&&h0.observerActive&&h0.shadowObserverReady&&h0.inputWrapped){window.__vbaSpaProbeInstalled=true;return true}}"
             js = js & "var legacy=!!(window.__vbaSpaProbeInstalled&&p&&(p.version===undefined||p.version===null));"
-            js = js & "p=p||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],changeTimes:{},inflightUrlCounts:new Map()};window.__vbaIdleProbe=p;window.__vbaSpaProbeInstalled=true;p.version=V;p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';"
+            js = js & "p=p||{inflightFetchCount:0,inflightXhrCount:0,lastMutationTs:performance.now(),changeList:[],changeTimes:{},inflightUrlCounts:new Map()};window.__vbaIdleProbe=p;window.__vbaSpaProbeInstalled=true;p.version=V;p.observeStart=performance.timeOrigin+performance.now();p.selectors=selectors;p.ignoreNetwork=ignoreNetwork;p.lastHealthError='';"
             js = js & "if(typeof p.inflightFetchCount!=='number')p.inflightFetchCount=0;if(typeof p.inflightXhrCount!=='number')p.inflightXhrCount=0;if(typeof p.lastMutationTs!=='number')p.lastMutationTs=performance.now();if(!Array.isArray(p.changeList))p.changeList=[];if(!p.changeTimes||typeof p.changeTimes!=='object'||Array.isArray(p.changeTimes))p.changeTimes={};"
             js = js & "if(!(p.inflightUrlCounts instanceof Map)){p.inflightUrlCounts=new Map();if(p.inflightUrls&&p.inflightUrls.forEach)p.inflightUrls.forEach((u)=>p.inflightUrlCounts.set(u,1))}"
             js = js & "p.invalidSelectors=new Set();"
@@ -13330,7 +13497,7 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "var h={versionOk:p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p.baseObserver,shadowObserverReady:typeof p.observeShadowRoot==='function'&&Array.isArray(p.shadowObservers),inputWrapped:!!d&&(!!p.inputSetterWrapper&&d.set===p.inputSetterWrapper)};"
             js = js & "var healthy=h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.shadowObserverReady&&h.inputWrapped;"
             js = js & "if(p.visArmed&&!p.visSeen){try{var vn=null;if(p.visKind==='shadow'&&p.visPath)vn=p.shadowResolve(p.visPath);else if(p.visXPath)vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
-            js = js & "var res={active:healthy,version:p.version||0,health:h,lastHealthError:String(p.lastHealthError||''),now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,changeTimes:p.changeTimes,inflightUrls:Array.from((p.inflightUrlCounts||new Map()).keys()),invalidSelectors:Array.from(p.invalidSelectors||[]),sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};p.changeList=[];p.changeTimes={};return JSON.stringify(res);"
+            js = js & "var res={active:healthy,version:p.version||0,timeOrigin:performance.timeOrigin,observeStart:p.observeStart||0,health:h,lastHealthError:String(p.lastHealthError||''),now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,changeTimes:p.changeTimes,inflightUrls:Array.from((p.inflightUrlCounts||new Map()).keys()),invalidSelectors:Array.from(p.invalidSelectors||[]),sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen};p.changeList=[];p.changeTimes={};return JSON.stringify(res);"
     End Select
     GetProbeJs = js
 End Function
@@ -13721,8 +13888,8 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
 
             ' QuerySpaProbe drains changeList even when health is false. Preserve current-version
             ' activity/render diagnostics before readiness decides whether this sample may affect
-            ' consensus. The query midpoint maps browser performance.now() to the VBA monotonic clock
-            ' closely enough to reject DOM entries that definitely predate an armed network hit.
+            ' consensus. The query midpoint maps the VBA monotonic clock to page epoch time for the
+            ' network completion interval model.
             ProcessSpaProbeChangesForDiagnostics probe, ctx, probeSampleVbaMs, probeSampleUncertaintyMs
 
             Dim isProbeActive As Boolean: isProbeActive = IsSpaProbeReady(probe)
