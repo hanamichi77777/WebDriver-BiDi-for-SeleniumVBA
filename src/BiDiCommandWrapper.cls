@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "5.9"
+Private Const BIDI_WRAPPER_VERSION As String = "6.0"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -4374,9 +4374,6 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
     ResetFileDialogCaptureState
 
     If Not ReleaseTrackedFileChooserInterceptionBestEffort(True) Then
-        If signalsAdopted And AnySignalArmed() Then
-            Me.DisarmSignal
-        End If
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
                   "PostSelectionInterceptionCleanupFailed: input.setFiles succeeded, but native " & _
                   "file-chooser interception could not be confirmed disabled. The selection may " & _
@@ -4408,7 +4405,7 @@ FileDialogFailureCleanup:
     On Error Resume Next
     ResetFileDialogCaptureState
     cleanupConfirmed = ReleaseTrackedFileChooserInterceptionBestEffort(True)
-    If signalsAdopted Then Me.DisarmSignal
+    If signalsAdopted And AnySignalArmed() Then Me.DisarmSignal
     If exclusiveCaptureEntered Then LeaveExclusiveCaptureOperation methodName
     On Error GoTo 0
 
@@ -5621,8 +5618,9 @@ Private Function ResolveShadowElementSharedId(ByVal selectorsArray As Variant, _
                                                           ByVal searchTimeoutMs As Long, _
                                                           ByVal callerName As String, _
                                                           Optional ByVal required As Boolean = True) As String
+    ' Only exact 0 is immediate; negatives use the default, matching XPath.
     Dim isImmediate As Boolean
-    isImmediate = (searchTimeoutMs <= 0)
+    isImmediate = (searchTimeoutMs = 0)
 
     Dim vTimeoutMs As Long
     If isImmediate Then
@@ -6234,6 +6232,10 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
         If Not allowAmbiguousRetry And _
            (IsAmbiguousOutcome(localErrNum) Or localErrNum = ERR_BIDI_PROTOCOL) Then Exit Do
 
+        ' Deterministic pre-send rejections (606/607 guards, 9251 invalid UTF-16) cannot be
+        ' healed by recovery.
+        If localErrNum = 606 Or localErrNum = 607 Or localErrNum = 9251 Then Exit Do
+
         ' Commands bound to a specific disappearing context (notably close) disable recovery
         ' retry because the generic recovery path may retarget parameters to the surviving main
         ' context and act on the wrong tab.
@@ -6272,7 +6274,8 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
             recoveryErrDesc = Err.description
             Err.Clear
 
-            If recoveryErr = 0 Then
+            If recoveryErr = 0 And allowContextRetarget Then
+                ' Explicit targets must not depend on the main binding.
                 If m_debugMode Then
                     Debug.Print "BiDi [RECOVERY]: Attempting to refresh context (" & recoveryAttemptCount & "/" & MAX_CONTEXT_RECOVERY_RETRIES & ")..."
                 End If
