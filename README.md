@@ -1,6 +1,7 @@
 # WebDriver BiDi for SeleniumVBA v6.1
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
+
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
 
 It is not intended to replace SeleniumVBA, Playwright, Puppeteer, or Selenium itself.  

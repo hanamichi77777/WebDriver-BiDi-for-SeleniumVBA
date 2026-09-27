@@ -86,7 +86,6 @@ Public Sub Main02()
     bidi.ExecuteLazyLoadScroll
     
     Dim elms_title As WebElements ' List of article elements
-    
     Set elms_title = .FindElements(By.xpath, "//a[contains(@href, '/n/') and @aria-label and @title]")
     
     Dim msgText As String, msgCaption As String

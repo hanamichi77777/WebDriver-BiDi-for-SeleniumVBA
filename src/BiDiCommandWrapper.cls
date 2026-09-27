@@ -382,6 +382,8 @@ Private m_fatalResetDeferredDroppedArms As String
 ' lo = request.timings responseEnd (network clock; header receipt for streamed bodies),
 ' hi = communicator arrival mapped to the page clock plus mapping uncertainty. 0 = unbounded side.
 Private m_waitJsonRecords As Collection       ' tracked json/API in this wait: Array(key, relSec, lo, hi)
+Private m_renderEvidenceContextId As String   ' browsing context owning the current render-evidence set
+Private m_carryoverContextId As String        ' context that produced the one-wait SUSPECT carryover reservation
 Private m_lastContentRenderEpochMs As Double  ' latest observed content-render mutation (page epoch ms)
 Private Const RENDER_RING_SIZE As Long = 256
 Private m_renderEpochRing(0 To 255) As Double ' recent content-render mutations for NET-TO-CONTENT
@@ -6875,6 +6877,7 @@ Private Sub ResetSessionBoundaryState()
 
     ClearRenderEvidenceState
     m_hasCarryoverHintForNextWait = False
+    m_carryoverContextId = vbNullString
     m_carryoverNoteArmedThisWait = False
     m_carryoverNoteEmittedThisWait = False
 End Sub
@@ -9829,6 +9832,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     ' A reused wrapper starts recording with all carryover diagnostics cleared.
     Set m_waitJsonRecords = Nothing
     m_hasCarryoverHintForNextWait = False
+    m_carryoverContextId = vbNullString
     m_carryoverNoteArmedThisWait = False
     m_carryoverNoteEmittedThisWait = False
 
@@ -10111,7 +10115,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | For dom signals, count= is the cumulative number of MutationRecords observed by the armed MutationObserver from ARM until the polling cycle that first detects the HIT. The observer watches the subtree of the single target node resolved at ARM (the FIRST node matched by xpath=, or the node resolved by shadowPath=). Attribute mutations are included only when the ARM line shows attributes=true. count= is NOT the number of matched elements, rendered rows, page-wide mutations, or mutations attributable only to the subsequent action." & vbCrLf
         stm.writeText "LEGEND | stableWindowMs is elapsed time since the most recent of: wait start, a poll that observed the combined idle/quiet condition as false, or an explicit reset (dom/vis HIT; net HIT at the first poll that observes it, not its event timestamp; probe READY/RECOVERED; navigation reset; probe missing/unhealthy detection). It is NOT an exact post-threshold dwell time or a safety margin; the true condition may have become satisfied between polls." & vbCrLf
         stm.writeText "LEGEND | signal miss at TIMEOUT = the armed signal never arrived (selector/pattern error, action never fired, or the site produced no change). signal hit at TIMEOUT = signal arrived but post-signal quiet never settled. [SPA-SIGNAL-LOST] = navigation destroyed an armed dom/vis observer mid-wait; the gate stays closed (fail-safe) so that wait ends TIMEOUT with miss." & vbCrLf
-        stm.writeText "LEGEND | At STABLE each tracked json/API seen in the wait is checked against the latest observed content render using its completion interval [lo, hi]. [SPA-CONSENSUS-SUSPECT]=at least one response completed inside probe observation with NO content render at/after lo -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CONSENSUS-UNRESOLVED] verdict=INDETERMINATE (latest render inside [lo, hi]) or UNOBSERVED (no render seen, but the response may have completed before the probe started observing) = render order cannot be determined; it is NOT a failure and NOT a suspect. No line = every response had a render after hi. [SPA-CARRYOVER-NOTE]=after a SUSPECT only, the IMMEDIATELY next wait showed a content render that MAY be that previous action's delayed paint. All are heads-up markers: no owner is asserted, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
+        stm.writeText "LEGEND | At STABLE each tracked json/API seen in the wait's browsing context is checked against the latest observed content render using its completion interval [lo, hi]. [SPA-CONSENSUS-SUSPECT]=at least one response completed inside probe observation with NO content render at/after lo -> the STABLE may be premature (firstJson=<key>@<sec> is the earliest such response; note is advisory). [SPA-CONSENSUS-UNRESOLVED] verdict=INDETERMINATE (latest render inside [lo, hi]) or UNOBSERVED (no render seen, but the response may have completed before the probe started observing) = render order cannot be determined; it is NOT a failure and NOT a suspect. No line = every response had a render after hi. [SPA-CARRYOVER-NOTE]=after a SUSPECT only, the IMMEDIATELY next wait in the same browsing context showed a content render that MAY be that previous action's delayed paint. All are heads-up markers: no owner is asserted, consensus is unchanged. Confirm with an armed re-run (see section 3)." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
             stm.writeText "LEGEND | BODY STORE is separate from the 5000-line timeline ring. With no explicit body patterns, JSON retrieval/logging requires BOTH the recorder top-level browsing context and Sec-Fetch-Site same-origin/same-site/none. Child-frame, cross-site, and unknown-context/site bodies are not pulled into the log. Explicit AddBodyCapturePattern entries act as the body allow-list and may intentionally override those defaults. The browser-side BiDi collector may still temporarily retain other data until cleanup." & vbCrLf
             stm.writeText "LEGEND | BODY maxPerMethodKeyMime uses an internal method + fragment-free full URL + MIME identity, separate from the public normalized key. Query values remain private but different query values count as distinct BODY capture identities; repeated requests to the same URL still share the cap." & vbCrLf
@@ -10182,7 +10186,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "       no content render -> treat that STABLE as possibly premature (NOT clean for capture)." & vbCrLf
         stm.writeText "     [SPA-CONSENSUS-UNRESOLVED] = the render order could not be determined from the network" & vbCrLf
         stm.writeText "       completion interval (INDETERMINATE) or observation window (UNOBSERVED); not a suspect." & vbCrLf
-        stm.writeText "     [SPA-CARRYOVER-NOTE] = the immediately next wait then showed a content render that MAY be" & vbCrLf
+        stm.writeText "     [SPA-CARRYOVER-NOTE] = the immediately next wait in the same browsing context then showed a content render that MAY be" & vbCrLf
         stm.writeText "       the previous action's delayed paint. It is a heads-up, not an attribution." & vbCrLf
         stm.writeText "   - Deliberately NOT provided: an exact OWNER-ATTRIBUTED settle-to-render gap or a pairing" & vbCrLf
         stm.writeText "     proving which json produced which render. Network completion is an interval, not a point:" & vbCrLf
@@ -10783,7 +10787,12 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             ' render-evidence check (completion interval taken at dispatch).
             If m_isRecording And m_waitStackDepth > 0 And Not IsIdleIgnored(resUrl) Then
                 If InStr(1, LCase$(mime), "json") > 0 Then
-                    RecordWaitJson json, resKey
+                    Dim resCtx As String
+                    resCtx = GetPathString(json, "params.context")
+                    If Len(m_renderEvidenceContextId) > 0 And _
+                       StrComp(resCtx, m_renderEvidenceContextId, vbBinaryCompare) = 0 Then
+                        RecordWaitJson json, resKey
+                    End If
                 End If
             End If
 
@@ -10879,9 +10888,18 @@ Private Sub FormatAndStoreLog(ByVal json As Object)
             ' Normalize navigation URLs so opaque authentication payloads cannot bloat the log.
             LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(navUrl)
 
-            ' A document load clears all carryover state; same-document SPA transitions do not.
-            Set m_waitJsonRecords = Nothing
-            m_hasCarryoverHintForNextWait = False: m_carryoverNoteArmedThisWait = False: m_carryoverNoteEmittedThisWait = False
+            ' Only a document load in the current render-evidence context invalidates that
+            ' evidence/carryover state; unrelated iframe/tab loads must not erase this wait.
+            Dim navCtx As String
+            navCtx = GetPathString(json, "params.context")
+            If Len(m_renderEvidenceContextId) > 0 And _
+               StrComp(navCtx, m_renderEvidenceContextId, vbBinaryCompare) = 0 Then
+                Set m_waitJsonRecords = Nothing
+                m_hasCarryoverHintForNextWait = False
+                m_carryoverContextId = vbNullString
+                m_carryoverNoteArmedThisWait = False
+                m_carryoverNoteEmittedThisWait = False
+            End If
 
         Case "log.entryAdded"
             Dim logLevel As String
@@ -11642,11 +11660,22 @@ Private Sub RecordWaitJson(ByVal json As Object, ByVal key As String)
     GetCompletionInterval json, lo, hi
     If m_waitJsonRecords Is Nothing Then Set m_waitJsonRecords = New Collection
     If m_waitJsonRecords.count >= 100 Then Exit Sub
-    m_waitJsonRecords.Add Array(key, (socket_.nowMs() / 1000) - m_recorderStartTime, lo, hi)
+
+    Dim arrivalMs As Double
+    Dim arrivalSec As Double
+    arrivalMs = socket_.LastEventArrivalMs
+    If arrivalMs > 0 Then
+        arrivalSec = (arrivalMs / 1000#) - m_recorderStartTime
+    Else
+        arrivalSec = (socket_.nowMs() / 1000#) - m_recorderStartTime
+    End If
+
+    m_waitJsonRecords.Add Array(key, arrivalSec, lo, hi)
 End Sub
 
 Private Sub ClearRenderEvidenceState()
     Set m_waitJsonRecords = Nothing
+    m_renderEvidenceContextId = vbNullString
     m_lastContentRenderEpochMs = 0#
     m_renderRingCount = 0
     m_pageEpochOffsetKnown = False
@@ -11757,6 +11786,7 @@ Private Sub EmitRenderEvidenceVerdict(ByVal relTime As String)
                          " | widthMs=" & WidthText(CDbl(firstSuspect(2)), CDbl(firstSuspect(3))) & _
                          counts & " | note=next-content-render-may-be-stale"
         m_hasCarryoverHintForNextWait = True
+        m_carryoverContextId = m_renderEvidenceContextId
     ElseIf nInd + nUnobs > 0 Then
         PushTimelineLine "[" & relTime & "] [SPA-CONSENSUS-UNRESOLVED]" & _
                          " verdict=" & unresolvedRel & _
@@ -12481,11 +12511,18 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     ' from NET-TO-CONTENT timing diagnostics. The fresh stableStart above still governs consensus.
     waitCtx.Add "sigNetHitWasPreWait", (m_sigNetArmed And m_sigNetSeen)
 
-    ' A carryover reservation becomes a one-wait arm at BEGIN and is cleared immediately;
-    ' this wait's unresolved state is reset independently.
-    m_carryoverNoteArmedThisWait = m_hasCarryoverHintForNextWait
+    ' A carryover reservation belongs to the context that produced the SUSPECT and is
+    ' consumable only by the immediately next wait in that same context. A different-context
+    ' next wait consumes (drops) the reservation rather than extending it further.
+    Dim carryoverOwnerCtx As String
+    carryoverOwnerCtx = m_carryoverContextId
+    m_renderEvidenceContextId = targetCtx
+    m_carryoverNoteArmedThisWait = m_hasCarryoverHintForNextWait And _
+                                    Len(carryoverOwnerCtx) > 0 And _
+                                    (StrComp(carryoverOwnerCtx, targetCtx, vbBinaryCompare) = 0)
     m_carryoverNoteEmittedThisWait = False
     m_hasCarryoverHintForNextWait = False
+    m_carryoverContextId = vbNullString
     Set m_waitJsonRecords = Nothing
     
     ' Log effective per-operation minStableMs/maxTimeoutMs, not only class defaults.

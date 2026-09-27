@@ -2417,14 +2417,16 @@ Private Function ReadFromWinsock(Optional ByVal deadline As Double = 0) As Strin
         remainingMs = deadline - nowMs()
         If remainingMs <= 0 Then Exit Do
 
-        If remainingMs > 20 Then
-            ' Wake on socket activity instead of the next timer tick; never wait longer than one tick.
-            Dim readWaitMs As Long
-            If remainingMs - 20 > READ_WAIT_MAX_MS Then readWaitMs = READ_WAIT_MAX_MS Else readWaitMs = CLng(remainingMs - 20)
-            If Not WsWaitForSocketActivity(readWaitMs) Then SleepWinAPI 1
+        ' Use the same bounded readiness wait as IdleReceive all the way to the deadline.
+        ' A one-tick boundary overrun is preferable to spinning the final ~20 ms of every
+        ' short correlation slice, especially when AllowUiPump=True.
+        Dim readWaitMs As Long
+        If remainingMs > READ_WAIT_MAX_MS Then
+            readWaitMs = READ_WAIT_MAX_MS
         Else
-            SleepWinAPI 0
+            readWaitMs = CLng(remainingMs) + 1
         End If
+        If Not WsWaitForSocketActivity(readWaitMs) Then SleepWinAPI 1
     Loop
 
     If Len(rawMsg) > 0 Then
@@ -3832,12 +3834,12 @@ CleanUp:
     WsTrySha1 = Completed
 End Function
 
-Private Function WsBase64EncodeBytes(ByRef Bytes() As Byte) As String
+Private Function WsBase64EncodeBytes(ByRef bytes() As Byte) As String
     Const alphabet As String = _
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
     Dim count As Long
-    count = WsByteArrayLength(Bytes)
+    count = WsByteArrayLength(bytes)
 
     If count <= 0 Then
         WsBase64EncodeBytes = vbNullString
@@ -3853,17 +3855,17 @@ Private Function WsBase64EncodeBytes(ByRef Bytes() As Byte) As String
         Dim byte2 As Long
         Dim remaining As Long
 
-        byte0 = Bytes(index)
+        byte0 = bytes(index)
         remaining = count - index
 
         If remaining > 1 Then
-            byte1 = Bytes(index + 1)
+            byte1 = bytes(index + 1)
         Else
             byte1 = 0
         End If
 
         If remaining > 2 Then
-            byte2 = Bytes(index + 2)
+            byte2 = bytes(index + 2)
         Else
             byte2 = 0
         End If
@@ -4621,22 +4623,22 @@ Private Function WsValidateFrameOpcode(ByVal opcode As Long) As Boolean
     End Select
 End Function
 
-Private Function WsDecodeSafePayloadLength(ByRef Bytes() As Byte) As Double
-    If (Bytes(0) And &H80) <> 0 Then
+Private Function WsDecodeSafePayloadLength(ByRef bytes() As Byte) As Double
+    If (bytes(0) And &H80) <> 0 Then
         WsDecodeSafePayloadLength = -1
         Exit Function
     End If
 
-    If Bytes(0) <> 0 Or Bytes(1) <> 0 Or Bytes(2) <> 0 Or Bytes(3) <> 0 Then
+    If bytes(0) <> 0 Or bytes(1) <> 0 Or bytes(2) <> 0 Or bytes(3) <> 0 Then
         WsDecodeSafePayloadLength = -1
         Exit Function
     End If
 
     Dim value As Double
-    value = CDbl(Bytes(4)) * 16777216# + _
-            CDbl(Bytes(5)) * 65536# + _
-            CDbl(Bytes(6)) * 256# + _
-            CDbl(Bytes(7))
+    value = CDbl(bytes(4)) * 16777216# + _
+            CDbl(bytes(5)) * 65536# + _
+            CDbl(bytes(6)) * 256# + _
+            CDbl(bytes(7))
 
     If value > 2147483647# Then
         WsDecodeSafePayloadLength = -1
@@ -4820,9 +4822,9 @@ Private Function WsGenerateMaskKey(ByRef mask() As Byte) As Boolean
 
     WsGenerateMaskKey = True
 End Function
-Private Sub WsEnqueueSendBytes(ByRef Bytes() As Byte)
+Private Sub WsEnqueueSendBytes(ByRef bytes() As Byte)
     Dim value As Variant
-    value = Bytes
+    value = bytes
     m_ws_sendQueue.Add value
 End Sub
 
@@ -5603,18 +5605,18 @@ Private Sub WsRaiseDecodeError(ByVal windowsError As Long)
               "MultiByteToWideChar failed. Windows error: " & windowsError
 End Sub
 
-Private Function WsByteArrayLength(ByRef Bytes() As Byte) As Long
+Private Function WsByteArrayLength(ByRef bytes() As Byte) As Long
     On Error GoTo EmptyArray
-    WsByteArrayLength = UBound(Bytes) - LBound(Bytes) + 1
+    WsByteArrayLength = UBound(bytes) - LBound(bytes) + 1
     Exit Function
 
 EmptyArray:
     WsByteArrayLength = 0
 End Function
 
-Private Function WsByteArrayCapacity(ByRef Bytes() As Byte) As Long
+Private Function WsByteArrayCapacity(ByRef bytes() As Byte) As Long
     On Error GoTo EmptyArray
-    WsByteArrayCapacity = UBound(Bytes) - LBound(Bytes) + 1
+    WsByteArrayCapacity = UBound(bytes) - LBound(bytes) + 1
     Exit Function
 
 EmptyArray:
