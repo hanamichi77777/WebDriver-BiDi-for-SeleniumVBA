@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "6.1"
+Private Const BIDI_SOCKET_VERSION As String = "6.2"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -2274,29 +2274,37 @@ End Sub
 '   True + parsed Is Object   = one valid message was consumed and parsed.
 '   True + parsed Is Nothing  = one invalid/filtered message was consumed and dropped.
 ' This distinction lets queue drains skip a bad event and continue with following events.
-Public Function TryGetParsedEvent(ByRef parsed As Object, _
-                                  ByRef dropReason As String, _
-                                  Optional ByVal minMsgSize As Long = 10, _
-                                  Optional ByVal maxMsgSize As Long = PARSED_ASYNC_EVENT_MAX_CHARS, _
-                                  Optional ByVal nonBlocking As Boolean = False) As Boolean
-    Set parsed = Nothing
+' Retrieval and cheap admission only (no JSON parse). Returns True when one event was consumed;
+' rawMsg is empty when that event was rejected (dropReason says why). arrivalMs is the event's
+' own FIFO/read arrival time, returned with the text so the pair cannot be separated.
+Public Function TryGetEventText(ByRef rawMsg As String, _
+                                ByRef dropReason As String, _
+                                ByRef arrivalMs As Double, _
+                                Optional ByVal minMsgSize As Long = 10, _
+                                Optional ByVal maxMsgSize As Long = PARSED_ASYNC_EVENT_MAX_CHARS, _
+                                Optional ByVal nonBlocking As Boolean = False, _
+                                Optional ByRef eventMethod As String = vbNullString) As Boolean
+    rawMsg = vbNullString
     dropReason = vbNullString
+    arrivalMs = 0#
+    eventMethod = vbNullString
 
     If maxMsgSize > PARSED_ASYNC_EVENT_MAX_CHARS Then maxMsgSize = PARSED_ASYNC_EVENT_MAX_CHARS
 
-    Dim rawMsg As String
+    Dim candidateMsg As String
     If nonBlocking Then
-        rawMsg = GetMessageNonBlocking()
+        candidateMsg = GetMessageNonBlocking()
     Else
-        rawMsg = GetMessage()
+        candidateMsg = GetMessage()
     End If
-    If Len(rawMsg) = 0 Then Exit Function
+    If Len(candidateMsg) = 0 Then Exit Function
 
     ' One event message was consumed even when it is rejected below.
-    TryGetParsedEvent = True
+    TryGetEventText = True
+    arrivalMs = m_lastEventArrivalMs
 
     Dim rawLength As Long
-    rawLength = Len(rawMsg)
+    rawLength = Len(candidateMsg)
 
     If rawLength < minMsgSize Then
         dropReason = "too-short event (chars=" & rawLength & _
@@ -2309,7 +2317,7 @@ Public Function TryGetParsedEvent(ByRef parsed As Object, _
 
     If rawLength > maxMsgSize Then
         Dim oversizeMethod As String
-        RecordAsyncMessageLoss rawMsg, oversizeMethod
+        RecordAsyncMessageLoss candidateMsg, oversizeMethod
 
         dropReason = "oversized parsed event (chars=" & rawLength & _
                      "; maximum=" & maxMsgSize & "; method="
@@ -2326,14 +2334,31 @@ Public Function TryGetParsedEvent(ByRef parsed As Object, _
         Exit Function
     End If
 
-    If InStr(rawMsg, """method"":") = 0 And _
-       InStr(rawMsg, """id"":") = 0 Then
+    If InStr(candidateMsg, """method"":") = 0 And _
+       InStr(candidateMsg, """id"":") = 0 Then
         dropReason = "message has neither a root method nor id"
         If m_DroppedParsedFilteredCount < 2147483647 Then _
             m_DroppedParsedFilteredCount = m_DroppedParsedFilteredCount + 1
         m_LastParsedEventDropReason = dropReason
         Exit Function
     End If
+
+    m_LastParsedEventDropReason = vbNullString
+    rawMsg = candidateMsg
+
+    ' Reuse the communicator's long-standing top-level method scanner.
+    ' The wrapper receives only the extracted method string; it does not inspect rawMsg.
+    Call TryExtractTopLevelEventMethod(candidateMsg, eventMethod)
+End Function
+
+' JSON parse of text admitted by TryGetEventText. Malformed input is counted and classified
+' exactly as TryGetParsedEvent always did. Returns True only when parsed is set.
+Public Function ParseEventText(ByVal rawMsg As String, _
+                               ByRef parsed As Object, _
+                               ByRef dropReason As String) As Boolean
+    Set parsed = Nothing
+    dropReason = vbNullString
+    If Len(rawMsg) = 0 Then Exit Function
 
     Dim parseErr As Long
     Dim candidate As Object
@@ -2364,6 +2389,25 @@ Public Function TryGetParsedEvent(ByRef parsed As Object, _
 
     m_LastParsedEventDropReason = vbNullString
     Set parsed = candidate
+    ParseEventText = True
+End Function
+
+' Three-state contract preserved: False = empty; True + object = parsed; True + Nothing = rejected.
+Public Function TryGetParsedEvent(ByRef parsed As Object, _
+                                  ByRef dropReason As String, _
+                                  Optional ByVal minMsgSize As Long = 10, _
+                                  Optional ByVal maxMsgSize As Long = PARSED_ASYNC_EVENT_MAX_CHARS, _
+                                  Optional ByVal nonBlocking As Boolean = False) As Boolean
+    Set parsed = Nothing
+    dropReason = vbNullString
+
+    Dim rawMsg As String
+    Dim arrivalMs As Double
+    If Not TryGetEventText(rawMsg, dropReason, arrivalMs, minMsgSize, maxMsgSize, nonBlocking) Then Exit Function
+
+    TryGetParsedEvent = True
+    If Len(rawMsg) = 0 Then Exit Function
+    Call ParseEventText(rawMsg, parsed, dropReason)
 End Function
 
 ' Compatibility API: callers that only understand Object/Nothing retain the old contract.
