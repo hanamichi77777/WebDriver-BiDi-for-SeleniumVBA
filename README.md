@@ -52,11 +52,6 @@ These benchmarks verify that WebDriver BiDi for SeleniumVBA can reliably handle 
 
 The ServiceNow validation code is contained in the `Main07` procedure, and the Google Flights validation code is contained in the `Main08` procedure.
 
-
-## VirusTotal Scan Results
-
-This version was scanned by VirusTotal, and received 0 detections from 64 security vendors at the time of testing.
-
 ---
 ## [Supported OS]
 * **Windows11**
