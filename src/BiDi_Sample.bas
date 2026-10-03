@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 6.2 / MIT License / Copyright (c) hanamichi77777
+' Version 6.3 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -128,10 +128,10 @@ Public Sub Main03()
     Dim url As String: url = "https://world.jorudan.co.jp/mln/en/"
     bidi.ExecuteNavigateAndGetStatus url
     bidi.StartDiscoveryLog
-    bidi.ExecuteInputValueByXPath "//input[@id='from_value']", "Tokyo", useKeyEvents:=False
-    bidi.ExecuteInputValueByXPath "//input[@id='to_value']", "Shinjuku", useKeyEvents:=False
-    bidi.ExecuteClickByXPath "//button[starts-with(@id, 'search_button_main')]"
-    bidi.ExecuteClickByXPath "//button[@id='search_button_main']"
+    bidi.ExecuteInputValue "//input[@id='from_value']", "Tokyo", useKeyEvents:=False
+    bidi.ExecuteInputValue "//input[@id='to_value']", "Shinjuku", useKeyEvents:=False
+    bidi.ExecuteClick "//button[starts-with(@id, 'search_button_main')]"
+    bidi.ExecuteClick "//button[@id='search_button_main']"
     Dim logPath As String
     logPath = .ResolvePath(".\") & "\discovery_log.txt"
     bidi.StopAndSaveDiscoveryLog logPath
@@ -204,10 +204,10 @@ Public Sub Main05()
 
     .NavigateTo "https://www.selenium.dev/selenium/web/ajaxy_page.html"
 
-    bidi.ExecuteInputValueByXPath "//input[@name='typer']", "aaa", , False
-    bidi.ExecuteClickByXPath "//input[@id='red']", , False
+    bidi.ExecuteInputValue "//input[@name='typer']", "aaa", , False
+    bidi.ExecuteClick "//input[@id='red']", , False
     
-    bidi.ExecuteClickByXPath "//input[@value='Add Label']", , , 1000
+    bidi.ExecuteClick "//input[@value='Add Label']", , , 1000
 
     Debug.Assert driver.FindElement(By.xpath, "//div[@id='update_butter']").GetText = "Done!"
 
@@ -235,7 +235,7 @@ Public Sub Main06()
    
    Dim conID As String
    conID = bidi.GetIframeContextIdByUrl("jccht00d")
-   bidi.ExecuteClickByXPath "//input[@id='la_imp']", , , , , conID
+   bidi.ExecuteClick "//input[@id='la_imp']", , , , , conID
    
    bidi.Shutdown: Set bidi = Nothing
    .CloseBrowser: .Shutdown
@@ -263,16 +263,17 @@ Public Sub Main07()
     
     bidi.StartDiscoveryLog
 
-    bidi.ExecuteRegisterAutoClickerByXPath "//button[@id='truste-consent-button']"
+    bidi.ExecuteRegisterAutoClicker "//button[@id='truste-consent-button']"
     
     bidi.ExecuteNavigateAndGetStatus targetUrl
         
     bidi.ArmNetworkSignal "metadata/application"
-    ' Shadow DOM paths use CSS selectors; XPath does not cross ShadowRoot boundaries
-    bidi.ExecuteShadowClick "#utility-sign-in button"
+    ' ExecuteShadow* evaluates the XPath in the document and in every nested ShadowRoot.
+    ' The match is searched root by root, so //*[@id=...]//button stays inside one tree.
+    bidi.ExecuteShadowClick "//*[@id='utility-sign-in']//button"
             
     ' Use a non-sensitive test value when adapting this sample.
-    bidi.ExecuteInputValueByXPath "//input[@id='username']", "aaa"
+    bidi.ExecuteInputValue "//input[@id='username']", "aaa"
     
     ' Saves discovery_log.txt in the same folder as the current VBA host file.
     bidi.StopAndSaveDiscoveryLog
@@ -322,7 +323,7 @@ Public Sub Main08()
         Dim url As String: url = "https://www.google.com/travel/flights"
         bidi.ExecuteNavigateAndGetStatus url
         
-        bidi.ExecuteSelectValueByXPath "(//div[@role='combobox'])[1]", "One way"
+        bidi.ExecuteSelectValue "(//div[@role='combobox'])[1]", "One way"
                 
         Dim depXPath As String
         depXPath = "(//input[contains(@aria-label, 'Where from')])[last()]"
@@ -331,10 +332,10 @@ Public Sub Main08()
         depSuggestXPath = _
             "//*[@role='listbox' and not(@aria-hidden='true')]" & _
             "//li[@role='option' and contains(@aria-label, 'Sapporo')][1]"
-        bidi.ExecuteInputValueByXPath depXPath, "Sapporo", useKeyEvents:=False
+        bidi.ExecuteInputValue depXPath, "Sapporo", useKeyEvents:=False
         
         bidi.ArmNetworkSignal "rpcids=tDoGIe"
-        bidi.ExecuteClickByXPath depSuggestXPath, minStableMs:=1000
+        bidi.ExecuteClick depSuggestXPath, minStableMs:=1000
         
         
         Dim destXPath As String
@@ -344,19 +345,19 @@ Public Sub Main08()
         destSuggestXPath = _
             "//*[@role='listbox' and not(@aria-hidden='true')]" & _
             "//li[@role='option' and contains(@aria-label, 'Paris')][1]"
-        bidi.ExecuteInputValueByXPath destXPath, "Paris", useKeyEvents:=False
+        bidi.ExecuteInputValue destXPath, "Paris", useKeyEvents:=False
         
         bidi.ArmNetworkSignal "rpcids=BVAT3"
-        bidi.ExecuteClickByXPath destSuggestXPath, minStableMs:=1000
+        bidi.ExecuteClick destSuggestXPath, minStableMs:=1000
         
         
         bidi.ArmNetworkSignal "GetCalendarPicker"
         bidi.ArmVisibilitySignal "//div[@data-gs]"
-        bidi.ExecuteClickByXPath "//input[@aria-label='Departure']"
+        bidi.ExecuteClick "//input[@aria-label='Departure']"
         
-        bidi.ExecuteClickByXPath _
+        bidi.ExecuteClick _
             "(//div[@role='gridcell' and @aria-hidden='false'])[8]//div[@role='button']"
-        bidi.ExecuteClickByXPath "//button[contains(., 'Done')]"
+        bidi.ExecuteClick "//button[contains(., 'Done')]"
         
         
         Dim searchXPath As String
@@ -364,7 +365,7 @@ Public Sub Main08()
 
 
         bidi.ArmNetworkSignal "GetShoppingResults"
-        bidi.ExecuteClickByXPath searchXPath, maxTimeoutMs:=30000
+        bidi.ExecuteClick searchXPath, maxTimeoutMs:=30000
         
         ' Saves discovery_log.txt in the same folder as the current VBA host file.
         bidi.StopAndSaveDiscoveryLog
@@ -451,10 +452,10 @@ Public Sub Main10()
     bidi.ExecuteNavigateAndGetStatus targetUrl
     
     bidi.ArmContentSignal "//*[@id='table-body']"
-    bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2015']"
+    bidi.ExecuteClick "//section[@id='oscars']//a[@id='2015']"
     
     bidi.ArmContentSignal "//*[@id='table-body']"
-    bidi.ExecuteClickByXPath "//section[@id='oscars']//a[@id='2014']"
+    bidi.ExecuteClick "//section[@id='oscars']//a[@id='2014']"
     
     ' Saves discovery_log.txt in the same folder as the current VBA host file.
     bidi.StopAndSaveDiscoveryLog
@@ -527,12 +528,12 @@ Public Sub Main11()
 End Sub
 
 ' Main12 - Unified multiple-download lifecycle and destination-folder sample
-' ExecuteDownloadsByXPath uses the same engine for one or many trigger XPaths.
+' ExecuteDownloads uses the same engine for one or many trigger XPaths.
 ' This sample dispatches three independent download triggers and waits until all
 ' accepted transactions reach complete/canceled.
 '
 ' A single String XPath is also valid:
-'   Set result = bidi.ExecuteDownloadsByXPath("//*[@id='download-a']")
+'   Set result = bidi.ExecuteDownloads("//*[@id='download-a']")
 '
 ' StartDiscoveryLog preserves the full download signal chain even when DebugMode
 ' is disabled. filePath is browser-reported only; this sample does not assert
@@ -580,7 +581,7 @@ Public Sub Main12()
 
         bidi.ExecuteNavigateAndGetStatus targetUrl
 
-        Set result = bidi.ExecuteDownloadsByXPath( _
+        Set result = bidi.ExecuteDownloads( _
                         Array( _
                             "//*[@id='download-a']", _
                             "//*[@id='download-b']", _
@@ -635,7 +636,7 @@ Public Sub Main12()
 End Sub
 
 ' Main13 - New tab / new window capture through browsingContext.contextCreated
-' ExecuteOpenNewContextByXPath clicks the trigger exactly once and returns the
+' ExecuteOpenNewContext clicks the trigger exactly once and returns the
 ' newly created top-level browsing context. originalOpener correlation excludes
 ' foreign contexts, and multiple candidates fail instead of being guessed.
 Public Sub Main13()
@@ -669,7 +670,7 @@ Public Sub Main13()
         bidi.ExecuteNavigateAndGetStatus targetUrl
         ownerContext = bidi.GetMainContextId()
 
-        Set tabResult = bidi.ExecuteOpenNewContextByXPath( _
+        Set tabResult = bidi.ExecuteOpenNewContext( _
             "//*[@id='open-tab']", _
             searchTimeoutMs:=5000, _
             timeoutMs:=10000)
@@ -683,7 +684,7 @@ Public Sub Main13()
 
         bidi.ExecuteCloseContext tabContext
 
-        Set windowResult = bidi.ExecuteOpenNewContextByXPath( _
+        Set windowResult = bidi.ExecuteOpenNewContext( _
             "//*[@id='open-window']", _
             searchTimeoutMs:=5000, _
             timeoutMs:=10000)

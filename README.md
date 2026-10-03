@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v6.2
+# WebDriver BiDi for SeleniumVBA v6.3
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -53,10 +53,6 @@ These benchmarks verify that WebDriver BiDi for SeleniumVBA can reliably handle 
 The ServiceNow validation code is contained in the `Main07` procedure, and the Google Flights validation code is contained in the `Main08` procedure.
 
 
-## VirusTotal Scan Results
-
-This version was scanned by VirusTotal, and received 0 detections from 64 security vendors at the time of testing.
-
 ---
 ## [Supported OS]
 * **Windows11**
@@ -75,13 +71,14 @@ Setup and import instructions are available in the **[Wiki](https://github.com/h
 * **SPA completion is inferred, not guaranteed.** The default idle consensus is based on observed network activity, Fetch/XHR counters, DOM mutations, and a quiet window. It cannot prove the target application's internal logical completion or rule out future delayed work.
 * **Use explicit completion signals for important actions.** When a specific DOM rewrite or network response marks completion, arm `ArmContentSignal` and/or `ArmNetworkSignal` immediately before the action. A targeted signal is safer than relying on quietness alone.
 * **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
+* **The browser print preview is not reachable through BiDi.** On Edge 154 (observed 2026-10-03), the print preview opened by `window.print()` (`edge://print/`) appears as a CDP target and as a classic WebDriver window handle, but not in the BiDi `browsingContext.getTree`. Operate the print dialog through classic SeleniumVBA.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
 
 ---
 
 ## 📂 Procedure Overview (Sample Module: `BiDi_Sample`)
 
-These descriptions are aligned with the `BiDi_Sample` module included in WebDriver BiDi for SeleniumVBA. The procedures are learning and diagnostic examples rather than permanent integration tests for the referenced public websites. Third-party URLs, XPath expressions, ARIA labels, extension folders, and observed network endpoints can change without notice. When adapting a sample, first identify the application's real completion condition, then update selectors, signal patterns, noise rules, and business-level verification accordingly.
+These descriptions are aligned with the `BiDi_Sample` module included in WebDriver BiDi for SeleniumVBA. The procedures are learning and diagnostic examples rather than permanent integration tests for the referenced public websites. Third-party URLs, XPath expressions, ARIA labels, extension folders, and observed network endpoints can change without notice. When adapting a sample, first identify the application's real completion condition, then update XPath locators, signal patterns, noise rules, and business-level verification accordingly.
 
 ### 1. Main01: Google Translate Extension Installation through WebDriver BiDi
 This procedure is intentionally limited to one task: installing the unpacked Google Translate extension into the current Chrome automation session.
@@ -109,8 +106,8 @@ This procedure automates a live route-search workflow that requires two sequenti
 * **Two different traffic controls:** `ExecuteEnableResourceBlocking` prevents matching requests from being sent, while `AddIdleIgnoreNetworkPattern` allows requests to continue but excludes matching background traffic from idle judgment. Blocking is stronger and can change page behavior; ignoring is appropriate for required but continuously noisy telemetry.
 * **Focused diagnostic recording:** `StartDiscoveryLog` begins after the initial navigation and covers field input, the first search-button action, the resulting page transition, the second search-button action, responses, DOM mutations, and the final stability decision.
 * **Action waits remain enabled:** The input and click operations keep their normal post-action waits because route fields, the intermediate transition, and final submission may trigger asynchronous work.
-* **Intentional two-stage button sequence:** The prefix selector clicks the first button. That action changes the page, after which another button with the exact ID appears and is clicked by the second call. These calls are not duplicate submissions against one unchanged element. When adapting the sample, verify that each selector belongs to the intended page state before removing either action.
-* **How to diagnose failure:** Inspect the Discovery Log before adding fixed delays. Determine whether the problem is an incorrect selector, a transition that did not complete, relevant traffic excluded as noise, an untracked completion response, or a render that occurs after apparent network quiet.
+* **Intentional two-stage button sequence:** The prefix XPath (`starts-with`) clicks the first button. That action changes the page, after which another button with the exact ID appears and is clicked by the second call. These calls are not duplicate submissions against one unchanged element. When adapting the sample, verify that each XPath belongs to the intended page state before removing either action.
+* **How to diagnose failure:** Inspect the Discovery Log before adding fixed delays. Determine whether the problem is an incorrect XPath, a transition that did not complete, relevant traffic excluded as noise, an untracked completion response, or a render that occurs after apparent network quiet.
 
 ### 4. Main04: Manual Login Wait Using URL and Post-Navigation Activity
 This procedure opens a login page, lets the user authenticate manually, and waits for the browser to reach the expected authenticated URL.
@@ -132,28 +129,28 @@ This procedure demonstrates that not every browser action needs the same synchro
 This procedure targets an element inside an iframe by passing a WebDriver BiDi browsing-context ID directly to the action.
 
 * **Context discovery by URL:** `GetIframeContextIdByUrl` searches the current context tree for a child frame whose live URL contains the supplied fragment.
-* **Explicit action scope:** The returned context ID is passed to `ExecuteClickByXPath`, so the lookup and click run in that frame without changing SeleniumVBA's active frame.
+* **Explicit action scope:** The returned context ID is passed to `ExecuteClick`, so the lookup and click run in that frame without changing SeleniumVBA's active frame.
 * **What to customize:** Replace the top-level URL, iframe URL fragment, and in-frame XPath.
 * **How to diagnose failure:** Check the frame's actual post-navigation URL and hierarchy. Redirects, dynamically generated URLs, and additional nesting can make an old fragment stop matching.
 
 ### 7. Main07: Consent Auto-Clicker, Shadow DOM, and Explicit Network Gate
 This procedure is the ServiceNow validation scenario and combines several features needed for a difficult third-party SPA.
 
-* **Pre-navigation auto-clicker:** `ExecuteRegisterAutoClickerByXPath` is registered before navigation so the browser-side helper can dismiss the consent banner as soon as it appears.
-* **Shadow DOM interaction:** `ExecuteShadowClick` targets the sign-in button inside an encapsulated web component.
+* **Pre-navigation auto-clicker:** `ExecuteRegisterAutoClicker` is registered before navigation so the browser-side helper can dismiss the consent banner as soon as it appears.
+* **Shadow DOM interaction:** `ExecuteShadowClick "//*[@id='utility-sign-in']//button"` locates the sign-in button inside encapsulated web components with a single XPath. The wrapper descends through every ShadowRoot recursively.
 * **Arm-then-act network gate:** `ArmNetworkSignal "metadata/application"` is called immediately before the Shadow DOM click. The one-shot signal belongs to the next action wait and helps bridge the transition into the sign-in experience.
 * **End-to-end diagnostic log:** Recording starts before registration and navigation, allowing the log to preserve the consent action, navigation, armed response, mutation tail, and final username input.
-* **Site-specific details:** The consent XPath, shadow selector, username XPath, and network pattern are observations from the current ServiceNow implementation, not universal authentication signals.
+* **Site-specific details:** The consent XPath, Shadow DOM XPath, username XPath, and network pattern are observations from the current ServiceNow implementation, not universal authentication signals.
 
 ### 8. Main08: Google Flights Heavy SPA Stress Sample
 This procedure demonstrates how multiple synchronization techniques can be combined on a highly reactive live SPA.
 
-* **Selector resilience:** The sample favors ARIA roles and accessible labels over obfuscated CSS classes, sets `--lang=en`, and uses `[last()]` where Google may create or replace duplicate combobox inputs.
-* **Trusted input path:** `ExecuteInputValueByXPath` uses the wrapper's active-element-aware input flow to clear, type, and validate values while the framework may replace controls.
+* **Locator resilience:** The sample favors ARIA roles and accessible labels over obfuscated CSS classes, sets `--lang=en`, and uses `[last()]` where Google may create or replace duplicate combobox inputs.
+* **Trusted input path:** `ExecuteInputValue` uses the wrapper's active-element-aware input flow to clear, type, and validate values while the framework may replace controls.
 * **Traffic classification:** Non-essential resources are blocked, while required background requests are merely ignored for idle judgment. The Discovery Log remains the evidence source for revising both lists.
 * **Suggestion-selection gates:** Immediately before clicking the Sapporo suggestion, the sample arms `rpcids=tDoGIe`; immediately before clicking the Paris suggestion, it arms `rpcids=BVAT3`. Each click also requests a 1000 ms stable window. These signals were discovered from the current live workflow and may change independently.
 * **Calendar and result gates:** Before opening the departure calendar, the sample arms the `GetCalendarPicker` network signal and the visibility signal `//div[@data-gs]`. Before pressing Search, it arms `GetShoppingResults`. All `Arm*` signals are one-shot observations rather than stable public APIs.
-* **Live-site limitations:** City suggestions, date-cell positions, button labels, endpoint names, consent state, locale, and account state may change. Update selectors and signals from a fresh log instead of adding arbitrary delays.
+* **Live-site limitations:** City suggestions, date-cell positions, button labels, endpoint names, consent state, locale, and account state may change. Update XPath locators and signals from a fresh log instead of adding arbitrary delays.
 * **Expected outcome:** The example demonstrates a robust diagnostic strategy, but it cannot guarantee immunity from future Google UI or backend changes.
 
 ### 9. Main09: Manual Discovery Log Recorder
@@ -195,7 +192,7 @@ This procedure demonstrates the unified WebDriver BiDi download API using a repr
 
 * **HTTPS multiple-download fixture:** The sample uses the project's public GitHub Pages download probe at `docs/download-probe/index.html`, published as `https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/download-probe/`. The current fixture exposes three deterministic triggers: `#download-a`, `#download-b`, and `#download-c`, producing `bidi-batch-A.bin`, `bidi-batch-B.bin`, and `bidi-batch-C.bin`.
 * **Explicit destination folder:** The sample resolves `.\download-sample` through SeleniumVBA's `ResolvePath(..., False)`, creates the folder when necessary, and passes it to `SetDownloadFolder`. `SetDownloadFolder` performs its own API-boundary path normalization and existence check before sending `browser.setDownloadBehavior`.
-* **One unified API for one or many downloads:** `ExecuteDownloadsByXPath` accepts either a single XPath String or a collection/array of trigger XPaths. Main12 passes an array containing the three download triggers. A single download uses the same API and the same result structure, for example `ExecuteDownloadsByXPath("//*[@id='download-a']")`. There is no separate single-download execution path.
+* **One unified API for one or many downloads:** `ExecuteDownloads` accepts either a single XPath String or a collection/array of trigger XPaths. Main12 passes an array containing the three download triggers. A single download uses the same API and the same result structure, for example `ExecuteDownloads("//*[@id='download-a']")`. There is no separate single-download execution path.
 * **All trigger XPaths are resolved before dispatch:** The wrapper resolves every requested XPath before arming the download batch. If an XPath cannot be resolved, the operation fails before any download trigger is clicked, avoiding a partially dispatched batch.
 * **Sequential trusted clicks, overlapping download lifetimes:** Trigger clicks are dispatched sequentially and exactly once through the trusted-click path. The wrapper does not wait for each transfer to finish before dispatching the next trigger, so previously started downloads may still be running while later triggers are clicked. Ambiguous or failed click outcomes are not handled by replaying the trigger.
 * **Per-download correlation:** Each accepted `downloadWillBegin` becomes an individual transaction inside the returned `downloads` Dictionary. When the browser provides a usable download identifier, it can be used for correlation. When it does not, the wrapper can correlate by owner browsing context plus navigation identity. Main12 displays each transaction's correlation key, `correlationMode`, `suggestedFilename`, terminal `status`, and browser-reported `filePath`.
@@ -213,7 +210,7 @@ This procedure demonstrates the unified WebDriver BiDi download API using a repr
 This procedure demonstrates capturing a newly created top-level browsing context after one trigger click, identifying whether it is a tab or a separate window, and explicitly controlling which top-level context is treated as the wrapper's main context.
 
 * **HTTPS new-context fixture:** The sample uses the project's public GitHub Pages probe at `https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/new-context-probe/`. The page provides separate `#open-tab` and `#open-window` triggers so tab and window creation can be exercised deterministically.
-* **Resolve, arm, then click exactly once:** `ExecuteOpenNewContextByXPath` resolves the trigger element before arming capture, snapshots the current top-level context tree, then performs one trusted click and waits for `browsingContext.contextCreated`. A timeout or ambiguous outcome does not cause the trigger to be replayed.
+* **Resolve, arm, then click exactly once:** `ExecuteOpenNewContext` resolves the trigger element before arming capture, snapshots the current top-level context tree, then performs one trusted click and waits for `browsingContext.contextCreated`. A timeout or ambiguous outcome does not cause the trigger to be replayed.
 * **Owner correlation:** When `originalOpener` is present, a new top-level context is accepted only when its opener matches the owner context that was armed. Contexts opened by unrelated pages are ignored. If `originalOpener` is unavailable, the wrapper falls back to identifying a context that did not exist in the pre-click top-level baseline.
 * **Ambiguity is rejected rather than guessed:** If more than one new top-level context matches the single trigger, the operation fails instead of arbitrarily choosing one. Capture also fails if relevant lifecycle events are lost after the arm boundary or if the candidate context is destroyed before capture completes.
 * **Tab/window classification from `clientWindow`:** The returned `Dictionary` reports `kind` as `tab` when the captured context shares the owner's `clientWindow`, `window` when it has a different `clientWindow`, and `unknown` when the browser does not provide enough information. The result also exposes `context`, `url`, `originalOpener`, `clientWindow`, `ownerContext`, `ownerClientWindow`, `correlation`, `candidateCount`, and `foreignIgnored`.
