@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "6.3"
+Private Const BIDI_WRAPPER_VERSION As String = "6.4"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -203,7 +203,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const SPA_PROBE_VERSION As Long = 45 ' Internal probe generation/quiet/filter/health-diagnostic/observation-start/overflow contract
+Private Const SPA_PROBE_VERSION As Long = 46 ' Internal probe generation/quiet/filter/health-diagnostic/observation-start/overflow contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
 Private m_idleFilterRevision As Long          ' increments whenever VBA-side ignore filters change
@@ -2151,17 +2151,37 @@ End Function
 
 ' Executes one or more XPath download triggers through the shared transaction engine.
 ' triggerXpaths accepts one String XPath, a Variant array, or a Collection of XPath strings.
+' With searchShadow, an item may be a nested Array (scope chain):
+'   ExecuteDownloads Array(Array("//my-panel", "//a[@id='dl']")), searchShadow:=True
 Public Function ExecuteDownloads(ByVal triggerXpaths As Variant, _
-                                        Optional ByVal searchTimeoutMs As Long = 10000, _
-                                        Optional ByVal timeoutMs As Long = DEFAULT_DOWNLOAD_TIMEOUT_MS, _
-                                        Optional ByVal contextId As String = "", _
-                                        Optional ByVal allowCrossContext As Boolean = False) As Dictionary
+                                 Optional ByVal searchTimeoutMs As Long = 10000, _
+                                 Optional ByVal timeoutMs As Long = DEFAULT_DOWNLOAD_TIMEOUT_MS, _
+                                 Optional ByVal contextId As String = "", _
+                                 Optional ByVal allowCrossContext As Boolean = False, _
+                                 Optional ByVal searchShadow As Boolean = False, _
+                                 Optional ByVal requireUnlocker As Boolean = False) As Dictionary
+    Const METHOD_NAME As String = "ExecuteDownloads"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME)
+
     Dim triggers As Collection
-    Set triggers = NormalizeDownloadTriggerXpaths(triggerXpaths, "ExecuteDownloads")
+    If kind = ElementLocatorShadowXPath Then
+        Set triggers = NormalizeShadowDownloadTriggers(triggerXpaths, METHOD_NAME)
+    Else
+        Set triggers = NormalizeDownloadTriggerXpaths(triggerXpaths, METHOD_NAME)
+    End If
 
     Set ExecuteDownloads = ExecuteDownloadsCore( _
-        ElementLocatorXPath, triggers, searchTimeoutMs, timeoutMs, contextId, _
-        "ExecuteDownloads", allowCrossContext)
+        kind, triggers, searchTimeoutMs, timeoutMs, contextId, _
+        METHOD_NAME, allowCrossContext)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
 ' Runs the download batch transaction for XPath trigger locators.
@@ -2549,13 +2569,26 @@ Private Function IsTransientWindowContextReadError(ByVal errNum As Long, _
          (InStr(d, "not found") > 0))
 End Function
 
-Public Function ExecuteOpenNewContext(ByVal triggerXPath As String, _
-                                              Optional ByVal searchTimeoutMs As Long = 10000, _
-                                              Optional ByVal timeoutMs As Long = 10000, _
-                                              Optional ByVal ownerContextId As String = "") As Dictionary
+Public Function ExecuteOpenNewContext(ByVal triggerXPath As Variant, _
+                                      Optional ByVal searchTimeoutMs As Long = 10000, _
+                                      Optional ByVal timeoutMs As Long = 10000, _
+                                      Optional ByVal ownerContextId As String = "", _
+                                      Optional ByVal searchShadow As Boolean = False, _
+                                      Optional ByVal requireUnlocker As Boolean = False) As Dictionary
+    Const METHOD_NAME As String = "ExecuteOpenNewContext"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, triggerXPath)
+
     Set ExecuteOpenNewContext = ExecuteOpenNewContextCore( _
-        ElementLocatorXPath, triggerXPath, searchTimeoutMs, timeoutMs, ownerContextId, _
-        "ExecuteOpenNewContext")
+        kind, triggerXPath, searchTimeoutMs, timeoutMs, ownerContextId, METHOD_NAME)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
 ' Runs the new-context capture transaction for XPath trigger locators.
@@ -3123,12 +3156,19 @@ End Function
 
 
 ' Public compatibility facade. Basic operations delegate to the unified element core.
-Public Function ExecuteIsElementVisible(ByVal xpath As String, _
+Public Function ExecuteIsElementVisible(ByVal xpath As Variant, _
                                         Optional ByVal searchTimeoutMs As Long = 10000, _
                                         Optional ByVal waitNetworkIdle As Boolean = False, _
                                         Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
                                         Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                        Optional ByVal contextId As String = "") As Boolean
+                                        Optional ByVal contextId As String = "", _
+                                        Optional ByVal searchShadow As Boolean = False, _
+                                        Optional ByVal requireUnlocker As Boolean = False) As Boolean
+    Const METHOD_NAME As String = "ExecuteIsElementVisible"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     Dim vSearchTimeout As Long
     If searchTimeoutMs = 0 Then
         vSearchTimeout = 0
@@ -3138,51 +3178,114 @@ Public Function ExecuteIsElementVisible(ByVal xpath As String, _
 
     Dim noValue As Variant
     ExecuteIsElementVisible = CBool(ExecuteElementActionCore( _
-        ElementLocatorXPath, xpath, ElementActionVisibilityCheck, False, noValue, _
+        kind, xpath, ElementActionVisibilityCheck, False, noValue, _
         vSearchTimeout, True, waitNetworkIdle, _
         SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
         SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS), _
-        False, contextId, "ExecuteIsElementVisible"))
+        False, contextId, METHOD_NAME))
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
-Public Function ExecuteGetText(ByVal xpath As String, _
-                                      Optional ByVal searchTimeoutMs As Long = 10000, _
-                                      Optional ByVal contextId As String = "") As String
+Public Function ExecuteGetText(ByVal xpath As Variant, _
+                               Optional ByVal searchTimeoutMs As Long = 10000, _
+                               Optional ByVal contextId As String = "", _
+                               Optional ByVal searchShadow As Boolean = False, _
+                               Optional ByVal requireUnlocker As Boolean = False) As String
+    Const METHOD_NAME As String = "ExecuteGetText"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     Dim noValue As Variant
     ExecuteGetText = CStr(ExecuteElementActionCore( _
-        ElementLocatorXPath, xpath, ElementActionGetText, False, noValue, _
+        kind, xpath, ElementActionGetText, False, noValue, _
         searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
-        False, contextId, "ExecuteGetText"))
+        False, contextId, METHOD_NAME))
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
-Public Function ExecuteGetAttribute(ByVal xpath As String, _
-                                           ByVal attributeName As String, _
-                                           Optional ByVal searchTimeoutMs As Long = 10000, _
-                                           Optional ByVal contextId As String = "") As Variant
+Public Function ExecuteGetAttribute(ByVal xpath As Variant, _
+                                    ByVal attributeName As String, _
+                                    Optional ByVal searchTimeoutMs As Long = 10000, _
+                                    Optional ByVal contextId As String = "", _
+                                    Optional ByVal searchShadow As Boolean = False, _
+                                    Optional ByVal requireUnlocker As Boolean = False) As Variant
+    Const METHOD_NAME As String = "ExecuteGetAttribute"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     ExecuteGetAttribute = ExecuteElementActionCore( _
-        ElementLocatorXPath, xpath, ElementActionGetAttribute, True, attributeName, _
+        kind, xpath, ElementActionGetAttribute, True, attributeName, _
         searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
-        False, contextId, "ExecuteGetAttribute")
+        False, contextId, METHOD_NAME)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
-Public Function ExecuteGetProperty(ByVal xpath As String, _
-                                          ByVal propertyName As String, _
-                                          Optional ByVal searchTimeoutMs As Long = 10000, _
-                                          Optional ByVal contextId As String = "") As Variant
+Public Function ExecuteGetProperty(ByVal xpath As Variant, _
+                                   ByVal propertyName As String, _
+                                   Optional ByVal searchTimeoutMs As Long = 10000, _
+                                   Optional ByVal contextId As String = "", _
+                                   Optional ByVal searchShadow As Boolean = False, _
+                                   Optional ByVal requireUnlocker As Boolean = False) As Variant
+    Const METHOD_NAME As String = "ExecuteGetProperty"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     ExecuteGetProperty = ExecuteElementActionCore( _
-        ElementLocatorXPath, xpath, ElementActionGetProperty, True, propertyName, _
+        kind, xpath, ElementActionGetProperty, True, propertyName, _
         searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
-        False, contextId, "ExecuteGetProperty")
+        False, contextId, METHOD_NAME)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
-Public Function ExecuteGetOuterHtml(ByVal xpath As String, _
-                                           Optional ByVal searchTimeoutMs As Long = 10000, _
-                                           Optional ByVal contextId As String = "") As String
+Public Function ExecuteGetOuterHtml(ByVal xpath As Variant, _
+                                    Optional ByVal searchTimeoutMs As Long = 10000, _
+                                    Optional ByVal contextId As String = "", _
+                                    Optional ByVal searchShadow As Boolean = False, _
+                                    Optional ByVal requireUnlocker As Boolean = False) As String
+    Const METHOD_NAME As String = "ExecuteGetOuterHtml"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     Dim noValue As Variant
     ExecuteGetOuterHtml = CStr(ExecuteElementActionCore( _
-        ElementLocatorXPath, xpath, ElementActionGetOuterHtml, False, noValue, _
+        kind, xpath, ElementActionGetOuterHtml, False, noValue, _
         searchTimeoutMs, False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, _
-        False, contextId, "ExecuteGetOuterHtml"))
+        False, contextId, METHOD_NAME))
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
 Private Function NewLocalValue(ByVal valueType As String, ByVal value As Variant) As Dictionary
@@ -4026,46 +4129,88 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
     End If
 End Function
 
-Public Function ExecuteClick(ByVal xpath As String, _
-                                    Optional ByVal searchTimeoutMs As Long = 10000, _
-                                    Optional ByVal waitNetworkIdle As Boolean = True, _
-                                    Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                    Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                    Optional ByVal contextId As String = "", _
-                                    Optional ByVal checkUrl As Boolean = False) As String
+Public Function ExecuteClick(ByVal xpath As Variant, _
+                             Optional ByVal searchTimeoutMs As Long = 10000, _
+                             Optional ByVal waitNetworkIdle As Boolean = True, _
+                             Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                             Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                             Optional ByVal contextId As String = "", _
+                             Optional ByVal checkUrl As Boolean = False, _
+                             Optional ByVal searchShadow As Boolean = False, _
+                             Optional ByVal requireUnlocker As Boolean = False) As String
+    Const METHOD_NAME As String = "ExecuteClick"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     Dim noValue As Variant
     ExecuteClick = CStr(ExecuteElementActionCore( _
-        ElementLocatorXPath, xpath, ElementActionClick, False, noValue, _
+        kind, xpath, ElementActionClick, False, noValue, _
         searchTimeoutMs, True, waitNetworkIdle, minStableMs, maxTimeoutMs, _
-        checkUrl, contextId, "ExecuteClick", True))
+        checkUrl, contextId, METHOD_NAME, True))
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
-Public Function ExecuteInputValue(ByVal xpath As String, _
-                                         ByVal valueToSet As String, _
-                                         Optional ByVal searchTimeoutMs As Long = 10000, _
-                                         Optional ByVal waitNetworkIdle As Boolean = True, _
-                                         Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                         Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                         Optional ByVal contextId As String = "", _
-                                         Optional ByVal useKeyEvents As Boolean = True, _
-                                         Optional ByVal useNativeKeys As Boolean = False, _
-                                         Optional ByVal selectAllFirst As Boolean = False) As String
+Public Function ExecuteInputValue(ByVal xpath As Variant, _
+                                  ByVal valueToSet As String, _
+                                  Optional ByVal searchTimeoutMs As Long = 10000, _
+                                  Optional ByVal waitNetworkIdle As Boolean = True, _
+                                  Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                  Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                  Optional ByVal contextId As String = "", _
+                                  Optional ByVal useKeyEvents As Boolean = True, _
+                                  Optional ByVal useNativeKeys As Boolean = False, _
+                                  Optional ByVal selectAllFirst As Boolean = False, _
+                                  Optional ByVal searchShadow As Boolean = False, _
+                                  Optional ByVal requireUnlocker As Boolean = False) As String
+    Const METHOD_NAME As String = "ExecuteInputValue"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     ExecuteInputValue = ExecuteInputValueCore( _
-        ElementLocatorXPath, xpath, valueToSet, searchTimeoutMs, waitNetworkIdle, _
+        kind, xpath, valueToSet, searchTimeoutMs, waitNetworkIdle, _
         minStableMs, maxTimeoutMs, contextId, useKeyEvents, useNativeKeys, _
-        "ExecuteInputValue", selectAllFirst)
+        METHOD_NAME, selectAllFirst)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
-Public Function ExecuteSetFiles(ByVal xpath As String, _
-                                       ByVal filePaths As Variant, _
-                                       Optional ByVal searchTimeoutMs As Long = 10000, _
-                                       Optional ByVal waitNetworkIdle As Boolean = True, _
-                                       Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                       Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                       Optional ByVal contextId As String = "") As String
+Public Function ExecuteSetFiles(ByVal xpath As Variant, _
+                                ByVal filePaths As Variant, _
+                                Optional ByVal searchTimeoutMs As Long = 10000, _
+                                Optional ByVal waitNetworkIdle As Boolean = True, _
+                                Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                Optional ByVal contextId As String = "", _
+                                Optional ByVal searchShadow As Boolean = False, _
+                                Optional ByVal requireUnlocker As Boolean = False) As String
+    Const METHOD_NAME As String = "ExecuteSetFiles"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     ExecuteSetFiles = ExecuteSetFilesCore( _
-        ElementLocatorXPath, xpath, filePaths, searchTimeoutMs, waitNetworkIdle, _
-        minStableMs, maxTimeoutMs, contextId, "ExecuteSetFiles")
+        kind, xpath, filePaths, searchTimeoutMs, waitNetworkIdle, _
+        minStableMs, maxTimeoutMs, contextId, METHOD_NAME)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
 ' Shares input.setFiles across locator types.
@@ -4139,16 +4284,30 @@ End Function
 ' an ambiguous outcome. If the final completion wait fails after input.setFiles succeeds, the
 ' raised error is prefixed PostSelectionCompletionFailed and explicitly warns that selection may
 ' already have started application work; callers must not blindly retry the whole operation.
-Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As String, _
-                                                  ByVal filePaths As Variant, _
-                                                  Optional ByVal searchTimeoutMs As Long = 10000, _
-                                                  Optional ByVal fileDialogTimeoutMs As Long = 10000, _
-                                                  Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                                  Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                                  Optional ByVal contextId As String = "") As String
+Public Function ExecuteSetFileSelectionViaDialog(ByVal triggerXPath As Variant, _
+                                                 ByVal filePaths As Variant, _
+                                                 Optional ByVal searchTimeoutMs As Long = 10000, _
+                                                 Optional ByVal fileDialogTimeoutMs As Long = 10000, _
+                                                 Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                                 Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                                 Optional ByVal contextId As String = "", _
+                                                 Optional ByVal searchShadow As Boolean = False, _
+                                                 Optional ByVal requireUnlocker As Boolean = False) As String
+    Const METHOD_NAME As String = "ExecuteSetFileSelectionViaDialog"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, triggerXPath)
+
     ExecuteSetFileSelectionViaDialog = ExecuteSetFileSelectionViaDialogCore( _
-        ElementLocatorXPath, triggerXPath, filePaths, searchTimeoutMs, fileDialogTimeoutMs, _
-        minStableMs, maxTimeoutMs, contextId, "ExecuteSetFileSelectionViaDialog")
+        kind, triggerXPath, filePaths, searchTimeoutMs, fileDialogTimeoutMs, _
+        minStableMs, maxTimeoutMs, contextId, METHOD_NAME)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
 ' Runs the native file-chooser transaction for XPath trigger locators.
@@ -5140,16 +5299,30 @@ Private Function ExecuteSelectValueCore(ByVal locatorKind As ElementLocatorKind,
     End If
 End Function
 
-Public Function ExecuteSelectValue(ByVal xpath As String, _
-                                          ByVal valueOrText As String, _
-                                          Optional ByVal selectByText As Boolean = False, _
-                                          Optional ByVal searchTimeoutMs As Long = 10000, _
-                                          Optional ByVal waitNetworkIdle As Boolean = True, _
-                                          Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                          Optional ByVal contextId As String = "") As String
+Public Function ExecuteSelectValue(ByVal xpath As Variant, _
+                                   ByVal valueOrText As String, _
+                                   Optional ByVal selectByText As Boolean = False, _
+                                   Optional ByVal searchTimeoutMs As Long = 10000, _
+                                   Optional ByVal waitNetworkIdle As Boolean = True, _
+                                   Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                   Optional ByVal contextId As String = "", _
+                                   Optional ByVal searchShadow As Boolean = False, _
+                                   Optional ByVal requireUnlocker As Boolean = False) As String
+    Const METHOD_NAME As String = "ExecuteSelectValue"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     ExecuteSelectValue = ExecuteSelectValueCore( _
-        ElementLocatorXPath, xpath, valueOrText, selectByText, searchTimeoutMs, _
-        waitNetworkIdle, maxTimeoutMs, contextId, "ExecuteSelectValue")
+        kind, xpath, valueOrText, selectByText, searchTimeoutMs, _
+        waitNetworkIdle, maxTimeoutMs, contextId, METHOD_NAME)
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
 Private Function ExecuteBrowsingContextLocateNodes(ByVal xpath As String, _
@@ -5660,17 +5833,124 @@ Private Sub ReraiseShadowPublicError(ByVal errorNumber As Long, _
     Err.Raise errorNumber, errorSource, errorDescription
 End Sub
 
+' searchShadow helpers: locator-kind selection and Shadow download triggers.
+' Maps searchShadow to a locator kind and validates Shadow-only options.
+' locator is omitted by callers whose plain Array has another meaning (Downloads).
+Private Function SelectElementLocatorKind(ByVal searchShadow As Boolean, _
+                                          ByVal requireUnlocker As Boolean, _
+                                          ByVal callerName As String, _
+                                          Optional ByVal locator As Variant) As ElementLocatorKind
+    If searchShadow Then
+        ValidateShadowUnlockerRequirement requireUnlocker, callerName
+        SelectElementLocatorKind = ElementLocatorShadowXPath
+        Exit Function
+    End If
+
+    If requireUnlocker Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "requireUnlocker requires searchShadow:=True."
+    End If
+    If Not IsMissing(locator) Then
+        If IsArray(locator) Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                      "An XPath scope chain (Array) requires searchShadow:=True."
+        End If
+    End If
+    SelectElementLocatorKind = ElementLocatorXPath
+End Function
+
+' Shadow searches add the Unlocker diagnostic; XPath errors pass through unchanged.
+Private Sub ReraiseElementLocatorError(ByVal locatorKind As ElementLocatorKind, _
+                                       ByVal errorNumber As Long, _
+                                       ByVal errorSource As String, _
+                                       ByVal errorDescription As String, _
+                                       ByVal callerName As String)
+    If locatorKind = ElementLocatorShadowXPath Then
+        ReraiseShadowPublicError errorNumber, errorSource, errorDescription, callerName
+    Else
+        If Len(errorSource) = 0 Then errorSource = "BiDi:" & callerName
+        Err.Raise errorNumber, errorSource, errorDescription
+    End If
+End Sub
+
+' Shadow download triggers: items are String or Variant array (scope chain).
+' XPath contract checks stay in BuildShadowXPathArg.
+Private Function NormalizeShadowDownloadTriggers(ByVal triggers As Variant, _
+                                                 ByVal methodName As String) As Collection
+    Dim result As New Collection
+    Dim item As Variant
+    Dim i As Long
+
+    On Error GoTo InvalidInput
+
+    If IsObject(triggers) Then
+        If TypeName(triggers) <> "Collection" Then GoTo InvalidInput
+        For Each item In triggers
+            AddShadowDownloadTrigger result, item
+        Next item
+    ElseIf IsArray(triggers) Then
+        For i = LBound(triggers) To UBound(triggers)
+            AddShadowDownloadTrigger result, triggers(i)
+        Next i
+    Else
+        AddShadowDownloadTrigger result, triggers
+    End If
+
+    If result.count = 0 Then GoTo InvalidInput
+    Set NormalizeShadowDownloadTriggers = result
+    Exit Function
+
+InvalidInput:
+    Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
+              "With searchShadow:=True, triggerXpaths must be a non-empty XPath String, or a Variant " & _
+              "array / Collection whose items are non-empty XPath Strings or non-empty arrays of " & _
+              "XPath Strings (scope chain)."
+End Function
+
+' Raises on invalid input; the caller maps every error to one message.
+Private Sub AddShadowDownloadTrigger(ByVal result As Collection, ByVal item As Variant)
+    Dim s As String
+
+    If IsObject(item) Or IsNull(item) Or IsEmpty(item) Then Err.Raise ERR_ACTION_FAILED
+
+    If IsArray(item) Then
+        Dim chain() As Variant
+        Dim lb As Long, ub As Long, i As Long
+        lb = LBound(item): ub = UBound(item)
+        If ub < lb Then Err.Raise ERR_ACTION_FAILED
+        ReDim chain(0 To ub - lb)
+        For i = lb To ub
+            If IsObject(item(i)) Or IsNull(item(i)) Or IsArray(item(i)) Then Err.Raise ERR_ACTION_FAILED
+            s = Trim$(CStr(item(i)))
+            If Len(s) = 0 Then Err.Raise ERR_ACTION_FAILED
+            chain(i - lb) = s
+        Next i
+        result.Add chain
+    Else
+        s = Trim$(CStr(item))
+        If Len(s) = 0 Then Err.Raise ERR_ACTION_FAILED
+        result.Add s
+    End If
+End Sub
+
 ' Basic element operations use BiDiElementAction for both XPath and Shadow locators.
 ' Executes a basic element action against an XPath locator.
-Public Function ExecuteElementAction(ByVal xpath As String, _
-                                            ByVal actionType As BiDiElementAction, _
-                                            Optional ByVal value As Variant, _
-                                            Optional ByVal searchTimeoutMs As Long = 10000, _
-                                            Optional ByVal waitNetworkIdle As Variant, _
-                                            Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                            Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                            Optional ByVal contextId As String = "", _
-                                            Optional ByVal checkUrl As Boolean = False) As Variant
+Public Function ExecuteElementAction(ByVal xpath As Variant, _
+                                     ByVal actionType As BiDiElementAction, _
+                                     Optional ByVal value As Variant, _
+                                     Optional ByVal searchTimeoutMs As Long = 10000, _
+                                     Optional ByVal waitNetworkIdle As Variant, _
+                                     Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
+                                     Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
+                                     Optional ByVal contextId As String = "", _
+                                     Optional ByVal checkUrl As Boolean = False, _
+                                     Optional ByVal searchShadow As Boolean = False, _
+                                     Optional ByVal requireUnlocker As Boolean = False) As Variant
+    Const METHOD_NAME As String = "ExecuteElementAction"
+    Dim kind As ElementLocatorKind
+    On Error GoTo Failed
+    kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+
     Dim hasValue As Boolean
     Dim actionValue As Variant
     hasValue = Not IsMissing(value)
@@ -5681,16 +5961,29 @@ Public Function ExecuteElementAction(ByVal xpath As String, _
     hasWaitOverride = Not IsMissing(waitNetworkIdle)
     If hasWaitOverride Then
         If VarType(waitNetworkIdle) <> vbBoolean Then
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteElementAction", _
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, _
                       "waitNetworkIdle must be Boolean."
         End If
         waitValue = CBool(waitNetworkIdle)
     End If
 
-    ExecuteElementAction = ExecuteElementActionCore( _
-        ElementLocatorXPath, xpath, actionType, hasValue, actionValue, searchTimeoutMs, _
+    Dim result As Variant
+    result = ExecuteElementActionCore( _
+        kind, xpath, actionType, hasValue, actionValue, searchTimeoutMs, _
         hasWaitOverride, waitValue, minStableMs, maxTimeoutMs, checkUrl, contextId, _
-        "ExecuteElementAction")
+        METHOD_NAME)
+    If IsObject(result) Then
+        Set ExecuteElementAction = result
+    Else
+        ExecuteElementAction = result
+    End If
+    Exit Function
+
+Failed:
+    Dim errorNumber As Long: errorNumber = Err.Number
+    Dim errorSource As String: errorSource = Err.source
+    Dim errorDescription As String: errorDescription = Err.description
+    ReraiseElementLocatorError kind, errorNumber, errorSource, errorDescription, METHOD_NAME
 End Function
 
 ' ===== Shadow DOM element resolution (XPath) =====
@@ -5887,178 +6180,6 @@ Private Function ResolveShadowElementSharedId(ByVal xpaths As Variant, _
                   "Shadow element not found within " & timeoutLabel & _
                   "ms for Shadow XPath: " & ShadowXPathLocatorSummary(xpaths)
     End If
-End Function
-
-' Centralizes Shadow facade validation and diagnostics.
-Private Function ExecuteShadowElementActionCore(ByVal xpaths As Variant, _
-                                                ByVal actionType As BiDiElementAction, _
-                                                ByVal hasValue As Boolean, _
-                                                ByVal value As Variant, _
-                                                ByVal searchTimeoutMs As Long, _
-                                                ByVal hasWaitNetworkIdle As Boolean, _
-                                                ByVal waitNetworkIdleValue As Boolean, _
-                                                ByVal minStableMs As Long, _
-                                                ByVal maxTimeoutMs As Long, _
-                                                ByVal checkUrl As Boolean, _
-                                                ByVal contextId As String, _
-                                                ByVal requireUnlocker As Boolean, _
-                                                ByVal callerName As String, _
-                                                Optional ByVal returnRaw As Boolean = False) As Variant
-    On Error GoTo Failed
-    ValidateShadowUnlockerRequirement requireUnlocker, callerName
-
-    ExecuteShadowElementActionCore = ExecuteElementActionCore( _
-        ElementLocatorShadowXPath, xpaths, actionType, hasValue, value, _
-        searchTimeoutMs, hasWaitNetworkIdle, waitNetworkIdleValue, minStableMs, _
-        maxTimeoutMs, checkUrl, contextId, callerName, returnRaw)
-    Exit Function
-
-Failed:
-    Dim errorNumber As Long: errorNumber = Err.Number
-    Dim errorSource As String: errorSource = Err.source
-    Dim errorDescription As String: errorDescription = Err.description
-    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, callerName
-End Function
-
-' Executes the same basic element actions against an element inside (nested) Shadow DOM.
-Public Function ExecuteShadowElementAction(ByVal xpaths As Variant, _
-                                           ByVal actionType As BiDiElementAction, _
-                                           Optional ByVal value As Variant, _
-                                           Optional ByVal searchTimeoutMs As Long = 10000, _
-                                           Optional ByVal waitNetworkIdle As Variant, _
-                                           Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                           Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                           Optional ByVal contextId As String = "", _
-                                           Optional ByVal checkUrl As Boolean = False, _
-                                           Optional ByVal requireUnlocker As Boolean = False) As Variant
-    Dim hasValue As Boolean
-    Dim actionValue As Variant
-    hasValue = Not IsMissing(value)
-    If hasValue Then actionValue = value
-
-    Dim hasWaitOverride As Boolean
-    Dim waitValue As Boolean
-    hasWaitOverride = Not IsMissing(waitNetworkIdle)
-    If hasWaitOverride Then
-        If VarType(waitNetworkIdle) <> vbBoolean Then
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ExecuteShadowElementAction", _
-                      "waitNetworkIdle must be Boolean."
-        End If
-        waitValue = CBool(waitNetworkIdle)
-    End If
-
-    ExecuteShadowElementAction = ExecuteShadowElementActionCore( _
-        xpaths, actionType, hasValue, actionValue, searchTimeoutMs, _
-        hasWaitOverride, waitValue, minStableMs, maxTimeoutMs, checkUrl, _
-        contextId, requireUnlocker, "ExecuteShadowElementAction")
-End Function
-
-Public Function ExecuteShadowClick(ByVal xpaths As Variant, _
-                                   Optional ByVal searchTimeoutMs As Long = 10000, _
-                                   Optional ByVal waitNetworkIdle As Boolean = True, _
-                                   Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                   Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                   Optional ByVal contextId As String = "", _
-                                   Optional ByVal requireUnlocker As Boolean = False, _
-                                   Optional ByVal checkUrl As Boolean = False) As String
-    Dim noValue As Variant
-    ExecuteShadowClick = CStr(ExecuteShadowElementActionCore( _
-        xpaths, ElementActionClick, False, noValue, searchTimeoutMs, _
-        True, waitNetworkIdle, minStableMs, maxTimeoutMs, checkUrl, contextId, _
-        requireUnlocker, "ExecuteShadowClick", True))
-End Function
-
-Public Function ExecuteShadowInputValue(ByVal xpaths As Variant, _
-                                        ByVal valueToSet As String, _
-                                        Optional ByVal searchTimeoutMs As Long = 10000, _
-                                        Optional ByVal waitNetworkIdle As Boolean = True, _
-                                        Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                        Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                        Optional ByVal contextId As String = "", _
-                                        Optional ByVal useKeyEvents As Boolean = True, _
-                                        Optional ByVal useNativeKeys As Boolean = False, _
-                                        Optional ByVal requireUnlocker As Boolean = False) As String
-    On Error GoTo Failed
-    ValidateShadowUnlockerRequirement requireUnlocker, "ExecuteShadowInputValue"
-
-    ExecuteShadowInputValue = ExecuteInputValueCore( _
-        ElementLocatorShadowXPath, xpaths, valueToSet, searchTimeoutMs, _
-        waitNetworkIdle, minStableMs, maxTimeoutMs, contextId, useKeyEvents, _
-        useNativeKeys, "ExecuteShadowInputValue")
-    Exit Function
-
-Failed:
-    Dim errorNumber As Long: errorNumber = Err.Number
-    Dim errorSource As String: errorSource = Err.source
-    Dim errorDescription As String: errorDescription = Err.description
-    ReraiseShadowPublicError errorNumber, errorSource, errorDescription, "ExecuteShadowInputValue"
-End Function
-
-Public Function ExecuteShadowGetText(ByVal xpaths As Variant, _
-                                     Optional ByVal searchTimeoutMs As Long = 10000, _
-                                     Optional ByVal contextId As String = "", _
-                                     Optional ByVal requireUnlocker As Boolean = False) As String
-    Dim noValue As Variant
-    ExecuteShadowGetText = CStr(ExecuteShadowElementActionCore( _
-        xpaths, ElementActionGetText, False, noValue, searchTimeoutMs, _
-        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
-        contextId, requireUnlocker, "ExecuteShadowGetText"))
-End Function
-
-Public Function ExecuteShadowGetAttribute(ByVal xpaths As Variant, _
-                                          ByVal attributeName As String, _
-                                          Optional ByVal searchTimeoutMs As Long = 10000, _
-                                          Optional ByVal contextId As String = "", _
-                                          Optional ByVal requireUnlocker As Boolean = False) As Variant
-    ExecuteShadowGetAttribute = ExecuteShadowElementActionCore( _
-        xpaths, ElementActionGetAttribute, True, attributeName, searchTimeoutMs, _
-        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
-        contextId, requireUnlocker, "ExecuteShadowGetAttribute")
-End Function
-
-Public Function ExecuteShadowGetProperty(ByVal xpaths As Variant, _
-                                         ByVal propertyName As String, _
-                                         Optional ByVal searchTimeoutMs As Long = 10000, _
-                                         Optional ByVal contextId As String = "", _
-                                         Optional ByVal requireUnlocker As Boolean = False) As Variant
-    ExecuteShadowGetProperty = ExecuteShadowElementActionCore( _
-        xpaths, ElementActionGetProperty, True, propertyName, searchTimeoutMs, _
-        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
-        contextId, requireUnlocker, "ExecuteShadowGetProperty")
-End Function
-
-Public Function ExecuteShadowGetOuterHtml(ByVal xpaths As Variant, _
-                                          Optional ByVal searchTimeoutMs As Long = 10000, _
-                                          Optional ByVal contextId As String = "", _
-                                          Optional ByVal requireUnlocker As Boolean = False) As String
-    Dim noValue As Variant
-    ExecuteShadowGetOuterHtml = CStr(ExecuteShadowElementActionCore( _
-        xpaths, ElementActionGetOuterHtml, False, noValue, searchTimeoutMs, _
-        False, False, DEFAULT_IDLE_STABLE_MS, DEFAULT_IDLE_TIMEOUT_MS, False, _
-        contextId, requireUnlocker, "ExecuteShadowGetOuterHtml"))
-End Function
-
-Public Function ExecuteShadowIsElementVisible(ByVal xpaths As Variant, _
-                                              Optional ByVal searchTimeoutMs As Long = 10000, _
-                                              Optional ByVal waitNetworkIdle As Boolean = False, _
-                                              Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS, _
-                                              Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                              Optional ByVal contextId As String = "", _
-                                              Optional ByVal requireUnlocker As Boolean = False) As Boolean
-    Dim vSearchTimeout As Long
-    If searchTimeoutMs = 0 Then
-        vSearchTimeout = 0
-    Else
-        vSearchTimeout = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 2000)
-    End If
-
-    Dim noValue As Variant
-    ExecuteShadowIsElementVisible = CBool(ExecuteShadowElementActionCore( _
-        xpaths, ElementActionVisibilityCheck, False, noValue, vSearchTimeout, _
-        True, waitNetworkIdle, _
-        SanitizeMs(minStableMs, "minStableMs", DEFAULT_IDLE_STABLE_MS), _
-        SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS), _
-        False, contextId, requireUnlocker, "ExecuteShadowIsElementVisible"))
 End Function
 
 ' Feasibility probe for the current browser/page. Temporarily attaches a test host to the page,
@@ -7404,10 +7525,14 @@ End Sub
 ' AutoClicker uses script.addPreloadScript. addPreloadScript is state-changing and a lost
 ' response can mean that the browser installed a preload whose script ID the wrapper never learned.
 ' A7 makes browser-side behavior generation-idempotent.
-Public Sub ExecuteRegisterAutoClicker(ByVal xpath As String, _
-                                             Optional ByVal timeoutMs As Long = 30000)
-    ExecuteRegisterAutoClickerCore BuildAutoClickerXPathKey(xpath), timeoutMs, _
-                                   "ExecuteRegisterAutoClicker"
+Public Sub ExecuteRegisterAutoClicker(ByVal xpath As Variant, _
+                                      Optional ByVal timeoutMs As Long = 30000, _
+                                      Optional ByVal searchShadow As Boolean = False, _
+                                      Optional ByVal requireUnlocker As Boolean = False)
+    Const METHOD_NAME As String = "ExecuteRegisterAutoClicker"
+    Call SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
+    ExecuteRegisterAutoClickerCore BuildAutoClickerKey(xpath, searchShadow, METHOD_NAME), _
+                                   timeoutMs, METHOD_NAME
 End Sub
 
 Private Sub ExecuteRegisterAutoClickerCore(ByVal registrationKey As String, _
@@ -7550,9 +7675,11 @@ Private Sub ExecuteRegisterAutoClickerCore(ByVal registrationKey As String, _
     End If
 End Sub
 
-Public Function ExecuteUnregisterAutoClicker(ByVal xpath As String) As Boolean
+Public Function ExecuteUnregisterAutoClicker(ByVal xpath As Variant, _
+                                             Optional ByVal searchShadow As Boolean = False) As Boolean
+    Const METHOD_NAME As String = "ExecuteUnregisterAutoClicker"
     ExecuteUnregisterAutoClicker = ExecuteUnregisterAutoClickerCore( _
-        BuildAutoClickerXPathKey(xpath), "ExecuteUnregisterAutoClicker")
+        BuildAutoClickerKey(xpath, searchShadow, METHOD_NAME), METHOD_NAME)
 End Function
 
 Private Function ExecuteUnregisterAutoClickerCore(ByVal registrationKey As String, _
@@ -7621,9 +7748,56 @@ Private Function BuildAutoClickerXPathKey(ByVal xpath As String) As String
     BuildAutoClickerXPathKey = "X|" & xpath
 End Function
 
+' "X|<xpath>" for document XPath; "S|<json array>" for Shadow scope chains.
+Private Function BuildAutoClickerKey(ByVal xpath As Variant, _
+                                     ByVal searchShadow As Boolean, _
+                                     ByVal callerName As String) As String
+    If searchShadow Then
+        BuildAutoClickerKey = "S|" & BuildShadowXPathJson(xpath, callerName)
+        Exit Function
+    End If
+    If IsArray(xpath) Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "An XPath scope chain (Array) requires searchShadow:=True."
+    End If
+    BuildAutoClickerKey = BuildAutoClickerXPathKey(CStr(xpath))
+End Function
+
+' Validated Shadow XPath scope chain as a JSON array literal for browser-side scripts.
+Private Function BuildShadowXPathJson(ByVal xpaths As Variant, _
+                                      ByVal callerName As String) As String
+    Dim body As String
+    Dim itemCount As Long
+    Dim i As Long
+
+    If IsArray(xpaths) Then
+        For i = LBound(xpaths) To UBound(xpaths)
+            If itemCount > 0 Then body = body & ","
+            body = body & WebJsonConverter.ConvertToJson( _
+                NormalizeShadowXPath(CStr(xpaths(i)), callerName))
+            itemCount = itemCount + 1
+        Next i
+    ElseIf VarType(xpaths) = vbString Then
+        body = WebJsonConverter.ConvertToJson(NormalizeShadowXPath(CStr(xpaths), callerName))
+        itemCount = 1
+    Else
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "Shadow XPath locator must be a String or an array of Strings."
+    End If
+
+    If itemCount = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+                  "Shadow XPath path must contain at least one XPath."
+    End If
+
+    BuildShadowXPathJson = "[" & body & "]"
+End Function
+
 Private Function AutoClickerLocatorSummary(ByVal registrationKey As String) As String
     If Left$(registrationKey, 2) = "X|" Then
         AutoClickerLocatorSummary = "XPath=" & Mid$(registrationKey, 3)
+    ElseIf Left$(registrationKey, 2) = "S|" Then
+        AutoClickerLocatorSummary = "ShadowXPath=" & Mid$(registrationKey, 3)
     Else
         AutoClickerLocatorSummary = "LocatorKey=" & registrationKey
     End If
@@ -7632,6 +7806,8 @@ End Function
 Private Function AutoClickerSignalLocator(ByVal registrationKey As String) As String
     If Left$(registrationKey, 2) = "X|" Then
         AutoClickerSignalLocator = "xpath=" & Mid$(registrationKey, 3)
+    ElseIf Left$(registrationKey, 2) = "S|" Then
+        AutoClickerSignalLocator = "shadowXPath=" & Mid$(registrationKey, 3)
     Else
         AutoClickerSignalLocator = "locatorKey=" & registrationKey
     End If
@@ -7680,13 +7856,19 @@ Private Function BuildAutoClickerPreloadSource(ByVal registrationKey As String, 
                                                ByVal timeoutMs As Long, _
                                                ByVal generation As Double, _
                                                ByVal enabled As Boolean) As String
+    Dim locatorMode As String
     Dim locatorJson As String
     Dim guardKeyJson As String
 
     If Left$(registrationKey, 2) = "X|" Then
+        locatorMode = "xpath"
         locatorJson = WebJsonConverter.ConvertToJson(Mid$(registrationKey, 3))
         ' Keep the historical raw-XPath browser guard key so older XPath preloads remain containable.
         guardKeyJson = locatorJson
+    ElseIf Left$(registrationKey, 2) = "S|" Then
+        locatorMode = "shadow"
+        locatorJson = Mid$(registrationKey, 3)
+        guardKeyJson = WebJsonConverter.ConvertToJson("shadow|" & locatorJson)
     Else
         Err.Raise ERR_BIDI_PROTOCOL, "BiDi:BuildAutoClickerPreloadSource", _
                   "Invalid AutoClicker registration key."
@@ -7702,6 +7884,7 @@ Private Function BuildAutoClickerPreloadSource(ByVal registrationKey As String, 
     Dim sourceJs As String
     sourceJs = GetActionJs("autoclicker")
     sourceJs = Replace(sourceJs, "{{KEY}}", guardKeyJson)
+    sourceJs = Replace(sourceJs, "{{MODE}}", WebJsonConverter.ConvertToJson(locatorMode))
     sourceJs = Replace(sourceJs, "{{LOCATOR}}", locatorJson)
     sourceJs = Replace(sourceJs, "{{TIMEOUT}}", CStr(timeoutMs))
     sourceJs = Replace(sourceJs, "{{GENERATION}}", AutoClickerGenerationLiteral(generation))
@@ -12095,20 +12278,39 @@ End Sub
 
 ' ArmContentSignal requires an existing valid target. By default only childList and
 ' characterData count; attribute churn is opt-in.
-Public Sub ArmContentSignal(ByVal signalXPath As String, _
+Public Sub ArmContentSignal(ByVal signalXPath As Variant, _
                             Optional ByVal includeAttributes As Boolean = False, _
-                            Optional ByVal contextId As String = "")
-    If Len(Trim$(signalXPath)) = 0 Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", "signalXPath is empty."
+                            Optional ByVal contextId As String = "", _
+                            Optional ByVal searchShadow As Boolean = False, _
+                            Optional ByVal requireUnlocker As Boolean = False)
+    Const METHOD_NAME As String = "ArmContentSignal"
+    Call SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, signalXPath)
+
+    Dim js As String
+    Dim locatorDesc As String
+    Dim sigTarget As String
+    If searchShadow Then
+        ' Observes the resolved element and every ShadowRoot inside it (probe obsDeep).
+        Dim pathJson As String
+        pathJson = BuildShadowXPathJson(signalXPath, METHOD_NAME)
+        locatorDesc = "shadowXPath=" & pathJson
+        sigTarget = "ShadowXPath=" & pathJson
+        js = "var p=window.__vbaIdleProbe;if(!p||!p.armShadowDomSignal)return -9;" & _
+             "return p.armShadowDomSignal(" & pathJson & "," & _
+             LCase$(CStr(includeAttributes)) & ");"
+    Else
+        sigTarget = CStr(signalXPath)
+        If Len(Trim$(sigTarget)) = 0 Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, "signalXPath is empty."
+        End If
+        locatorDesc = "xpath=" & sigTarget
+        js = "var p=window.__vbaIdleProbe;if(!p||!p.armDomSignal)return -9;" & _
+             "return p.armDomSignal(" & JsStringLiteral(sigTarget) & "," & _
+             LCase$(CStr(includeAttributes)) & ");"
     End If
 
     Dim targetCtx As String
-    targetCtx = ResolveSignalContextForArm(contextId, "ArmContentSignal")
-
-    Dim js As String
-    js = "var p=window.__vbaIdleProbe;if(!p||!p.armDomSignal)return -9;" & _
-         "return p.armDomSignal(" & JsStringLiteral(signalXPath) & "," & _
-         LCase$(CStr(includeAttributes)) & ");"
+    targetCtx = ResolveSignalContextForArm(contextId, METHOD_NAME)
 
     Dim rc As Long: rc = InvokeProbeArm(js, targetCtx)
 
@@ -12116,23 +12318,23 @@ Public Sub ArmContentSignal(ByVal signalXPath As String, _
         Case 0
             ClaimSignalOwner targetCtx
             If m_sigDomArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=dom | overwrite=true (previous dom arm replaced)"
-            m_sigDomArmed = True: m_sigDomSeen = False: m_sigDomXPath = signalXPath
+            m_sigDomArmed = True: m_sigDomSeen = False: m_sigDomXPath = sigTarget
             m_sigLostWarned = False
-            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | xpath=" & signalXPath & _
+            LogSignalLine "[SPA-SIGNAL-ARM] type=dom | " & locatorDesc & _
                           " | attributes=" & LCase$(CStr(includeAttributes)) & " | ctx=" & targetCtx
         Case -1
-            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=not-found | xpath=" & signalXPath
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
-                "ArmContentSignal: target element not found at arm time: " & signalXPath & vbCrLf & _
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=not-found | " & locatorDesc
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, _
+                "ArmContentSignal: target element not found at arm time: " & locatorDesc & vbCrLf & _
                 "This method watches an EXISTING element for rewrites. To wait for an element " & _
                 "that appears only after the action, use ArmVisibilitySignal instead."
         Case -2
-            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=invalid-xpath | xpath=" & signalXPath
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
-                "ArmContentSignal: invalid XPath expression: " & signalXPath
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=invalid-xpath | " & locatorDesc
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, _
+                "ArmContentSignal: invalid XPath expression: " & locatorDesc
         Case Else
-            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=probe-unavailable | xpath=" & signalXPath
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmContentSignal", _
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=dom | reason=probe-unavailable | " & locatorDesc
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, _
                 "ArmContentSignal: SPA probe unavailable in the target context (rc=" & rc & ")."
     End Select
 End Sub
@@ -12166,18 +12368,36 @@ End Sub
 
 ' ArmVisibilitySignal rejects an already-visible target because that would silently
 ' behave as an ungated wait. The XPath is polled only until the first visibility latch.
-Public Sub ArmVisibilitySignal(ByVal signalXPath As String, _
-                               Optional ByVal contextId As String = "")
-    If Len(Trim$(signalXPath)) = 0 Then
-        Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", "signalXPath is empty."
+Public Sub ArmVisibilitySignal(ByVal signalXPath As Variant, _
+                               Optional ByVal contextId As String = "", _
+                               Optional ByVal searchShadow As Boolean = False, _
+                               Optional ByVal requireUnlocker As Boolean = False)
+    Const METHOD_NAME As String = "ArmVisibilitySignal"
+    Call SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, signalXPath)
+
+    Dim js As String
+    Dim locatorDesc As String
+    Dim sigTarget As String
+    If searchShadow Then
+        ' Re-resolved through every ShadowRoot on each poll until the first latch (opt-in cost).
+        Dim pathJson As String
+        pathJson = BuildShadowXPathJson(signalXPath, METHOD_NAME)
+        locatorDesc = "shadowXPath=" & pathJson
+        sigTarget = "ShadowXPath=" & pathJson
+        js = "var p=window.__vbaIdleProbe;if(!p||!p.armShadowVisSignal)return -9;" & _
+             "return p.armShadowVisSignal(" & pathJson & ");"
+    Else
+        sigTarget = CStr(signalXPath)
+        If Len(Trim$(sigTarget)) = 0 Then
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, "signalXPath is empty."
+        End If
+        locatorDesc = "xpath=" & sigTarget
+        js = "var p=window.__vbaIdleProbe;if(!p||!p.armVisSignal)return -9;" & _
+             "return p.armVisSignal(" & JsStringLiteral(sigTarget) & ");"
     End If
 
     Dim targetCtx As String
-    targetCtx = ResolveSignalContextForArm(contextId, "ArmVisibilitySignal")
-
-    Dim js As String
-    js = "var p=window.__vbaIdleProbe;if(!p||!p.armVisSignal)return -9;" & _
-         "return p.armVisSignal(" & JsStringLiteral(signalXPath) & ");"
+    targetCtx = ResolveSignalContextForArm(contextId, METHOD_NAME)
 
     Dim rc As Long: rc = InvokeProbeArm(js, targetCtx)
 
@@ -12185,23 +12405,23 @@ Public Sub ArmVisibilitySignal(ByVal signalXPath As String, _
         Case 0
             ClaimSignalOwner targetCtx
             If m_sigVisArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=vis | overwrite=true (previous vis arm replaced)"
-            m_sigVisArmed = True: m_sigVisSeen = False: m_sigVisXPath = signalXPath
+            m_sigVisArmed = True: m_sigVisSeen = False: m_sigVisXPath = sigTarget
             m_sigLostWarned = False
-            LogSignalLine "[SPA-SIGNAL-ARM] type=vis | xpath=" & signalXPath & " | ctx=" & targetCtx
+            LogSignalLine "[SPA-SIGNAL-ARM] type=vis | " & locatorDesc & " | ctx=" & targetCtx
         Case -3
-            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=already-visible | xpath=" & signalXPath
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
-                "ArmVisibilitySignal: target is ALREADY visible at arm time: " & signalXPath & vbCrLf & _
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=already-visible | " & locatorDesc
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, _
+                "ArmVisibilitySignal: target is ALREADY visible at arm time: " & locatorDesc & vbCrLf & _
                 "Waiting for the appearance of something already visible is meaningless and " & _
                 "would open the gate instantly. To wait for this element's content to be " & _
                 "REWRITTEN, use ArmContentSignal instead."
         Case -2
-            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=invalid-xpath | xpath=" & signalXPath
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
-                "ArmVisibilitySignal: invalid XPath expression: " & signalXPath
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=invalid-xpath | " & locatorDesc
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, _
+                "ArmVisibilitySignal: invalid XPath expression: " & locatorDesc
         Case Else
-            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=probe-unavailable | xpath=" & signalXPath
-            Err.Raise ERR_ACTION_FAILED, "BiDi:ArmVisibilitySignal", _
+            LogSignalLine "[SPA-SIGNAL-ARM-FAIL] type=vis | reason=probe-unavailable | " & locatorDesc
+            Err.Raise ERR_ACTION_FAILED, "BiDi:" & METHOD_NAME, _
                 "ArmVisibilitySignal: SPA probe unavailable in the target context (rc=" & rc & ")."
     End Select
 End Sub
@@ -13490,18 +13710,21 @@ Private Function GetActionJs(ByVal actionType As String) As String
             js = js & "if(!e||!e.isConnected)throw new Error('INPUT_TARGET_CHANGED_DURING_KEYS');if(v.length>0&&(!e.value||e.value.length<v.length))throw new Error('Wiz Input Validation Failed: '+e.value);return true;}catch(err){throw err;}"
 
         Case "autoclicker"
-            ' AutoClickers share one generation registry keyed by the browser guard key. s.poll is
-            ' still cleared on stop so a superseded preload from an older wrapper is fully contained.
-            js = js & "function(){const k={{KEY}},p={{LOCATOR}},t={{TIMEOUT}},g={{GENERATION}},en={{ENABLED}};"
+            ' AutoClickers share one generation registry keyed by the browser guard key.
+            ' Shadow mode: per-root XPath matcher (mt); observes every open ShadowRoot and polls
+            ' every 100 ms until timeout so late attachShadow calls are seen (opt-in cost).
+            js = js & "function(){const k={{KEY}},m={{MODE}},p={{LOCATOR}},t={{TIMEOUT}},g={{GENERATION}},en={{ENABLED}};"
             js = js & "const rk='__seleniumvba_bidi_autoclicker_v41',bag=globalThis[rk]||(globalThis[rk]=Object.create(null));"
             js = js & "const q=bag[k];if(q&&Number(q.g)>=g)return;"
             js = js & "if(q){q.cancelled=true;try{if(q.o)q.o.disconnect()}catch(_){ }try{for(const z of(q.os||[]))z.disconnect()}catch(_){ }try{if(q.tm)clearTimeout(q.tm)}catch(_){ }try{if(q.poll)clearInterval(q.poll)}catch(_){ }}"
             js = js & "const s={g:g,cancelled:!en,os:[],tm:0,poll:0};bag[k]=s;if(!en)return;const own=()=>bag[k]===s&&!s.cancelled;"
             js = js & "const stop=()=>{s.cancelled=true;try{for(const z of s.os)z.disconnect()}catch(_){ }try{if(s.tm)clearTimeout(s.tm)}catch(_){ }try{if(s.poll)clearInterval(s.poll)}catch(_){ }};"
-            js = js & "const find=()=>{try{return document.evaluate(p,document,null,9,null).singleNodeValue}catch(_){return null}};"
+            js = js & "const ev=(x,c)=>{const n=document.evaluate(x,c,null,9,null).singleNodeValue;return n&&n.nodeType===1?n:null};const mt=(r,x)=>{try{if(r.nodeType===9)return ev(x,r);if(r.nodeType===11){const f=r.firstChild;return f?ev('..'+x,f):null}return ev('.'+x,r)}catch(_){return null}};const fd=(r,x)=>{let n=mt(r,String(x));if(n)return n;let a=[];try{a=r.querySelectorAll('*')}catch(_){return null}for(const c of a){if(c.shadowRoot){n=fd(c.shadowRoot,x);if(n)return n}}return null};"
+            js = js & "const find=()=>{if(m==='xpath'){try{return document.evaluate(p,document,null,9,null).singleNodeValue}catch(_){return null}}if(!Array.isArray(p)||p.length===0)return null;let e=document;for(const x of p){e=fd(e.shadowRoot||e,x);if(!e)return null}return e};"
             js = js & "const f=()=>{if(!own())return 0;const e=find();if(e&&e.isConnected&&(e.offsetWidth>0||e.offsetHeight>0||e.getClientRects().length>0)){e.click();console.log('BiDi-AutoClicker: Target clicked');return 1}return 0};"
-            js = js & "const seen=new WeakSet();const watch=r=>{if(!own()||!r||seen.has(r))return;seen.add(r);const o=new MutationObserver(()=>{if(!own()){stop();return}if(f())stop()});s.os.push(o);try{o.observe(r,{childList:1,subtree:1,attributes:1})}catch(_){ }};"
-            js = js & "setTimeout(()=>{if(!own())return;if(f()){stop();return}watch(document);s.tm=setTimeout(()=>{if(own())stop()},t)},0);}"
+            js = js & "const seen=new WeakSet();let scan=null;const watch=r=>{if(!own()||!r||seen.has(r))return;seen.add(r);const o=new MutationObserver(()=>{if(!own()){stop();return}if(m==='shadow')scan(document);if(f())stop()});s.os.push(o);try{o.observe(r,{childList:1,subtree:1,attributes:1})}catch(_){ }};"
+            js = js & "scan=r=>{if(!own()||!r)return;watch(r);let a=[];try{a=r.querySelectorAll('*')}catch(_){return}for(const c of a){if(c.shadowRoot)scan(c.shadowRoot)}};"
+            js = js & "setTimeout(()=>{if(!own())return;if(f()){stop();return}watch(document);if(m==='shadow'){scan(document);s.poll=setInterval(()=>{if(!own()){stop();return}scan(document);if(f())stop()},100)}s.tm=setTimeout(()=>{if(own())stop()},t)},0);}"
 
         Case "lazy_scroll"
             js = js & "try{const tout=arguments[0],poll=arguments[1],start=performance.now();"
@@ -13672,12 +13895,19 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "if(typeof p.inflightFetchCount!=='number')p.inflightFetchCount=0;if(typeof p.inflightXhrCount!=='number')p.inflightXhrCount=0;if(typeof p.lastMutationTs!=='number')p.lastMutationTs=performance.now();if(!Array.isArray(p.changeList))p.changeList=[];if(!p.changeTimes||typeof p.changeTimes!=='object'||Array.isArray(p.changeTimes))p.changeTimes={};if(typeof p.changeDropped!=='number')p.changeDropped=0;if(typeof p.dropRenderFirstTs!=='number')p.dropRenderFirstTs=0;if(typeof p.dropRenderLastTs!=='number')p.dropRenderLastTs=0;"
             js = js & "if(!(p.inflightUrlCounts instanceof Map)){p.inflightUrlCounts=new Map();if(p.inflightUrls&&p.inflightUrls.forEach)p.inflightUrls.forEach((u)=>p.inflightUrlCounts.set(u,1))}"
             js = js & "p.invalidSelectors=new Set();"
-            js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath=''}"
+            js = js & "if(p.sigCount===undefined){p.sigCount=0;p.sigArmed=false;p.sigObs=null;p.visArmed=false;p.visSeen=false;p.visXPath='';p.visKind='';p.visPath=null}"
             js = js & "var gX=function(e){if(!e||e.nodeType!==1)return '';var s=[];while(e&&e.nodeType===1){if(e.id){s.unshift('//*[@id=\''+e.id+'\']');return s.join('/')}var i=1,b=e.previousSibling;while(b){if(b.nodeType===1&&b.tagName===e.tagName)i++;b=b.previousSibling}s.unshift(e.tagName.toLowerCase()+'['+i+']');e=e.parentNode}return '/'+s.join('/')};"
             js = js & "p.vChk=function(e){if(!e||!e.isConnected)return false;var s=window.getComputedStyle(e),r=e.getBoundingClientRect();return(s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&(r.width>0||r.height>0||e.getClientRects().length>0))};"
-            js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigCount=0;p.sigArmed=true;p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
-            js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visXPath=x;p.visArmed=true;p.visSeen=false;return 0};"
-            js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath=''};"
+            ' Shadow arms: same per-root XPath matcher as the Shadow element resolver.
+            js = js & "p.shadowResolve=function(a){if(!Array.isArray(a)||a.length===0)return null;var ev=function(x,c){var n=document.evaluate(x,c,null,9,null).singleNodeValue;return n&&n.nodeType===1?n:null};var m=function(r,x){if(r.nodeType===9)return ev(x,r);if(r.nodeType===11){var f=r.firstChild;return f?ev('..'+x,f):null}return ev('.'+x,r)};var fd=function(r,x){var n=m(r,x);if(n)return n;var z=r.querySelectorAll('*');for(var j=0;j<z.length;j++){var c=z[j];if(c.shadowRoot){n=fd(c.shadowRoot,x);if(n)return n}}return null};var e=document;for(var i=0;i<a.length;i++){e=fd(e.shadowRoot||e,String(a[i]));if(!e)return null}return e};"
+            js = js & "p.armDomSignal=function(x,a){var n;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(!n)return -1;if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigRescan=null;p.sigCount=0;p.sigArmed=true;p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length});p.sigObs.observe(n,{childList:true,characterData:true,subtree:true,attributes:!!a});return 0};"
+            ' Shadow content arm observes the target and every ShadowRoot inside it, and rescans
+            ' the target subtree on each batch so roots of newly inserted hosts are added.
+            js = js & "p.obsDeep=function(n,o){var seen=new WeakSet();var sc=function(r){if(!r)return;if(!seen.has(r)){seen.add(r);try{p.sigObs.observe(r,o)}catch(e){}}if(r.shadowRoot)sc(r.shadowRoot);var z=r.querySelectorAll?r.querySelectorAll('*'):[];for(var j=0;j<z.length;j++){if(z[j].shadowRoot)sc(z[j].shadowRoot)}};p.sigRescan=function(){sc(n)};sc(n)};"
+            js = js & "p.armShadowDomSignal=function(a,b){var n;try{n=p.shadowResolve(a)}catch(e){return -2}if(!n)return -1;if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}}p.sigRescan=null;p.sigCount=0;p.sigArmed=true;p.sigObs=new MutationObserver(function(ms){p.sigCount+=ms.length;if(p.sigRescan)p.sigRescan()});p.obsDeep(n,{childList:true,characterData:true,subtree:true,attributes:!!b});return 0};"
+            js = js & "p.armVisSignal=function(x){var n=null;try{n=document.evaluate(x,document,null,9,null).singleNodeValue}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visKind='xpath';p.visXPath=x;p.visPath=null;p.visArmed=true;p.visSeen=false;return 0};"
+            js = js & "p.armShadowVisSignal=function(a){var n=null;try{n=p.shadowResolve(a)}catch(e){return -2}if(n&&p.vChk(n))return -3;p.visKind='shadow';p.visXPath='';p.visPath=a.slice();p.visArmed=true;p.visSeen=false;return 0};"
+            js = js & "p.disarmSignal=function(){if(p.sigObs){try{p.sigObs.disconnect()}catch(e){}p.sigObs=null}p.sigRescan=null;p.sigArmed=false;p.sigCount=0;p.visArmed=false;p.visSeen=false;p.visXPath='';p.visKind='';p.visPath=null};"
             js = js & "var uT=()=>{p.lastMutationTs=performance.now()},cR=(e)=>{if(e.slice(0,4)!=='DOM:')return false;var q=e.slice(4).trim(),l=q.toLowerCase();if(!q||l.indexOf('/head[')!==-1||l.indexOf('/title[')!==-1)return false;if(q.indexOf('[@id=')!==-1)return true;return q.split('/').filter(Boolean).length>=3},lg=(e)=>{if(e){var ts=performance.now(),ix=p.changeList.indexOf(e);p.lastMutationTs=ts;if(ix!==-1){p.changeTimes[e]=ts}else if(p.changeList.length<50){p.changeList.push(e);p.changeTimes[e]=ts}else{p.changeDropped=(p.changeDropped||0)+1;if(cR(e)){if(!p.dropRenderFirstTs)p.dropRenderFirstTs=ts;p.dropRenderLastTs=ts}}}};p.touch=uT;p.logChange=lg;"
             js = js & "var iN=(n,s)=>{if(!n)return 1;var t=(n.nodeType===1)?n:n.parentElement;if(!t)return 0;for(var i=0;i<s.length;i++){var x=s[i],k=String(x);if(p.invalidSelectors.has(k))continue;var q=t;while(q){try{if(q.closest&&q.closest(x)!==null)return 1}catch(e){p.invalidSelectors.add(k);break}var r=null;try{r=q.getRootNode?q.getRootNode():null}catch(e){}q=(r&&r.host)?r.host:null}}return 0};"
             js = js & "try{var d=getInputDesc();if(legacy&&!p.inputSetterWrapper&&d&&typeof d.set==='function'){p.inputSetterWrapper=d.set;p.inputGetterWrapper=d.get||null}else if(!(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&!p.inputOriginalSet)){var bS=(p.inputSetterWrapper&&d&&d.set===p.inputSetterWrapper&&p.inputOriginalSet)?p.inputOriginalSet:(d&&d.set),bG=(p.inputGetterWrapper&&d&&d.get===p.inputGetterWrapper&&p.inputOrigi"
@@ -13707,7 +13937,7 @@ Private Function GetProbeJs(ByVal probeType As String) As String
             js = js & "var proto=(typeof XMLHttpRequest==='function')?XMLHttpRequest.prototype:null,d=null;try{d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')}catch(e){}"
             js = js & "var h={versionOk:p.version===V,fetchWrapped:(typeof window.fetch!=='function')||(!!p.fetchWrapper&&window.fetch===p.fetchWrapper),xhrWrapped:(!proto)||(!!p.xhrOpenWrapper&&!!p.xhrSendWrapper&&proto.open===p.xhrOpenWrapper&&proto.send===p.xhrSendWrapper),observerActive:!!p.baseObserver,shadowObserverReady:typeof p.observeShadowRoot==='function'&&Array.isArray(p.shadowObservers),inputWrapped:!!d&&(!!p.inputSetterWrapper&&d.set===p.inputSetterWrapper)};"
             js = js & "var healthy=h.versionOk&&h.fetchWrapped&&h.xhrWrapped&&h.observerActive&&h.shadowObserverReady&&h.inputWrapped;"
-            js = js & "if(p.visArmed&&!p.visSeen){try{var vn=null;if(p.visXPath)vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
+            js = js & "if(p.visArmed&&!p.visSeen){try{var vn=null;if(p.visKind==='shadow'&&p.visPath)vn=p.shadowResolve(p.visPath);else if(p.visXPath)vn=document.evaluate(p.visXPath,document,null,9,null).singleNodeValue;if(vn&&p.vChk&&p.vChk(vn))p.visSeen=true}catch(e){}}"
             js = js & "var res={active:healthy,version:p.version||0,timeOrigin:performance.timeOrigin,observeStart:p.observeStart||0,health:h,lastHealthError:String(p.lastHealthError||''),now:performance.now(),lastMutationTs:p.lastMutationTs,inflightFetchCount:p.inflightFetchCount,inflightXhrCount:p.inflightXhrCount,changes:p.changeList,changeTimes:p.changeTimes,inflightUrls:Array.from((p.inflightUrlCounts||new Map()).keys()),invalidSelectors:Array.from(p.invalidSelectors||[]),sigArmed:!!p.sigArmed,sigCount:p.sigCount||0,visArmed:!!p.visArmed,visSeen:!!p.visSeen,changeDropped:p.changeDropped||0,dropRenderFirstTs:p.dropRenderFirstTs||0,dropRenderLastTs:p.dropRenderLastTs||0};p.changeList=[];p.changeTimes={};p.changeDropped=0;p.dropRenderFirstTs=0;p.dropRenderLastTs=0;return JSON.stringify(res);"
     End Select
     GetProbeJs = js
@@ -15539,10 +15769,11 @@ Public Property Get AutoClickerRegistrationCount() As Long
     EnsureAutoClickerRegistry
     AutoClickerRegistrationCount = m_autoClickerScriptIds.count
 End Property
-Public Function GetAutoClickerScriptId(ByVal xpath As String) As String
+Public Function GetAutoClickerScriptId(ByVal xpath As Variant, _
+                                       Optional ByVal searchShadow As Boolean = False) As String
     EnsureAutoClickerRegistry
     Dim registrationKey As String
-    registrationKey = BuildAutoClickerXPathKey(xpath)
+    registrationKey = BuildAutoClickerKey(xpath, searchShadow, "GetAutoClickerScriptId")
     If m_autoClickerScriptIds.Exists(registrationKey) Then
         GetAutoClickerScriptId = CStr(m_autoClickerScriptIds(registrationKey))
     End If
@@ -15800,16 +16031,21 @@ Private Function GetCleanResult(ByVal jsonRaw As String) As Variant
     End If
 End Function
 
-Public Sub ExecuteWizSelectDropdown(ByVal triggerXPath As String, _
+' Options are always searched across document and Shadow DOM; searchShadow applies to the trigger.
+Public Sub ExecuteWizSelectDropdown(ByVal triggerXPath As Variant, _
                                     ByVal optionText As String, _
                                     Optional ByVal searchTimeoutMs As Long = 10000, _
                                     Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
-                                    Optional ByVal contextId As String = "")
+                                    Optional ByVal contextId As String = "", _
+                                    Optional ByVal searchShadow As Boolean = False, _
+                                    Optional ByVal requireUnlocker As Boolean = False)
+    Call SelectElementLocatorKind(searchShadow, requireUnlocker, "ExecuteWizSelectDropdown", triggerXPath)
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
 
     Call Me.ExecuteElementAction( _
         triggerXPath, ElementActionClick, searchTimeoutMs:=searchTimeoutMs, _
-        waitNetworkIdle:=False, maxTimeoutMs:=maxTimeoutMs, contextId:=targetCtx)
+        waitNetworkIdle:=False, maxTimeoutMs:=maxTimeoutMs, contextId:=targetCtx, _
+        searchShadow:=searchShadow, requireUnlocker:=requireUnlocker)
 
     Call ExecuteUniqueVisibleRoleOptionClick( _
         targetCtx, optionText, searchTimeoutMs, True, maxTimeoutMs, _

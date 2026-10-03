@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 6.3 / MIT License / Copyright (c) hanamichi77777
+' Version 6.4 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -268,9 +268,9 @@ Public Sub Main07()
     bidi.ExecuteNavigateAndGetStatus targetUrl
         
     bidi.ArmNetworkSignal "metadata/application"
-    ' ExecuteShadow* evaluates the XPath in the document and in every nested ShadowRoot.
+    ' searchShadow:=True evaluates the XPath in the document and in every nested ShadowRoot.
     ' The match is searched root by root, so //*[@id=...]//button stays inside one tree.
-    bidi.ExecuteShadowClick "//*[@id='utility-sign-in']//button"
+    bidi.ExecuteClick "//*[@id='utility-sign-in']//button", searchShadow:=True
             
     ' Use a non-sensitive test value when adapting this sample.
     bidi.ExecuteInputValue "//input[@id='username']", "aaa"

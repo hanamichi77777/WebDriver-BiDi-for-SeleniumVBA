@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v6.3
+# WebDriver BiDi for SeleniumVBA v6.4
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -53,6 +53,10 @@ These benchmarks verify that WebDriver BiDi for SeleniumVBA can reliably handle 
 The ServiceNow validation code is contained in the `Main07` procedure, and the Google Flights validation code is contained in the `Main08` procedure.
 
 
+## VirusTotal Scan Results
+
+This version was scanned by VirusTotal, and received 0 detections from 64 security vendors at the time of testing.
+
 ---
 ## [Supported OS]
 * **Windows11**
@@ -89,8 +93,6 @@ This procedure is intentionally limited to one task: installing the unpacked Goo
 * **Local source-path requirement:** `extensionPath` must identify the Google Translate version directory containing `manifest.json`. The version folder can change whenever Chrome updates the extension.
 * **Easy diagnosis:** No navigation or SPA wait is performed. Failures are therefore normally attributable to the local path, the manifest, Chrome/ChromeDriver support, startup arguments, or enterprise browser policy rather than synchronization logic.
 * **Result handling:** The raw BiDi response is written to the Immediate window. Because installation changes browser state, an ambiguous transport failure is not automatically retried.
-
-See [Installing Chrome Extensions through WebDriver BiDi](#installing-chrome-extensions-through-webdriver-bidi) for the complete background and prerequisites.
 
 ### 2. Main02: Lazy-Load Scrolling with Best-Effort SPA Quiescence
 This procedure demonstrates controlled scrolling on a page that appends content as the user moves downward.
@@ -137,7 +139,7 @@ This procedure targets an element inside an iframe by passing a WebDriver BiDi b
 This procedure is the ServiceNow validation scenario and combines several features needed for a difficult third-party SPA.
 
 * **Pre-navigation auto-clicker:** `ExecuteRegisterAutoClicker` is registered before navigation so the browser-side helper can dismiss the consent banner as soon as it appears.
-* **Shadow DOM interaction:** `ExecuteShadowClick "//*[@id='utility-sign-in']//button"` locates the sign-in button inside encapsulated web components with a single XPath. The wrapper descends through every ShadowRoot recursively.
+* **Shadow DOM interaction:** `ExecuteClick "//*[@id='utility-sign-in']//button", searchShadow:=True` locates the sign-in button inside encapsulated web components with a single XPath. The wrapper descends through every ShadowRoot recursively. The same `searchShadow:=True` parameter is available on every API that takes an element XPath, including `ExecuteRegisterAutoClicker`, `ArmContentSignal`, and `ArmVisibilitySignal`.
 * **Arm-then-act network gate:** `ArmNetworkSignal "metadata/application"` is called immediately before the Shadow DOM click. The one-shot signal belongs to the next action wait and helps bridge the transition into the sign-in experience.
 * **End-to-end diagnostic log:** Recording starts before registration and navigation, allowing the log to preserve the consent action, navigation, armed response, mutation tail, and final username input.
 * **Site-specific details:** The consent XPath, Shadow DOM XPath, username XPath, and network pattern are observations from the current ServiceNow implementation, not universal authentication signals.

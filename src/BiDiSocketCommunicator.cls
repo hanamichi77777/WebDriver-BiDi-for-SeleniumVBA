@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "6.3"
+Private Const BIDI_SOCKET_VERSION As String = "6.4"
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -2731,7 +2731,7 @@ Public Sub trace(ByVal msg As String, Optional ByVal isCritical As Boolean = Fal
     On Error GoTo 0
 End Sub
 
-Public Sub LogEvent(ByVal Header As String, ByVal Body As String, _
+Public Sub LogEvent(ByVal Header As String, ByVal body As String, _
                    Optional ByVal tag As String = "[INFO]", _
                    Optional ByVal LogToFile As Boolean = False)
     If Not COMMUNICATOR_DEBUG_ENABLED And Not LogToFile Then Exit Sub
@@ -2745,7 +2745,7 @@ Public Sub LogEvent(ByVal Header As String, ByVal Body As String, _
     currentTick = Me.NowTicks()
     timePrefix = "[" & Format(Now, "hh:mm:ss") & " | " & Format(currentTick, "0") & "] "
 
-    cleanText = Replace(Body, vbNullChar, "")
+    cleanText = Replace(body, vbNullChar, "")
     Do While Len(cleanText) > 0
         Dim lastChar As String
         lastChar = Right$(cleanText, 1)
