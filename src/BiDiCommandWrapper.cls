@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "6.5"
+Private Const BIDI_WRAPPER_VERSION As String = "6.6"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -42,7 +42,7 @@ Private socket_ As BiDiSocketCommunicator
 Private m_boundConnectionGeneration As Long
 ' True when no live session still requires teardown.
 Private m_shutdownCompleted As Boolean
-Private m_useTrustedClick As Boolean        ' default False -> synthetic JS clicks (proven path); True = trusted pointer clicks (opt-in)
+Private m_useTrustedClick As Boolean        ' default True -> trusted pointer clicks with synthetic fallback; False = synthetic only
 Private m_noVisibleMatchPreference As Boolean ' default False -> interactive XPath actions prefer the first visible match
 Private m_debugMode As Boolean              ' Backing field for the DebugMode property. Default On; set in Class_Initialize.
 
@@ -591,6 +591,7 @@ Private Sub Class_Initialize()
     ResetLastSyncState
     m_shutdownCompleted = True
     m_debugMode = True
+    m_useTrustedClick = True
 End Sub
 
 Public Property Get Version() As String
@@ -4104,8 +4105,10 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
         Dim nativeKeyActions As Collection
         Set nativeKeyActions = BuildNativeKeyActions(valueToSet, callerName, selectAllFirst)
 
+        ' Synthetic focus click: a pointer click would place the caret at the click point,
+        ' so native keys would land mid-text instead of at the end as in v6.5.
         Dim focusArgs As Collection: Set focusArgs = NewElementArgs(sharedId)
-        Call ExecuteBaseAction(targetCtx, "click", focusArgs, False, minStableMs, _
+        Call ExecuteBaseAction(targetCtx, "focus_click", focusArgs, False, minStableMs, _
                                True, DEFAULT_STALE_RETRIES, maxTimeoutMs, False, _
                                locatorKind, locator, searchTimeoutMs, callerName)
         ExecuteInputValueCore = PerformNativeKeyInput( _
@@ -5747,7 +5750,7 @@ End Function
 Private Function PrefersVisibleTarget(ByVal actionKey As String) As Boolean
     If m_noVisibleMatchPreference Then Exit Function
     Select Case LCase$(actionKey)
-        Case "click", "input", "input_keys", "select", "select_text"
+        Case "click", "focus_click", "input", "input_keys", "select", "select_text"
             PrefersVisibleTarget = True
     End Select
 End Function
@@ -9799,13 +9802,7 @@ Private Function SelectBodyCandidates(ByVal candidates As Collection, ByVal isRe
 End Function
 
 
-Private Function BuildDiscoveryBodyStoreOutput( _
-    ByRef perfGetDataMs As Double, _
-    ByRef perfGetDataCalls As Long, _
-    ByRef perfGetDataMaxMs As Double, _
-    ByRef perfCompactMs As Double, _
-    ByRef perfCompactCalls As Long, _
-    ByRef perfCompactMaxMs As Double) As Collection
+Private Function BuildDiscoveryBodyStoreOutput() As Collection
     Dim output As New Collection
     Set BuildDiscoveryBodyStoreOutput = output
 
@@ -9863,15 +9860,8 @@ Private Function BuildDiscoveryBodyStoreOutput( _
                     Dim idText As String
                     idText = ShortId(CStr(candidate("requestId")))
 
-                    Dim getDataStartMs As Double
-                    Dim getDataElapsedMs As Double
                     Dim getDataOk As Boolean
-                    getDataStartMs = socket_.nowMs()
                     getDataOk = TryGetCapturedResponseBody(candidate, bodyText, missReason, missDetail)
-                    getDataElapsedMs = socket_.nowMs() - getDataStartMs
-                    perfGetDataMs = perfGetDataMs + getDataElapsedMs
-                    perfGetDataCalls = perfGetDataCalls + 1
-                    If getDataElapsedMs > perfGetDataMaxMs Then perfGetDataMaxMs = getDataElapsedMs
 
                     If getDataOk Then
                         Dim sourceChars As Long
@@ -9879,14 +9869,7 @@ Private Function BuildDiscoveryBodyStoreOutput( _
 
                         Dim wasCompacted As Boolean
                         Dim wasNormalized As Boolean
-                        Dim compactStartMs As Double
-                        Dim compactElapsedMs As Double
-                        compactStartMs = socket_.nowMs()
                         bodyText = CompactBodyForAiLog(bodyText, wasCompacted, wasNormalized)
-                        compactElapsedMs = socket_.nowMs() - compactStartMs
-                        perfCompactMs = perfCompactMs + compactElapsedMs
-                        perfCompactCalls = perfCompactCalls + 1
-                        If compactElapsedMs > perfCompactMaxMs Then perfCompactMaxMs = compactElapsedMs
 
                         Dim wasTruncated As Boolean
                         wasTruncated = False
@@ -9945,15 +9928,8 @@ Private Function BuildDiscoveryBodyStoreOutput( _
                     Dim reqIdText As String
                     reqIdText = ShortId(CStr(reqCandidate("requestId")))
 
-                    Dim reqGetDataStartMs As Double
-                    Dim reqGetDataElapsedMs As Double
                     Dim reqGetDataOk As Boolean
-                    reqGetDataStartMs = socket_.nowMs()
                     reqGetDataOk = TryGetCapturedRequestBody(reqCandidate, reqBodyText, reqMissReason, reqMissDetail)
-                    reqGetDataElapsedMs = socket_.nowMs() - reqGetDataStartMs
-                    perfGetDataMs = perfGetDataMs + reqGetDataElapsedMs
-                    perfGetDataCalls = perfGetDataCalls + 1
-                    If reqGetDataElapsedMs > perfGetDataMaxMs Then perfGetDataMaxMs = reqGetDataElapsedMs
 
                     If reqGetDataOk Then
                         Dim reqSourceChars As Long
@@ -9961,14 +9937,7 @@ Private Function BuildDiscoveryBodyStoreOutput( _
 
                         Dim reqWasCompacted As Boolean
                         Dim reqWasNormalized As Boolean
-                        Dim reqCompactStartMs As Double
-                        Dim reqCompactElapsedMs As Double
-                        reqCompactStartMs = socket_.nowMs()
                         reqBodyText = CompactBodyForAiLog(reqBodyText, reqWasCompacted, reqWasNormalized)
-                        reqCompactElapsedMs = socket_.nowMs() - reqCompactStartMs
-                        perfCompactMs = perfCompactMs + reqCompactElapsedMs
-                        perfCompactCalls = perfCompactCalls + 1
-                        If reqCompactElapsedMs > perfCompactMaxMs Then perfCompactMaxMs = reqCompactElapsedMs
 
                         Dim reqWasTruncated As Boolean
                         reqWasTruncated = False
@@ -10267,84 +10236,7 @@ DiscoveryStartFailureCleanup:
     Err.Raise errNum, errSrc, errDesc
 End Sub
 
-Private Function FormatDiscoveryStopPerfLine( _
-    ByVal queueMs As Double, _
-    ByVal hopSummaryMs As Double, _
-    ByVal bodyBuildMs As Double, _
-    ByVal getDataMs As Double, _
-    ByVal getDataCalls As Long, _
-    ByVal getDataMaxMs As Double, _
-    ByVal compactMs As Double, _
-    ByVal compactCalls As Long, _
-    ByVal compactMaxMs As Double, _
-    ByVal collectorCleanupMs As Double, _
-    ByVal suppressedMs As Double, _
-    ByVal reportBuildMs As Double, _
-    ByVal fileSaveMs As Double, _
-    ByVal totalMs As Double) As String
-
-    Dim getDataAvgMs As Double
-    If getDataCalls > 0 Then getDataAvgMs = getDataMs / CDbl(getDataCalls)
-
-    Dim compactAvgMs As Double
-    If compactCalls > 0 Then compactAvgMs = compactMs / CDbl(compactCalls)
-
-    Dim bodyOtherMs As Double
-    bodyOtherMs = bodyBuildMs - getDataMs - compactMs
-    If bodyOtherMs < 0# Then bodyOtherMs = 0#
-
-    FormatDiscoveryStopPerfLine = _
-        "[STOP-PERF] queueMs=" & Format$(queueMs, "0.0") & _
-        " | hopSummaryMs=" & Format$(hopSummaryMs, "0.0") & _
-        " | bodyBuildMs=" & Format$(bodyBuildMs, "0.0") & _
-        " | getDataMs=" & Format$(getDataMs, "0.0") & _
-        " | getDataCalls=" & CStr(getDataCalls) & _
-        " | getDataAvgMs=" & Format$(getDataAvgMs, "0.0") & _
-        " | getDataMaxMs=" & Format$(getDataMaxMs, "0.0") & _
-        " | compactMs=" & Format$(compactMs, "0.0") & _
-        " | compactCalls=" & CStr(compactCalls) & _
-        " | compactAvgMs=" & Format$(compactAvgMs, "0.0") & _
-        " | compactMaxMs=" & Format$(compactMaxMs, "0.0") & _
-        " | bodyOtherMs=" & Format$(bodyOtherMs, "0.0") & _
-        " | collectorCleanupMs=" & Format$(collectorCleanupMs, "0.0") & _
-        " | suppressedMs=" & Format$(suppressedMs, "0.0") & _
-        " | reportBuildMs=" & Format$(reportBuildMs, "0.0") & _
-        " | fileSaveMs=" & Format$(fileSaveMs, "0.0") & _
-        " | totalMs=" & Format$(totalMs, "0.0")
-End Function
-
-Private Function StopPerfElapsedTimerMs(ByVal startSec As Double) As Double
-    Dim endSec As Double
-    endSec = Timer
-    If endSec < startSec Then endSec = endSec + 86400#
-    StopPerfElapsedTimerMs = (endSec - startSec) * 1000#
-End Function
-
 Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discovery_log.txt")
-    Dim perfStopStartMs As Double
-    Dim perfPhaseStartMs As Double
-    Dim perfQueueMs As Double
-    Dim perfHopSummaryMs As Double
-    Dim perfBodyBuildMs As Double
-    Dim perfGetDataMs As Double
-    Dim perfGetDataCalls As Long
-    Dim perfGetDataMaxMs As Double
-    Dim perfCompactMs As Double
-    Dim perfCompactCalls As Long
-    Dim perfCompactMaxMs As Double
-    Dim perfCollectorCleanupMs As Double
-    Dim perfSuppressedMs As Double
-    Dim perfReportBuildMs As Double
-    Dim perfFileSaveMs As Double
-    Dim perfTotalMs As Double
-    Dim perfTailReleaseMs As Double
-    Dim perfBodyResetMs As Double
-    Dim perfHopResetMs As Double
-    Dim perfSocketFullMs As Double
-    Dim perfWallFullMs As Double
-    Dim perfWallStartSec As Double
-    Dim perfLine As String
-
     ' Keep stream references visible to the failure-cleanup path.
     Dim stm As ADODB.stream
     Dim outStm As ADODB.stream
@@ -10355,21 +10247,14 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
 
     On Error GoTo StopFailed
 
-    perfWallStartSec = Timer
-    perfStopStartMs = socket_.nowMs()
-
     ' Drain the queue before setting m_isRecording=False because event dispatch records only
     ' while that flag is True. RecordEventsForSeconds owns the final manual DOM sample; Stop does
     ' not consume the SPA probe outside that explicit manual recording window.
-    perfPhaseStartMs = socket_.nowMs()
     Call ProcessRecorderQueue
-    perfQueueMs = socket_.nowMs() - perfPhaseStartMs
 
     ' Record the request-hop summary while the recorder timeline is still writable.
-    perfPhaseStartMs = socket_.nowMs()
     AppendRecorderUnpairedRequestSummary
     AppendRecorderQueueStats
-    perfHopSummaryMs = socket_.nowMs() - perfPhaseStartMs
 
     m_isRecording = False
 
@@ -10379,13 +10264,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     requestBodyCaptureWasActive = m_requestBodyCaptureActive
 
     Dim bodyStoreOutput As Collection
-    perfPhaseStartMs = socket_.nowMs()
-    Set bodyStoreOutput = BuildDiscoveryBodyStoreOutput( _
-        perfGetDataMs, perfGetDataCalls, perfGetDataMaxMs, _
-        perfCompactMs, perfCompactCalls, perfCompactMaxMs)
-    perfBodyBuildMs = socket_.nowMs() - perfPhaseStartMs
+    Set bodyStoreOutput = BuildDiscoveryBodyStoreOutput()
 
-    perfPhaseStartMs = socket_.nowMs()
     Dim bodyCleanupFailure As String
     If Not ReleaseBodyDataCollectorBestEffort(bodyCleanupFailure) Then
         If Not bodyStoreOutput Is Nothing Then
@@ -10402,7 +10282,6 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                                     CompactBodyDiagnostic(requestBodyCleanupFailure)
         End If
     End If
-    perfCollectorCleanupMs = socket_.nowMs() - perfPhaseStartMs
 
     If (m_bodyCaptureRequested Or m_requestBodyCaptureRequested) And Not bodyStoreOutput Is Nothing Then _
         bodyStoreOutput.Add "=== END BODY STORE ==="
@@ -10417,9 +10296,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         Exit Sub
     End If
 
-    perfPhaseStartMs = socket_.nowMs()
     AppendSuppressedSummary
-    perfSuppressedMs = socket_.nowMs() - perfPhaseStartMs
 
     ' Save when either the timeline has entries OR BODY STORE has diagnostic output.
     ' This matters for guard tests where an oversized request can be classified before
@@ -10433,7 +10310,6 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     End If
 
     If shouldWriteDiscoveryOutput Then
-        perfPhaseStartMs = socket_.nowMs()
 
         ' Resolve relative paths against the folder of the document that owns the active VBA project.
         filePath = WebShared.getFullLocalPath(filePath, targetExists:=False)
@@ -10642,23 +10518,14 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         utf8Bytes = stm.Read
         stm.Close
 
-        perfReportBuildMs = socket_.nowMs() - perfPhaseStartMs
-
-        perfPhaseStartMs = socket_.nowMs()
         Set outStm = New ADODB.stream
         outStm.Type = 1                   ' adTypeBinary
         outStm.Open
         outStm.Write utf8Bytes
         outStm.SaveToFile filePath, 2     ' adSaveCreateOverWrite
         outStm.Close
-        perfFileSaveMs = socket_.nowMs() - perfPhaseStartMs
-
-        ' Core timing ends after the main Discovery Log file has been saved.
-        ' Full/tail timing below continues through all state-release work before return.
-        perfTotalMs = socket_.nowMs() - perfStopStartMs
     End If
 
-    perfPhaseStartMs = socket_.nowMs()
     Set m_recorderLogs = Nothing
     Set m_recSuppByKey = Nothing
     Set m_recRequestUrlById = Nothing
@@ -10668,34 +10535,12 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
-    perfTailReleaseMs = socket_.nowMs() - perfPhaseStartMs
 
-    perfPhaseStartMs = socket_.nowMs()
     ResetDiscoveryBodyRunState
-    perfBodyResetMs = socket_.nowMs() - perfPhaseStartMs
-
-    perfPhaseStartMs = socket_.nowMs()
     ResetRecorderRequestHopRunState
-    perfHopResetMs = socket_.nowMs() - perfPhaseStartMs
-
-    perfSocketFullMs = socket_.nowMs() - perfStopStartMs
-    perfWallFullMs = StopPerfElapsedTimerMs(perfWallStartSec)
 
     If shouldWriteDiscoveryOutput Then
-        perfLine = FormatDiscoveryStopPerfLine( _
-            perfQueueMs, perfHopSummaryMs, perfBodyBuildMs, _
-            perfGetDataMs, perfGetDataCalls, perfGetDataMaxMs, _
-            perfCompactMs, perfCompactCalls, perfCompactMaxMs, _
-            perfCollectorCleanupMs, perfSuppressedMs, perfReportBuildMs, _
-            perfFileSaveMs, perfTotalMs) & _
-            " | tailReleaseMs=" & Format$(perfTailReleaseMs, "0.0") & _
-            " | bodyResetMs=" & Format$(perfBodyResetMs, "0.0") & _
-            " | hopResetMs=" & Format$(perfHopResetMs, "0.0") & _
-            " | socketFullMs=" & Format$(perfSocketFullMs, "0.0") & _
-            " | wallFullMs=" & Format$(perfWallFullMs, "0.0")
-
         Debug.Print "BiDi Recorder: Log saved to " & filePath
-        Debug.Print perfLine
     End If
 
     Exit Sub
@@ -13791,7 +13636,7 @@ End Function
 ' Non-idempotent actions may duplicate user-visible or server-visible state.
 Private Function IsNonIdempotentActionKey(ByVal key As String) As Boolean
     Select Case LCase$(key)
-        Case "click", "input", "input_keys", "select", "select_text"
+        Case "click", "focus_click", "input", "input_keys", "select", "select_text"
             IsNonIdempotentActionKey = True
     End Select
 End Function
@@ -13814,7 +13659,7 @@ Private Function GetActionJs(ByVal actionType As String) As String
     rp = "if(window.__vbaIdleProbe) window.__vbaIdleProbe.lastMutationTs = performance.now(); "
     
     Select Case LCase(actionType)
-        Case "click"
+        Case "click", "focus_click"
             js = js & "try { const e=arguments[0]; if(!e||!e.isConnected)throw new Error('STALE_ELEMENT'); "
             js = js & "e.scrollIntoView({block:'center'}); e.focus(); if(!e.isConnected)throw new Error('STALE_ELEMENT'); "
             js = js & rp & "e.click(); return true; } catch(err) { throw err; }"
@@ -15886,8 +15731,6 @@ Private Function TryPreparePhase(ByVal ctx As String, _
     TryPreparePhase = 0
 End Function
 
-' Trusted pointer clicks are opt-in. Synthetic element.click() remains the default proven
-' path for Wiz/Lit SPAs.
 ' True (default): when an XPath matches several elements, click/input/select use the
 ' first visible one. False restores strict document order.
 Public Property Get PreferVisibleMatch() As Boolean
@@ -15897,6 +15740,9 @@ Public Property Let PreferVisibleMatch(ByVal value As Boolean)
     m_noVisibleMatchPreference = Not value
 End Property
 
+' True (default): ExecuteClick hit-tests the target center and sends a native pointer click,
+' falling back to element.click() when the target is not topmost. False: element.click() only.
+' ExecuteRegisterAutoClicker and the focus click before native key input stay synthetic.
 Public Property Get UseTrustedClick() As Boolean
     UseTrustedClick = m_useTrustedClick
 End Property
@@ -15997,8 +15843,7 @@ Private Function TryExecutePhase(ByVal ctx As String, _
                                   ByRef outErrSrc As String) As Long
     On Error Resume Next
     
-    ' Trusted clicks can leave focus state that breaks some autocomplete flows, so use them
-    ' only for sites that reject synthetic clicks.
+    ' Trusted by default; PerformTrustedClick falls back to element.click() when not topmost.
     If key = "click" And m_useTrustedClick Then
         outResult = PerformTrustedClick(ctx, args, TIMEOUT)
     Else
