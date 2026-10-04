@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 6.4 / MIT License / Copyright (c) hanamichi77777
+' Version 6.5 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -325,13 +325,12 @@ Public Sub Main08()
         
         bidi.ExecuteSelectValue "(//div[@role='combobox'])[1]", "One way"
                 
+        ' v6.5 picks the visible match among duplicates, so plain XPaths suffice.
         Dim depXPath As String
-        depXPath = "(//input[contains(@aria-label, 'Where from')])[last()]"
+        depXPath = "//input[contains(@aria-label, 'Where from')]"
         
         Dim depSuggestXPath As String
-        depSuggestXPath = _
-            "//*[@role='listbox' and not(@aria-hidden='true')]" & _
-            "//li[@role='option' and contains(@aria-label, 'Sapporo')][1]"
+        depSuggestXPath = "//li[@role='option' and contains(@aria-label, 'Sapporo')]"
         bidi.ExecuteInputValue depXPath, "Sapporo", useKeyEvents:=False
         
         bidi.ArmNetworkSignal "rpcids=tDoGIe"
@@ -339,12 +338,10 @@ Public Sub Main08()
         
         
         Dim destXPath As String
-        destXPath = "(//input[contains(@aria-label, 'Where to')])[last()]"
+        destXPath = "//input[contains(@aria-label, 'Where to')]"
         
         Dim destSuggestXPath As String
-        destSuggestXPath = _
-            "//*[@role='listbox' and not(@aria-hidden='true')]" & _
-            "//li[@role='option' and contains(@aria-label, 'Paris')][1]"
+        destSuggestXPath = "//li[@role='option' and contains(@aria-label, 'Paris')]"
         bidi.ExecuteInputValue destXPath, "Paris", useKeyEvents:=False
         
         bidi.ArmNetworkSignal "rpcids=BVAT3"
@@ -355,8 +352,10 @@ Public Sub Main08()
         bidi.ArmVisibilitySignal "//div[@data-gs]"
         bidi.ExecuteClick "//input[@aria-label='Departure']"
         
-        bidi.ExecuteClick _
-            "(//div[@role='gridcell' and @aria-hidden='false'])[8]//div[@role='button']"
+        ' Departure date: one week from today. Day cells carry data-iso="yyyy-mm-dd".
+        Dim departDate As String
+        departDate = Format$(Date + 7, "yyyy-mm-dd")
+        bidi.ExecuteClick "//div[@role='gridcell' and @data-iso='" & departDate & "']//div[@role='button']"
         bidi.ExecuteClick "//button[contains(., 'Done')]"
         
         

@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "6.4"
+Private Const BIDI_WRAPPER_VERSION As String = "6.5"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -43,6 +43,7 @@ Private m_boundConnectionGeneration As Long
 ' True when no live session still requires teardown.
 Private m_shutdownCompleted As Boolean
 Private m_useTrustedClick As Boolean        ' default False -> synthetic JS clicks (proven path); True = trusted pointer clicks (opt-in)
+Private m_noVisibleMatchPreference As Boolean ' default False -> interactive XPath actions prefer the first visible match
 Private m_debugMode As Boolean              ' Backing field for the DebugMode property. Default On; set in Class_Initialize.
 
 ' Session-scoped preload registration; it is not retroactive for existing closed roots.
@@ -2237,7 +2238,8 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
     Dim trigger As Variant
     For Each trigger In triggers
         resolvedTriggerIds.Add ResolveElementSharedId( _
-            triggerLocatorKind, trigger, targetCtx, searchTimeoutMs, methodName)
+            triggerLocatorKind, trigger, targetCtx, searchTimeoutMs, methodName, _
+            preferVisible:=PrefersVisibleTarget("click"))
         RequireCurrentCaptureGeneration captureGeneration, methodName
     Next trigger
 
@@ -2627,7 +2629,8 @@ Private Function ExecuteOpenNewContextCore(ByVal triggerLocatorKind As ElementLo
     ' Resolve before arming so lookup cannot consume the capture boundary.
     Dim triggerSharedId As String
     triggerSharedId = ResolveElementSharedId( _
-        triggerLocatorKind, triggerLocator, ownerCtx, searchTimeoutMs, methodName)
+        triggerLocatorKind, triggerLocator, ownerCtx, searchTimeoutMs, methodName, _
+        preferVisible:=PrefersVisibleTarget("click"))
     RequireCurrentCaptureGeneration captureGeneration, methodName
 
     ProcessRecorderQueue
@@ -4093,7 +4096,8 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim sharedId As String
     sharedId = ResolveElementSharedId( _
-        locatorKind, locator, targetCtx, searchTimeoutMs, callerName)
+        locatorKind, locator, targetCtx, searchTimeoutMs, callerName, _
+        preferVisible:=PrefersVisibleTarget("input"))
 
     Dim args As Collection: Set args = NewElementArgs(sharedId, valueToSet)
     If useNativeKeys Then
@@ -4390,7 +4394,8 @@ Private Function ExecuteSetFileSelectionViaDialogCore(ByVal triggerLocatorKind A
     ' Resolve before arming so locator work cannot consume an unrelated chooser event.
     Dim triggerSharedId As String
     triggerSharedId = ResolveElementSharedId( _
-        triggerLocatorKind, triggerLocator, targetCtx, searchTimeoutMs, callerName)
+        triggerLocatorKind, triggerLocator, targetCtx, searchTimeoutMs, callerName, _
+        preferVisible:=PrefersVisibleTarget("click"))
     RequireCurrentCaptureGeneration captureGeneration, methodName
 
     Dim fileChooserCdpSessionId As String
@@ -5137,8 +5142,8 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
     ' A hit-test failure is not equivalent to a genuine hit=0 result. The strict helper raises
     ' on transport/protocol/parse/contract failures, so synthetic fallback is considered only
     ' after a successfully evaluated hit=0 verdict.
-    Dim onTarget As Boolean
-    onTarget = RequireTrustedHitTestResult(contextId, args)
+    Dim onTarget As Boolean, missReason As String
+    onTarget = RequireTrustedHitTestResult(contextId, args, missReason)
 
     If onTarget Then
         Dim ptrActions As New Collection
@@ -5179,9 +5184,11 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
     Else
         ' A covered target must not receive a coordinate click because it would hit the front
         ' element; the default fallback addresses the intended node directly.
+        LogTrustedHitMiss missReason, allowSyntheticFallback
         If Not allowSyntheticFallback Then
             Err.Raise ERR_ACTION_FAILED, "BiDi:PerformTrustedClick", _
-                      "TrustedClickRequired: the target center is not topmost; synthetic fallback is disabled."
+                      "TrustedClickRequired: the target center is not topmost; synthetic fallback is disabled." & _
+                      " (" & missReason & ")"
         End If
         If m_debugMode Then Debug.Print "BiDi: not on-target; node click fallback."
     End If
@@ -5191,7 +5198,8 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
 End Function
 
 Private Function RequireTrustedHitTestResult(ByVal contextId As String, _
-                                             ByVal args As Collection) As Boolean
+                                             ByVal args As Collection, _
+                                             Optional ByRef missReason As String) As Boolean
     Dim rawRes As String
     rawRes = CallScript(HitTestJs(), args, contextId, True, False, 5000, _
                         Silent:=False, allowAmbiguousRetry:=True)
@@ -5205,32 +5213,56 @@ Private Function RequireTrustedHitTestResult(ByVal contextId As String, _
                   "synthetic fallback was not attempted."
     End If
 
+    ' Verdicts: hit=1 | hit=0;<reason>[;<front element>]. The reason is diagnostic only.
     Dim verdict As String: verdict = CStr(cleanValue)
-    Select Case verdict
-        Case "hit=1"
-            RequireTrustedHitTestResult = True
-        Case "hit=0"
-            RequireTrustedHitTestResult = False
-        Case Else
-            Err.Raise ERR_ACTION_FAILED, "BiDi:PerformTrustedClick", _
-                      "TrustedClickHitTestIndeterminate: unexpected hit-test verdict '" & verdict & _
-                      "'; synthetic fallback was not attempted."
-    End Select
+    If verdict = "hit=1" Then
+        RequireTrustedHitTestResult = True
+    ElseIf verdict = "hit=0" Or Left$(verdict, 6) = "hit=0;" Then
+        missReason = Mid$(verdict, 7)
+        RequireTrustedHitTestResult = False
+    Else
+        Err.Raise ERR_ACTION_FAILED, "BiDi:PerformTrustedClick", _
+                  "TrustedClickHitTestIndeterminate: unexpected hit-test verdict '" & verdict & _
+                  "'; synthetic fallback was not attempted."
+    End If
 End Function
 
 Private Function HitTestJs() As String
     Dim js As String
     js = "const e=arguments[0]; e.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); "
     js = js & "if(window.__vbaIdleProbe) window.__vbaIdleProbe.lastMutationTs = performance.now(); "
-    js = js & "const r=e.getBoundingClientRect(); if(!(r.width>0||r.height>0)) return 'hit=0'; "
+    js = js & "const r=e.getBoundingClientRect(); if(!(r.width>0||r.height>0)) return 'hit=0;zero-box'; "
     js = js & "const cx=Math.round(r.left+r.width/2), cy=Math.round(r.top+r.height/2); "
     js = js & "let top=document.elementFromPoint(cx,cy); "
     js = js & "let g=0; while(top&&top.shadowRoot&&g++<10){const d=top.shadowRoot.elementFromPoint(cx,cy); if(!d||d===top)break; top=d;} "
     js = js & "const within=(n)=>{let x=n,h=0;while(x&&h++<20){if(x===e||e.contains(x))return true;"
     js = js & "const r=x.getRootNode?x.getRootNode():null;if(r&&r.host){x=r.host;continue;}break;}return false;}; "
-    js = js & "return 'hit='+((top&&within(top))?1:0);"
+    js = js & "if(!top) return 'hit=0;no-element'; if(within(top)) return 'hit=1'; "
+    ' Covered: short front-element description only (tag#id.class [label]).
+    js = js & "const c=(typeof top.className==='string')?top.className.trim().split(/\s+/).slice(0,2).join('.'):''; "
+    js = js & "const l=String((top.getAttribute&&top.getAttribute('aria-label'))||top.textContent||'').slice(0,200)"
+    js = js & ".replace(/\s+/g,' ').replace(/[|;]/g,'/').trim().slice(0,30); "
+    js = js & "return 'hit=0;covered;'+top.tagName+(top.id?'#'+top.id:'')+(c?'.'+c:'')+(l?' ['+l+']':'');"
     HitTestJs = js
 End Function
+
+Private Sub LogTrustedHitMiss(ByVal missReason As String, ByVal allowSyntheticFallback As Boolean)
+    Dim reasonCode As String, frontDesc As String
+    Dim sep As Long: sep = InStr(1, missReason, ";", vbBinaryCompare)
+    If sep > 0 Then
+        reasonCode = Left$(missReason, sep - 1)
+        frontDesc = Mid$(missReason, sep + 1)
+    Else
+        reasonCode = missReason
+    End If
+    If Len(reasonCode) = 0 Then reasonCode = "unspecified"
+
+    Dim line As String
+    line = "[TRUSTED-HITTEST] hit=0 | reason=" & reasonCode
+    If Len(frontDesc) > 0 Then line = line & " | top=" & frontDesc
+    line = line & " | outcome=" & IIf(allowSyntheticFallback, "synthetic-fallback", "refused")
+    LogSignalLine line
+End Sub
 
 Private Function BuildPointerMove(ByVal sharedId As String, _
                                   ByVal x As Long, _
@@ -5271,7 +5303,8 @@ Private Function ExecuteSelectValueCore(ByVal locatorKind As ElementLocatorKind,
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim sharedId As String
     sharedId = ResolveElementSharedId( _
-        locatorKind, locator, targetCtx, searchTimeoutMs, callerName)
+        locatorKind, locator, targetCtx, searchTimeoutMs, callerName, _
+        preferVisible:=PrefersVisibleTarget("select"))
 
     Dim elementArgs As Collection: Set elementArgs = NewElementArgs(sharedId)
     Dim isStandardSelect As Boolean
@@ -5545,7 +5578,8 @@ End Function
 
 Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
                                                ByVal searchTimeoutMs As Long, _
-                                               ByVal targetCtx As String) As String
+                                               ByVal targetCtx As String, _
+                                               Optional ByVal preferVisible As Boolean = False) As String
 
     ' Test the original timeout before SanitizeMs; otherwise the exact-zero one-shot path
     ' would be converted to the minimum polling interval.
@@ -5618,8 +5652,12 @@ Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
             Set nodes = GetPathObject(json, "result.nodes")
             If Not nodes Is Nothing Then
                 If nodes.count > 0 Then
-                    If nodes(1).Exists("sharedId") Then
-                        sid = CStr(nodes(1)("sharedId"))
+                    Dim pickIndex As Long: pickIndex = 1
+                    If preferVisible And nodes.count > 1 Then
+                        pickIndex = PickFirstVisibleNodeIndex(nodes, targetCtx, xpath)
+                    End If
+                    If nodes(pickIndex).Exists("sharedId") Then
+                        sid = CStr(nodes(pickIndex)("sharedId"))
                         GetFindElementSharedIdByXPath = sid
                         Exit Function
                     End If
@@ -5634,6 +5672,84 @@ Private Function GetFindElementSharedIdByXPath(ByVal xpath As String, _
 
     RaiseIfPollingEndedOnProtocolError "browsingContext.locateNodes", pendingTransient
     GetFindElementSharedIdByXPath = ""
+End Function
+
+' Returns the 1-based index of the first visible node among the first MAX candidates.
+' Falls back to 1 (document order) when none is visible or the probe fails.
+Private Function PickFirstVisibleNodeIndex(ByVal nodes As Collection, _
+                                           ByVal targetCtx As String, _
+                                           ByVal xpath As String) As Long
+    Const MAX_CANDIDATES As Long = 50
+    PickFirstVisibleNodeIndex = 1
+
+    Dim map() As Long: ReDim map(1 To MAX_CANDIDATES)
+    Dim args As New Collection
+    Dim n As Long, i As Long
+    For i = 1 To nodes.count
+        If n >= MAX_CANDIDATES Then Exit For
+        If nodes(i).Exists("sharedId") Then
+            n = n + 1
+            map(n) = i
+            args.Add NewElementReference(CStr(nodes(i)("sharedId")))
+        End If
+    Next i
+    If n < 2 Then Exit Function
+
+    Dim rawRes As String, cleanValue As Variant
+    Dim probeErr As Long, probeDesc As String
+    On Error Resume Next
+    Err.Clear
+    rawRes = CallScript(VisibleMatchIndexJs(), args, targetCtx, True, False, 5000, _
+                        Silent:=True, allowAmbiguousRetry:=True)
+    If Err.Number = 0 Then Assign cleanValue, GetCleanResult(rawRes)
+    probeErr = Err.Number: probeDesc = Err.description
+    Err.Clear
+    On Error GoTo 0
+
+    If probeErr <> 0 Then
+        If m_debugMode Then Debug.Print "BiDi: visible-match probe failed; using document order. " & probeDesc
+        Exit Function
+    End If
+    If IsEmpty(cleanValue) Or IsNull(cleanValue) Or IsObject(cleanValue) Then Exit Function
+
+    Dim verdict As String: verdict = CStr(cleanValue)
+    If Left$(verdict, 2) <> "v=" Then Exit Function
+    Dim k As Long: k = CLng(val(Mid$(verdict, 3)))
+    If k < 1 Or k > n Then Exit Function
+
+    PickFirstVisibleNodeIndex = map(k)
+    If map(k) <> 1 Then
+        LogSignalLine "[LOCATE-PREFER-VISIBLE] matched=" & nodes.count & " | checked=" & n & _
+                      " | chose=" & map(k) & " | xpath=" & xpath
+    End If
+End Function
+
+' Visible = connected, has a non-empty box, computed visibility is visible, not inside [inert].
+' Opacity is ignored: opacity-0 inputs are common legitimate click targets.
+' Shared by the XPath and Shadow XPath resolvers so both use one definition.
+Private Function VisiblePredicateJs() As String
+    Dim js As String
+    js = "const vis=e=>{if(!e||!e.isConnected||!e.getClientRects().length)return false;"
+    js = js & "const r=e.getBoundingClientRect();if(!(r.width>0||r.height>0))return false;"
+    js = js & "if(getComputedStyle(e).visibility!=='visible')return false;"
+    js = js & "return !(e.closest&&e.closest('[inert]'));};"
+    VisiblePredicateJs = js
+End Function
+
+Private Function VisibleMatchIndexJs() As String
+    Dim js As String
+    js = VisiblePredicateJs()
+    js = js & "const a=arguments;for(let i=0;i<a.length;i++){if(vis(a[i]))return 'v='+(i+1);}return 'v=0';"
+    VisibleMatchIndexJs = js
+End Function
+
+' Interactive actions prefer a visible match; readers and file inputs keep document order.
+Private Function PrefersVisibleTarget(ByVal actionKey As String) As Boolean
+    If m_noVisibleMatchPreference Then Exit Function
+    Select Case LCase$(actionKey)
+        Case "click", "input", "input_keys", "select", "select_text"
+            PrefersVisibleTarget = True
+    End Select
 End Function
 
 Public Function GetCurrentUrl(Optional ByVal contextId As String = "", _
@@ -5758,7 +5874,8 @@ Private Function ExecuteElementActionCore(ByVal locatorKind As ElementLocatorKin
 
     Dim sid As String
     sid = ResolveElementSharedId( _
-        locatorKind, locator, targetCtx, searchTimeoutMs, callerName, elementRequired)
+        locatorKind, locator, targetCtx, searchTimeoutMs, callerName, elementRequired, _
+        PrefersVisibleTarget(actionKey))
 
     If Len(sid) = 0 Then
         ExecuteElementActionCore = False
@@ -6083,7 +6200,9 @@ Private Function ShadowXPathLocatorSummary(ByVal xpaths As Variant) As String
 End Function
 
 Private Function TryResolveShadowElementSharedIdOnce(ByVal xpathArg As Dictionary, _
-                                                     ByVal targetCtx As String) As String
+                                                     ByVal targetCtx As String, _
+                                                     Optional ByVal preferVisible As Boolean = False, _
+                                                     Optional ByVal locatorSummary As String = "") As String
     Dim params As New Dictionary
     Dim targetDic As New Dictionary
     Dim args As New Collection
@@ -6099,6 +6218,33 @@ Private Function TryResolveShadowElementSharedIdOnce(ByVal xpathArg As Dictionar
         "const fd=(r,x)=>{let n=m(r,x);if(n)return n;" & _
         "for(const c of r.querySelectorAll('*')){if(c.shadowRoot){n=fd(c.shadowRoot,x);if(n)return n;}}return null;};" & _
         "let el=document;for(const x of xps){el=fd(el.shadowRoot||el,String(x));if(!el)return null;}return el;}"
+
+    ' preferVisible: intermediate steps resolve hosts exactly as above. The final step lists
+    ' candidates in the same traversal order (a root contributes only when its first match is
+    ' an element, as fd does), so the no-visible fallback is the node fd would return.
+    ' Returns [node, matched, checked, chosen].
+    If preferVisible Then
+        Dim pv As String
+        pv = "function(xps){" & VisiblePredicateJs()
+        pv = pv & "const ev=(x,c)=>{const n=document.evaluate(x,c,null,9,null).singleNodeValue;return n&&n.nodeType===1?n:null;};"
+        pv = pv & "const m=(r,x)=>{if(r.nodeType===9)return ev(x,r);"
+        pv = pv & "if(r.nodeType===11){const f=r.firstChild;return f?ev('..'+x,f):null;}return ev('.'+x,r);};"
+        pv = pv & "const fd=(r,x)=>{let n=m(r,x);if(n)return n;"
+        pv = pv & "for(const c of r.querySelectorAll('*')){if(c.shadowRoot){n=fd(c.shadowRoot,x);if(n)return n;}}return null;};"
+        pv = pv & "const ea=(x,c)=>{const s=document.evaluate(x,c,null,7,null);const o=[];"
+        pv = pv & "if(!s.snapshotLength||s.snapshotItem(0).nodeType!==1)return o;"
+        pv = pv & "for(let i=0;i<s.snapshotLength;i++){const n=s.snapshotItem(i);if(n.nodeType===1)o.push(n);}return o;};"
+        pv = pv & "const ma=(r,x)=>{if(r.nodeType===9)return ea(x,r);"
+        pv = pv & "if(r.nodeType===11){const f=r.firstChild;return f?ea('..'+x,f):[];}return ea('.'+x,r);};"
+        pv = pv & "const fa=(r,x,o)=>{o.push(...ma(r,x));"
+        pv = pv & "for(const c of r.querySelectorAll('*')){if(c.shadowRoot)fa(c.shadowRoot,x,o);}return o;};"
+        pv = pv & "let el=document;for(let i=0;i<xps.length;i++){const x=String(xps[i]);"
+        pv = pv & "if(i===xps.length-1){const all=fa(el.shadowRoot||el,x,[]);if(!all.length)return null;"
+        pv = pv & "const n=Math.min(all.length,50);let k=1;for(let j=0;j<n;j++){if(vis(all[j])){k=j+1;break;}}"
+        pv = pv & "return [all[k-1],all.length,n,k];}"
+        pv = pv & "el=fd(el.shadowRoot||el,x);if(!el)return null;}return null;}"
+        functionDeclaration = pv
+    End If
 
     args.Add xpathArg
     targetDic.Add "context", targetCtx
@@ -6121,6 +6267,11 @@ Private Function TryResolveShadowElementSharedIdOnce(ByVal xpathArg As Dictionar
 
     If resultType = "null" Or resultType = "undefined" Then Exit Function
 
+    If preferVisible And resultType = "array" Then
+        TryResolveShadowElementSharedIdOnce = ReadShadowVisiblePick(json, locatorSummary)
+        Exit Function
+    End If
+
     If resultType <> "node" Then
         Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryResolveShadowElementSharedIdOnce", _
                   "Shadow resolver returned unexpected remote value type: " & resultType
@@ -6132,11 +6283,34 @@ Private Function TryResolveShadowElementSharedIdOnce(ByVal xpathArg As Dictionar
         "Shadow resolver returned a node without sharedId.")
 End Function
 
+' Reads [node, matched, checked, chosen] from the visible-aware Shadow resolver.
+Private Function ReadShadowVisiblePick(ByVal json As Object, ByVal locatorSummary As String) As String
+    Const src As String = "BiDi:TryResolveShadowElementSharedIdOnce"
+    Dim items As Object
+    Set items = GetPathObject(json, "result.result.value")
+    If items Is Nothing Then Err.Raise ERR_BIDI_PROTOCOL, src, "Shadow resolver returned an empty pick."
+    If items.count <> 4 Then Err.Raise ERR_BIDI_PROTOCOL, src, "Shadow resolver pick has an unexpected length."
+
+    Dim nodeItem As Object: Set nodeItem = items(1)
+    If LCase$(CStr(nodeItem("type"))) <> "node" Or Not nodeItem.Exists("sharedId") Then
+        Err.Raise ERR_BIDI_PROTOCOL, src, "Shadow resolver pick did not return a node with sharedId."
+    End If
+
+    Dim chosen As Long: chosen = CLng(items(4)("value"))
+    If chosen <> 1 Then
+        LogSignalLine "[LOCATE-PREFER-VISIBLE] matched=" & CLng(items(2)("value")) & _
+                      " | checked=" & CLng(items(3)("value")) & " | chose=" & chosen & _
+                      " | xpath=" & locatorSummary & " | shadow=1"
+    End If
+    ReadShadowVisiblePick = CStr(nodeItem("sharedId"))
+End Function
+
 Private Function ResolveShadowElementSharedId(ByVal xpaths As Variant, _
                                               ByVal targetCtx As String, _
                                               ByVal searchTimeoutMs As Long, _
                                               ByVal callerName As String, _
-                                              Optional ByVal required As Boolean = True) As String
+                                              Optional ByVal required As Boolean = True, _
+                                              Optional ByVal preferVisible As Boolean = False) As String
     ' Validate once before polling so contract errors are not retried.
     Dim xpathArg As Dictionary
     Set xpathArg = BuildShadowXPathArg(xpaths, callerName)
@@ -6152,12 +6326,15 @@ Private Function ResolveShadowElementSharedId(ByVal xpaths As Variant, _
         vTimeoutMs = SanitizeMs(searchTimeoutMs, "searchTimeoutMs", 5000)
     End If
 
+    Dim locatorSummary As String
+    If preferVisible Then locatorSummary = ShadowXPathLocatorSummary(xpaths)
+
     Dim startTick As Currency
     startTick = socket_.NowTicks()
 
     Do
         Dim sid As String
-        sid = TryResolveShadowElementSharedIdOnce(xpathArg, targetCtx)
+        sid = TryResolveShadowElementSharedIdOnce(xpathArg, targetCtx, preferVisible, locatorSummary)
         If Len(sid) > 0 Then
             ResolveShadowElementSharedId = sid
             Exit Function
@@ -12766,7 +12943,8 @@ Private Sub LogInputValueMismatchBestEffort(ByVal locatorKind As ElementLocatorK
 
     Dim postSharedId As String
     postSharedId = ResolveElementSharedId( _
-        locatorKind, locator, contextId, searchTimeoutMs, callerName & ":postcheck")
+        locatorKind, locator, contextId, searchTimeoutMs, callerName & ":postcheck", _
+        preferVisible:=PrefersVisibleTarget("input"))
 
     Dim readArgs As Collection
     Set readArgs = NewElementArgs(postSharedId, "value")
@@ -14519,8 +14697,10 @@ Private Function ExecuteBaseAction(ByVal contextId As String, _
                 resolverName = retryCallerName
                 If Len(resolverName) = 0 Then resolverName = "ExecuteBaseAction"
 
+                ' Same preference as the initial resolve, so a retry cannot switch targets.
                 freshSharedId = ResolveElementSharedId( _
-                    retryLocatorKind, retryLocator, targetCtx, retrySearchTimeoutMs, resolverName)
+                    retryLocatorKind, retryLocator, targetCtx, retrySearchTimeoutMs, resolverName, _
+                    preferVisible:=PrefersVisibleTarget(jsKey))
 
                 Set currentArgs = ReplaceFirstElementReference(currentArgs, freshSharedId)
 
@@ -14861,7 +15041,9 @@ Private Function ResolveElementSharedId(ByVal locatorKind As ElementLocatorKind,
                                         ByVal contextId As String, _
                                         ByVal searchTimeoutMs As Long, _
                                         ByVal callerName As String, _
-                                        Optional ByVal required As Boolean = True) As String
+                                        Optional ByVal required As Boolean = True, _
+                                        Optional ByVal preferVisible As Boolean = False) As String
+    ' preferVisible changes only the final candidate choice; traversal order is unchanged.
     Select Case locatorKind
         Case ElementLocatorXPath
             If VarType(locator) <> vbString Then
@@ -14870,11 +15052,11 @@ Private Function ResolveElementSharedId(ByVal locatorKind As ElementLocatorKind,
             End If
 
             ResolveElementSharedId = ResolveXPathSharedId( _
-                CStr(locator), contextId, searchTimeoutMs, callerName, required)
+                CStr(locator), contextId, searchTimeoutMs, callerName, required, preferVisible)
 
         Case ElementLocatorShadowXPath
             ResolveElementSharedId = ResolveShadowElementSharedId( _
-                locator, contextId, searchTimeoutMs, callerName, required)
+                locator, contextId, searchTimeoutMs, callerName, required, preferVisible)
 
         Case Else
             Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
@@ -14886,7 +15068,8 @@ Private Function ResolveXPathSharedId(ByVal xpath As String, _
                                       ByVal contextId As String, _
                                       ByVal timeoutMs As Long, _
                                       ByVal methodName As String, _
-                                      Optional ByVal required As Boolean = True) As String
+                                      Optional ByVal required As Boolean = True, _
+                                      Optional ByVal preferVisible As Boolean = False) As String
     Dim sid As String
     Dim targetCtx As String
 
@@ -14908,7 +15091,7 @@ Private Function ResolveXPathSharedId(ByVal xpath As String, _
         targetCtx = UpdateMainContextId()
     End If
 
-    sid = GetFindElementSharedIdByXPath(xpath, vTimeout, targetCtx)
+    sid = GetFindElementSharedIdByXPath(xpath, vTimeout, targetCtx, preferVisible)
 
     If Len(sid) = 0 And required Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:" & methodName, _
@@ -15705,6 +15888,15 @@ End Function
 
 ' Trusted pointer clicks are opt-in. Synthetic element.click() remains the default proven
 ' path for Wiz/Lit SPAs.
+' True (default): when an XPath matches several elements, click/input/select use the
+' first visible one. False restores strict document order.
+Public Property Get PreferVisibleMatch() As Boolean
+    PreferVisibleMatch = Not m_noVisibleMatchPreference
+End Property
+Public Property Let PreferVisibleMatch(ByVal value As Boolean)
+    m_noVisibleMatchPreference = Not value
+End Property
+
 Public Property Get UseTrustedClick() As Boolean
     UseTrustedClick = m_useTrustedClick
 End Property
