@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "6.6"
+Private Const BIDI_WRAPPER_VERSION As String = "6.7"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -110,6 +110,9 @@ Private m_navSupersessionNavigationId As String
 Private m_navSupersessionUrl As String
 
 Private m_waitStackDepth As Long ' Tracks recursion depth of active wait loops
+' Absolute nowMs deadline for commands issued inside a MasterWaitEngine segment; 0 = unbounded.
+' INVARIANT: never left set across WaitHeartbeat, where Office callbacks may run.
+Private m_commandDeadlineMs As Double
 
 Private m_lastHudKey As String        ' Fingerprint of last HUD payload (msg+color)
 Private m_lastHudCtx As String        ' Context the last HUD was rendered into
@@ -446,6 +449,10 @@ Private Const ERR_DOWNLOAD_BATCH_COUNT_MISMATCH As Long = vbObjectError + 1028
 Private Const ERR_DOWNLOAD_BATCH_FILENAME_COLLISION As Long = vbObjectError + 1029
 Private Const ERR_SESSION_CONTINUITY_LOST As Long = vbObjectError + 1030 ' transport lost or silently reconnected
 Private Const PEER_LIVENESS_PROBE_MS As Long = 3000 ' session.status normally answers in a few ms
+' Marker for 604 raised because a MasterWaitEngine segment ran out of its wait budget.
+Private Const WAIT_BUDGET_EXHAUSTED_TAG As String = "WaitBudgetExhausted:"
+' Upper bound by which best-effort HUD removal may outlive an exhausted wait budget.
+Private Const WAIT_CLEANUP_GRACE_MS As Long = 250
 
 Private Enum MainContextState
     MainContextUnbound = 0
@@ -2553,7 +2560,9 @@ Private Function IsTransientWindowContextReadError(ByVal errNum As Long, _
 
     Dim d As String: d = LCase$(errDesc)
 
+    ' Environment desync covers main-context recovery that ran out of attempts.
     If InStr(d, "inspected target navigated or closed") > 0 Or _
+       InStr(d, "environment desync (context lost)") > 0 Or _
        InStr(d, "execution context was destroyed") > 0 Or _
        InStr(d, "document was unloaded") > 0 Or _
        InStr(d, "target navigated") > 0 Or _
@@ -5727,7 +5736,8 @@ Private Function PickFirstVisibleNodeIndex(ByVal nodes As Collection, _
     End If
 End Function
 
-' Visible = connected, has a non-empty box, computed visibility is visible, not inside [inert].
+' Visible = connected, has a non-empty box, computed visibility is visible, and no flat-tree
+' [inert] ancestor (the walk crosses slots and ShadowRoot hosts).
 ' Opacity is ignored: opacity-0 inputs are common legitimate click targets.
 ' Shared by the XPath and Shadow XPath resolvers so both use one definition.
 Private Function VisiblePredicateJs() As String
@@ -5735,7 +5745,11 @@ Private Function VisiblePredicateJs() As String
     js = "const vis=e=>{if(!e||!e.isConnected||!e.getClientRects().length)return false;"
     js = js & "const r=e.getBoundingClientRect();if(!(r.width>0||r.height>0))return false;"
     js = js & "if(getComputedStyle(e).visibility!=='visible')return false;"
-    js = js & "return !(e.closest&&e.closest('[inert]'));};"
+    js = js & "const inertInclusive=n=>{const seen=new Set();let q=n;while(q&&!seen.has(q)){seen.add(q);"
+    js = js & "if(q.nodeType===1&&q.hasAttribute&&q.hasAttribute('inert'))return true;"
+    js = js & "if(q.assignedSlot){q=q.assignedSlot;continue;}if(q.parentElement){q=q.parentElement;continue;}"
+    js = js & "const rt=q.getRootNode?q.getRootNode():null;q=(rt&&rt.host)?rt.host:null;}return false;};"
+    js = js & "return !inertInclusive(e);};"
     VisiblePredicateJs = js
 End Function
 
@@ -6475,13 +6489,40 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
         ' Fail closed before sending on a lost or silently reconnected transport.
         AssertSessionContinuity "BiDi:ExecuteBiDiCommand:" & method
 
+        ' INVARIANT: inside a wait segment every attempt, including retries, fits the remaining
+        ' wait budget. Exhaustion before send is unambiguous: nothing was dispatched.
+        Dim attemptTimeoutMs As Long: attemptTimeoutMs = commandTimeoutMs
+        Dim budgetCapped As Boolean: budgetCapped = False
+        If m_commandDeadlineMs > 0# Then
+            Dim attemptBudgetMs As Long: attemptBudgetMs = RemainingCommandBudgetMs()
+            If attemptBudgetMs <= 0 Then
+                If localErrNum <> 0 Then
+                    localErrDesc = WAIT_BUDGET_EXHAUSTED_TAG & " retry of " & method & " not sent | trigger=" & _
+                                   localErrNum & " " & localErrDesc
+                Else
+                    localErrDesc = WAIT_BUDGET_EXHAUSTED_TAG & " " & method & " not sent"
+                End If
+                localErrNum = 604
+                Exit Do
+            End If
+            If attemptTimeoutMs <= 0 Or attemptTimeoutMs > attemptBudgetMs Then
+                attemptTimeoutMs = attemptBudgetMs
+                budgetCapped = True
+            End If
+        End If
+
         On Error Resume Next
-        strRes = socket_.SendCommand(method, params, Silent, commandTimeoutMs)
+        strRes = socket_.SendCommand(method, params, Silent, attemptTimeoutMs)
         localErrNum = Err.Number: localErrDesc = Err.description
         On Error GoTo 0
         
         If localErrNum = 0 Then
-            If IsContextLostError(strRes) Then
+            ' INVARIANT: "navigated or closed" becomes Context Lost only when recovery can retarget
+            ' and resend safely. Otherwise the raw response reaches the existing transient,
+            ' polling and ambiguous-dispatch classifiers unchanged.
+            If IsContextLostError(strRes) Or _
+               (allowContextRetarget And allowRecoveryRetry And allowAmbiguousRetry And _
+                IsRecoverableNavigatedOrClosedResponse(strRes)) Then
                 localErrNum = ERR_BIDI_PROTOCOL
                 localErrDesc = "Environment desync (Context Lost) detected in response."
                 Set m_validatedContexts = New Dictionary
@@ -6515,8 +6556,24 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                           " | capMs=" & CStr(socket_.MaxCommandCorrelationWaitMs)
             ' A silent peer is detected by the transport only after up to ~25s (WS Ping 15s +
             ' Pong 10s). For shorter waits, classify the timeout with one bounded probe.
-            localErrDesc = localErrDesc & " | PeerLiveness=" & _
-                           IIf(CheckAlive(PEER_LIVENESS_PROBE_MS), "responsive", "unresponsive")
+            ' A budget-capped timeout is the wait deadline itself; probing would outlive it.
+            If budgetCapped Then
+                localErrDesc = WAIT_BUDGET_EXHAUSTED_TAG & " " & localErrDesc & _
+                               " | PeerLiveness=not-probed(wait-budget)"
+            Else
+                Dim livenessMs As Long: livenessMs = PEER_LIVENESS_PROBE_MS
+                If m_commandDeadlineMs > 0# Then
+                    Dim livenessBudgetMs As Long: livenessBudgetMs = RemainingCommandBudgetMs()
+                    If livenessBudgetMs < livenessMs Then livenessMs = livenessBudgetMs
+                End If
+                If livenessMs <= 0 Then
+                    localErrDesc = localErrDesc & " | PeerLiveness=not-probed(wait-budget)"
+                ElseIf CheckAlive(livenessMs) Then
+                    localErrDesc = localErrDesc & " | PeerLiveness=responsive"
+                Else
+                    localErrDesc = localErrDesc & " | PeerLiveness=unresponsive"
+                End If
+            End If
             Exit Do
         End If
 
@@ -6558,6 +6615,18 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                 Exit Do
             End If
 
+            Dim backoffMs As Long: backoffMs = 800 * (retryCount + 1)
+            If m_commandDeadlineMs > 0# Then
+                Dim recoveryBudgetMs As Long: recoveryBudgetMs = RemainingCommandBudgetMs()
+                If recoveryBudgetMs <= 0 Then
+                    localErrDesc = WAIT_BUDGET_EXHAUSTED_TAG & " no time for recovery | trigger=" & _
+                                   localErrNum & " " & localErrDesc
+                    localErrNum = 604
+                    Exit Do
+                End If
+                If backoffMs > recoveryBudgetMs Then backoffMs = recoveryBudgetMs
+            End If
+
             recoveryAttemptCount = recoveryAttemptCount + 1
             m_isRecovering = True
 
@@ -6572,10 +6641,17 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
 
             On Error Resume Next
             socket_.AllowUiPump = False
-            WaitRecoveryBackoffNoOfficePump 800 * (retryCount + 1)
+            WaitRecoveryBackoffNoOfficePump backoffMs
             recoveryErr = Err.Number
             recoveryErrDesc = Err.description
             Err.Clear
+
+            If recoveryErr = 0 And m_commandDeadlineMs > 0# Then
+                If RemainingCommandBudgetMs() <= 0 Then
+                    recoveryErr = 604
+                    recoveryErrDesc = WAIT_BUDGET_EXHAUSTED_TAG & " recovery backoff used the remaining budget"
+                End If
+            End If
 
             If recoveryErr = 0 And allowContextRetarget Then
                 ' Explicit targets must not depend on the main binding.
@@ -6609,9 +6685,20 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                 End If
                 retryCount = retryCount + 1
             Else
-                Debug.Print "BiDi [RECOVERY FAIL]: " & recoveryErrDesc
-                If Len(recoveryErrDesc) > 0 Then
-                    localErrDesc = localErrDesc & " | Recovery failed: " & recoveryErrDesc
+                ' INVARIANT: continuity loss and wait-budget exhaustion during recovery replace the
+                ' triggering error; neither may be reported as an ordinary recovery failure.
+                If recoveryErr = ERR_SESSION_CONTINUITY_LOST Then
+                    localErrDesc = recoveryErrDesc & " | trigger=" & localErrNum & " " & localErrDesc
+                    localErrNum = ERR_SESSION_CONTINUITY_LOST
+                ElseIf IsWaitBudgetExhaustedError(recoveryErr, recoveryErrDesc) Then
+                    localErrDesc = WAIT_BUDGET_EXHAUSTED_TAG & " during recovery | trigger=" & _
+                                   localErrNum & " " & localErrDesc
+                    localErrNum = 604
+                Else
+                    Debug.Print "BiDi [RECOVERY FAIL]: " & recoveryErrDesc
+                    If Len(recoveryErrDesc) > 0 Then
+                        localErrDesc = localErrDesc & " | Recovery failed: " & recoveryErrDesc
+                    End If
                 End If
                 Exit Do
             End If
@@ -6624,6 +6711,22 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
               "BiDi:ExecuteBiDiCommand", _
               "Command '" & method & "' failed after " & recoveryAttemptCount & " recovery attempt(s). " & _
               "Last Error: " & localErrDesc
+End Function
+
+' Chromium reports a main-document navigation during an in-flight script.callFunction as
+' [unknown error] "Inspected target navigated or closed" (measured). Exact phrase only.
+Private Function IsRecoverableNavigatedOrClosedResponse(ByVal response As String) As Boolean
+    If InStr(1, response, "navigated or closed", vbTextCompare) = 0 Then Exit Function
+
+    On Error Resume Next
+    Dim json As Object: Set json = WebJsonConverter.ParseJson(response)
+    On Error GoTo 0
+    If json Is Nothing Then Exit Function
+    If Not (json.Exists("error") And json.Exists("message")) Then Exit Function
+
+    If LCase$(CStr(json("error"))) <> "unknown error" Then Exit Function
+    IsRecoverableNavigatedOrClosedResponse = _
+        (InStr(1, LCase$(CStr(json("message"))), "inspected target navigated or closed", vbBinaryCompare) > 0)
 End Function
 
 Private Function IsContextLostError(ByVal response As String) As Boolean
@@ -10417,10 +10520,11 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText vbCrLf
         stm.writeText "2) Wait-time assessment" & vbCrLf
         stm.writeText "   - Consensus uses current network-idle + DOM-quiet>=minStableMs AND a poll-based" & vbCrLf
-        stm.writeText "     stable-window timer. stableWindowMs is elapsed time since the most recent of: wait start," & vbCrLf
-        stm.writeText "     a poll that observed the combined idle/quiet condition as false, or an explicit reset" & vbCrLf
-        stm.writeText "     (dom/vis HIT; net HIT at the first poll that observes it, not its event timestamp;" & vbCrLf
-        stm.writeText "     probe READY/RECOVERED; navigation reset; probe missing/unhealthy detection)." & vbCrLf
+        stm.writeText "     stable-window timer. stableWindowMs begins at the first sampled poll that satisfies the" & vbCrLf
+        stm.writeText "     combined condition after WAIT-BEGIN or after any false poll / explicit reset; unsampled" & vbCrLf
+        stm.writeText "     time never contributes to the confirmation window. Explicit resets include" & vbCrLf
+        stm.writeText "     dom/vis HIT; net HIT at the first poll that observes it, not its event timestamp;" & vbCrLf
+        stm.writeText "     probe READY/RECOVERED; navigation reset; probe missing/unhealthy detection." & vbCrLf
         stm.writeText "     Because the true threshold crossing occurs between polls, stableWindowMs is NOT an exact" & vbCrLf
         stm.writeText "     post-threshold dwell time or a safety margin. Its amount above minStableMs is largely" & vbCrLf
         stm.writeText "     polling phase/overshoot. Do NOT rank or tune waits from that difference." & vbCrLf
@@ -12897,6 +13001,9 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     waitCtx.Add "contextId", targetCtx
     waitCtx.Add "minStableMs", minStableMs
     waitCtx.Add "stableStart", socket_.nowMs()
+    ' A confirmation window begins only at the first sampled state that actually satisfies
+    ' network-idle + DOM-quiet + signal-gate. Unsampled time since WAIT-BEGIN is not evidence.
+    waitCtx.Add "stableWindowStarted", False
     waitCtx.Add "missingProbeCount", 0 ' Used for multi-stage JIT recovery
     ' Pre-seeded metrics are diagnostic only and guarantee a complete END line.
     waitCtx.Add "lastJsIdleDuration", 0#
@@ -12915,11 +13022,11 @@ Public Sub WaitForNetworkIdleSpa(ByVal minStableMs As Long, _
     waitCtx.Add "probeDetectedUnhealthyMs", 0#
     waitCtx.Add "probeRecoveries", 0
     waitCtx.Add "probeRecoveryAttempts", 0
-    ' Network hits latch asynchronously. Reset stableStart once on the first poll that sees
-    ' the hit; pre-wait hits need no extra reset because stableStart is already fresh.
+    ' Network hits latch asynchronously. Reset the sampled confirmation window once on the first
+    ' poll that sees the hit; pre-wait hits are handled by the first qualifying sampled poll.
     waitCtx.Add "sigNetAcked", m_sigNetSeen
     ' A network hit that predates WAIT-BEGIN opens the gate, but it is deliberately excluded
-    ' from NET-TO-CONTENT timing diagnostics. The fresh stableStart above still governs consensus.
+    ' from NET-TO-CONTENT timing diagnostics. Unsampled WAIT-BEGIN time never governs consensus.
     waitCtx.Add "sigNetHitWasPreWait", (m_sigNetArmed And m_sigNetSeen)
 
     ' A carryover reservation belongs to the context that produced the SUSPECT and is
@@ -13015,6 +13122,7 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
             If CLng(probe("sigCount")) > 0 Then
                 m_sigDomSeen = True
                 ctx("stableStart") = currentMs   ' reset: full window after the hit
+                ctx("stableWindowStarted") = False
                 LogSignalLine "[SPA-SIGNAL-HIT] type=dom | count=" & CLng(probe("sigCount")) & _
                               " | quietAtHit=" & Format(jsIdleDuration, "0") & "ms"
             End If
@@ -13025,6 +13133,7 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
             If CBool(probe("visSeen")) Then
                 m_sigVisSeen = True
                 ctx("stableStart") = currentMs   ' reset: full window after the hit
+                ctx("stableWindowStarted") = False
                 LogSignalLine "[SPA-SIGNAL-HIT] type=vis | quietAtHit=" & Format(jsIdleDuration, "0") & "ms"
             End If
         End If
@@ -13034,6 +13143,7 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
             If Not CBool(ctx("sigNetAcked")) Then
                 ctx("sigNetAcked") = True
                 ctx("stableStart") = currentMs   ' reset: full window after the hit
+                ctx("stableWindowStarted") = False
             End If
         End If
     End If
@@ -13049,17 +13159,30 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
                   (Not m_sigVisArmed Or m_sigVisSeen)
 
     If netIdle And activityStable Then
+        If Not sigGateOpen Then
+            ' A closed signal gate cannot start a confirmation window. The signal hit itself
+            ' owns the reset; its observing poll may become the first qualifying sample.
+            ctx("stableWindowStarted") = False
+            ctx("lastStableWindowMs") = 0#
+            EvaluateSpaIdleCondition = False
+            Exit Function
+        End If
+
+        ' The first qualifying poll only establishes the sampled start of the confirmation
+        ' window. This prevents a delayed first poll from inheriting unsampled WAIT-BEGIN time.
+        If Not CBool(ctx("stableWindowStarted")) Then
+            ctx("stableStart") = currentMs
+            ctx("stableWindowStarted") = True
+            ctx("lastStableWindowMs") = 0#
+            EvaluateSpaIdleCondition = False
+            Exit Function
+        End If
+
         Dim stableWindowMs As Double
         stableWindowMs = currentMs - CDbl(ctx("stableStart"))
         If stableWindowMs < 0 Then stableWindowMs = 0
         ctx("lastStableWindowMs") = stableWindowMs
 
-        If Not sigGateOpen Then
-            ' Do not reset stableStart while merely waiting for a signal; the hit itself owns the
-            ' single reset. A TIMEOUT with signal=miss must not use this window as evidence.
-            EvaluateSpaIdleCondition = False
-            Exit Function
-        End If
         If stableWindowMs >= CDbl(minStableMs) Then
             If m_debugMode Then
                 Call socket_.LogEvent("Consensus reached (" & minStableMs & "ms window satisfied)", "", ">>> [BiDi SPA Stable]")
@@ -13081,6 +13204,7 @@ Private Function EvaluateSpaIdleCondition(ByVal probe As Dictionary, _
         End If
     Else
         ctx("stableStart") = currentMs
+        ctx("stableWindowStarted") = False
         ctx("lastStableWindowMs") = 0#
         EvaluateSpaIdleCondition = False
     End If
@@ -13853,6 +13977,79 @@ Private Function IsTimeout(ByVal startTicks As Currency, ByVal timeoutMs As Doub
     IsTimeout = socket_.elapsedMs(startTicks) > timeoutMs
 End Function
 
+' Remaining wall-clock budget for MasterWaitEngine-owned commands. Zero means the logical
+' wait deadline has been reached and no further response-correlated command may be started.
+Private Function RemainingWaitBudgetMs(ByVal startTicks As Currency, ByVal timeoutMs As Long) As Long
+    If timeoutMs <= 0 Then Exit Function
+
+    Dim remaining As Double
+    remaining = CDbl(timeoutMs) - socket_.elapsedMs(startTicks)
+    If remaining <= 0# Then Exit Function
+
+    If remaining < 1# Then
+        RemainingWaitBudgetMs = 1
+    Else
+        RemainingWaitBudgetMs = CLng(Fix(remaining))
+    End If
+End Function
+
+' Remaining budget of the active wait segment (m_commandDeadlineMs). Zero when exhausted.
+Private Function RemainingCommandBudgetMs() As Long
+    If m_commandDeadlineMs <= 0# Then Exit Function
+
+    Dim remaining As Double
+    remaining = m_commandDeadlineMs - socket_.nowMs()
+    If remaining <= 0# Then Exit Function
+
+    If remaining < 1# Then
+        RemainingCommandBudgetMs = 1
+    ElseIf remaining >= 2147483647# Then
+        RemainingCommandBudgetMs = 2147483647
+    Else
+        RemainingCommandBudgetMs = CLng(Fix(remaining))
+    End If
+End Function
+
+' Bounds commands of one wait segment. Nested segments keep the earlier deadline.
+' Returns the previous deadline for RestoreCommandDeadline.
+Private Function EnterCommandDeadline(ByVal deadlineMs As Double) As Double
+    EnterCommandDeadline = m_commandDeadlineMs
+    If m_commandDeadlineMs <= 0# Or deadlineMs < m_commandDeadlineMs Then m_commandDeadlineMs = deadlineMs
+End Function
+
+Private Sub RestoreCommandDeadline(ByVal previousDeadlineMs As Double)
+    m_commandDeadlineMs = previousDeadlineMs
+End Sub
+
+' Classifies a reached wait deadline. Continuity loss outranks 504: a timeout must never hide a
+' lost or silently reconnected transport, even when both are observed at the deadline.
+Private Sub SetWaitDeadlineError(ByVal timeoutMs As Long, _
+                                 ByRef errNum As Long, _
+                                 ByRef errDesc As String, _
+                                 ByRef errSrc As String, _
+                                 Optional ByVal detail As String = vbNullString)
+    Dim reason As String
+    If IsSessionContinuityLost(reason) Then
+        errNum = ERR_SESSION_CONTINUITY_LOST
+        errDesc = "SessionContinuityLost: " & reason & " (observed at wait deadline). " & _
+                  "The BiDi session cannot continue on this connection."
+        errSrc = "SessionContinuity"
+        Exit Sub
+    End If
+
+    errNum = 504
+    errDesc = "Wait condition timed out (" & timeoutMs & "ms)."
+    If Len(detail) > 0 Then errDesc = errDesc & " | " & detail
+    errSrc = "LogicalTimeout"
+End Sub
+
+' Only a 604 tagged by the wait-budget path is a logical timeout. Any other error, including an
+' uncapped 604 or ERR_SESSION_CONTINUITY_LOST, keeps its own code.
+Private Function IsWaitBudgetExhaustedError(ByVal errNum As Long, ByVal errDesc As String) As Boolean
+    If errNum <> 604 Then Exit Function
+    IsWaitBudgetExhaustedError = (InStr(1, errDesc, WAIT_BUDGET_EXHAUSTED_TAG, vbBinaryCompare) > 0)
+End Function
+
 Private Sub WaitRecoveryBackoffNoOfficePump(ByVal sleepMs As Long)
     Dim vSleep As Long
     vSleep = sleepMs
@@ -14023,6 +14220,13 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
     Dim startTick As Currency: startTick = socket_.NowTicks()
     Dim success As Boolean: success = False
 
+    ' INVARIANT: every response-correlated command of this wait, including retries and context
+    ' recovery, runs inside an EnterCommandDeadline segment bounded by waitDeadlineMs.
+    Dim waitDeadlineMs As Double: waitDeadlineMs = socket_.nowMs() + CDbl(vTimeout)
+    Dim savedDeadlineMs As Double: savedDeadlineMs = m_commandDeadlineMs
+    Dim segmentPrevMs As Double
+    Dim remainingMs As Long
+
     m_waitStackDepth = m_waitStackDepth + 1
     
     If m_waitStackDepth = 1 Then
@@ -14034,49 +14238,88 @@ Private Function MasterWaitEngine(ByVal mode As waitMode, _
         m_lastHudRetryTick = 0
         
         On Error Resume Next
+        segmentPrevMs = EnterCommandDeadline(waitDeadlineMs)
         Call Me.CallScript(GetHudJs("init"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), _
                            False, False, 2000, Silent:=True, allowAmbiguousRetry:=True)
+        RestoreCommandDeadline segmentPrevMs
+        Err.Clear
         On Error GoTo 0
     End If
     On Error GoTo ErrorHandler
     Do
+        remainingMs = RemainingWaitBudgetMs(startTick, vTimeout)
+        If remainingMs <= 0 Then
+            SetWaitDeadlineError vTimeout, errNum, errDesc, errSrc
+            Exit Do
+        End If
+
         ' Queue processing and Office pumping occur only at this safe wrapper wait boundary.
-        WaitHeartbeat vInterval
+        ' No command deadline is active here: Office callbacks must not inherit this budget.
+        If vInterval < remainingMs Then WaitHeartbeat vInterval Else WaitHeartbeat remainingMs
+
+        remainingMs = RemainingWaitBudgetMs(startTick, vTimeout)
+        If remainingMs <= 0 Then
+            SetWaitDeadlineError vTimeout, errNum, errDesc, errSrc
+            Exit Do
+        End If
         
         If socket_.elapsedMs(m_lastTelemetryTick) > 100 Then
+            segmentPrevMs = EnterCommandDeadline(waitDeadlineMs)
             Call UpdateWaitTelemetry(mode, ctx)
+            RestoreCommandDeadline segmentPrevMs
             m_lastTelemetryTick = socket_.NowTicks()
         End If
         
+        segmentPrevMs = EnterCommandDeadline(waitDeadlineMs)
         On Error Resume Next
         success = EvaluateWaitCondition(mode, ctx)
-        If Err.Number <> 0 Then
-            errNum = Err.Number: errDesc = Err.description: errSrc = Err.source
-            On Error GoTo ErrorHandler: Exit Do
-        End If
+        Dim evalErrNum As Long: evalErrNum = Err.Number
+        Dim evalErrDesc As String: evalErrDesc = Err.description
+        Dim evalErrSrc As String: evalErrSrc = Err.source
+        Err.Clear
         On Error GoTo ErrorHandler
-        
-        If success Then Exit Do
-        
-        If IsTimeout(startTick, CDbl(vTimeout)) Then
-            errNum = 504
-            errDesc = "Wait condition timed out (" & vTimeout & "ms)."
-            errSrc = "LogicalTimeout"
+        RestoreCommandDeadline segmentPrevMs
+
+        ' Decision order: success, non-timeout error, budget exhaustion, unmet condition at the
+        ' deadline. A sampled success is kept even if it returns at the deadline: the per-command
+        ' budget bounds that overrun to about one round trip.
+        If evalErrNum = 0 Then
+            If success Then Exit Do
+        ElseIf IsWaitBudgetExhaustedError(evalErrNum, evalErrDesc) Then
+            success = False
+            SetWaitDeadlineError vTimeout, errNum, errDesc, errSrc, evalErrDesc
+            Exit Do
+        Else
+            success = False
+            errNum = evalErrNum: errDesc = evalErrDesc: errSrc = evalErrSrc
             Exit Do
         End If
     Loop
 
 CleanExit:
+    ' The deadline segment never outlives this wait, including the ErrorHandler path.
+    RestoreCommandDeadline savedDeadlineMs
+
     m_waitStackDepth = m_waitStackDepth - 1
     If m_waitStackDepth < 0 Then m_waitStackDepth = 0
 
     On Error Resume Next
-    ' Keep the HUD while an outer nested wait is still active.
+    ' Keep the HUD while an outer nested wait is still active. Removal is best-effort and may
+    ' outlive an exhausted budget by at most WAIT_CLEANUP_GRACE_MS.
     If m_waitStackDepth = 0 Then
-        Call Me.CallScript(GetHudJs("remove"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), _
-                           False, False, 1000, Silent:=True, allowAmbiguousRetry:=True)
+        Dim cleanupDeadlineMs As Double: cleanupDeadlineMs = socket_.nowMs() + WAIT_CLEANUP_GRACE_MS
+        If waitDeadlineMs > cleanupDeadlineMs Then cleanupDeadlineMs = waitDeadlineMs
+        segmentPrevMs = EnterCommandDeadline(cleanupDeadlineMs)
+        If RemainingWaitBudgetMs(startTick, vTimeout) > 0 Then
+            Call Me.CallScript(GetHudJs("remove"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))), _
+                               False, False, 1000, Silent:=True, allowAmbiguousRetry:=True)
+        Else
+            Call Me.PostScript(GetHudJs("remove"), Nothing, ResolveTargetContext(CStr(ctx("contextId"))))
+        End If
+        RestoreCommandDeadline segmentPrevMs
     End If
     
+    Err.Clear
     On Error GoTo 0
     
     If errNum <> 0 Then
@@ -14274,6 +14517,7 @@ Private Sub CompleteProbeInitialization(ByRef ctx As Dictionary, _
 
     ctx("probeInitializations") = CLng(ctx("probeInitializations")) + 1
     ctx("stableStart") = currentMs
+    ctx("stableWindowStarted") = False
     ctx("lastStableWindowMs") = 0#
 
     LogProbeDiagnosticLine "[SPA-PROBE-READY] initMs=" & Format(initMs, "0") & _
@@ -14316,6 +14560,7 @@ Private Sub CompleteProbeRecovery(ByRef ctx As Dictionary, _
     ctx("probeDetectedUnhealthyMs") = CDbl(ctx("probeDetectedUnhealthyMs")) + episodeMs
     ctx("probeRecoveries") = CLng(ctx("probeRecoveries")) + 1
     ctx("stableStart") = currentMs
+    ctx("stableWindowStarted") = False
     ctx("lastStableWindowMs") = 0#
 
     LogProbeDiagnosticLine "[SPA-PROBE-RECOVERED] detectedUnhealthyMs=" & Format(episodeMs, "0") & _
@@ -14415,6 +14660,7 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
                     On Error GoTo 0
 
                     ctx("stableStart") = socket_.nowMs()
+                    ctx("stableWindowStarted") = False
                     ctx("missingProbeCount") = 0
 
                     If m_debugMode Then
@@ -14436,6 +14682,7 @@ Private Function EvaluateWaitCondition(ByVal mode As waitMode, ByRef ctx As Dict
                 Dim bCount As Long: bCount = CLng(ctx("missingProbeCount")) + 1
                 ctx("missingProbeCount") = bCount
                 ctx("stableStart") = unhealthyNowMs
+                ctx("stableWindowStarted") = False
                 ctx("lastStableWindowMs") = 0#
 
                 If bCount > MAX_RECOVERY_ATTEMPTS Then
@@ -15222,7 +15469,14 @@ Private Sub UpdateWaitTelemetry(ByVal mode As waitMode, ByRef ctx As Dictionary)
             colorCode = "#00FF00" ' Green
             
         Case WaitMode_SpaIdle
-            Dim idleTime As Double: idleTime = (socket_.nowMs() - CDbl(ctx("stableStart"))) / 1000
+            Dim idleTime As Double
+            If ctx.Exists("stableWindowStarted") Then
+                If CBool(ctx("stableWindowStarted")) Then
+                    idleTime = (socket_.nowMs() - CDbl(ctx("stableStart"))) / 1000
+                Else
+                    idleTime = 0#
+                End If
+            End If
             Dim targetIdle As Double: targetIdle = CLng(ctx("minStableMs")) / 1000
 
             ' HUD pending types may lag DOM/visibility by one poll because telemetry precedes probe
