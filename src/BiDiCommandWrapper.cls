@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "6.7"
+Private Const BIDI_WRAPPER_VERSION As String = "6.8"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -235,6 +235,7 @@ Private m_rqMaxDrainGapMs As Double
 Private m_rqMaxDrainGapEndSec As Double
 Private m_rqLastDrainEndMs As Double
 Private m_rqLossBaseline As Long
+Private m_rqOversizeBaseline As Long
 Private m_rqReduced As Long             ' events parsed from a reduced copy
 Private m_rqReducedFallback As Long     ' reduced copy failed to parse; original parsed instead (expected 0)
 Private m_excludeResources As Boolean
@@ -10474,6 +10475,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<normalized network endpoint; URL fragment removed ([NAV] shows #<fragment-redacted>); query parameter names preserved with values stripped, except the rpcids value and token-shaped action values (operation names such as UpdateItem) retained> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
         stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During Discovery recording, GLOBAL network.responseCompleted remains subscribed through navigation URL-stability so [RES] and BODY candidate coverage are continuous. Per-request latency (dur=) is not computed." & vbCrLf
         stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
+        stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
         stm.writeText "LEGEND | [REQ-UNPAIRED] tracks request hops by (request id, redirectCount), including suppressed requests. Categories are exclusive: open-at-end=still had no observed terminal event/redirect advance when recording ended; other=no terminal event observed, but later evidence (such as the next redirect hop) showed the hop was no longer open." & vbCrLf
         stm.writeText "LEGEND | [ERR]/[BLOCK] carry request id + normalized key; if fetchError omits its URL, the recorder falls back to the beforeRequestSent id->URL/key cache (including suppressed requests). Path/matrix assignment values such as ;ord=... or /_dc_unique_id=... are stripped to name= so volatile identifiers do not fragment keys." & vbCrLf
         stm.writeText "LEGEND | ctx= on [REQ]/[RES]/[ERR]/[BLOCK] appears only for events outside the recorder top-level context (CONFIG recorderCtx): ctx=(empty) = no browsing context, typically a Web Worker; its Fetch/XHR is invisible to idle consensus and never enters render-evidence checks. ctx=other:<first 8 chars> = another tab or frame. No ctx= = recorder context (if recorderCtx=unresolved, only (empty) is marked)." & vbCrLf
@@ -10935,7 +10937,17 @@ Private Sub ResetRecorderQueueStats()
     m_rqMaxDepth = 0
     m_rqMaxDrainGapMs = 0#: m_rqMaxDrainGapEndSec = 0#: m_rqLastDrainEndMs = 0#
     m_rqLossBaseline = CurrentTotalAsyncEventLossCount()
+    m_rqOversizeBaseline = SafeTransportOversizedEventCount()
 End Sub
+
+' Transport-cap event drops; already included in the total async loss count.
+Private Function SafeTransportOversizedEventCount() As Long
+    On Error GoTo Unavailable
+    SafeTransportOversizedEventCount = socket_.TransportOversizedEventCount
+    Exit Function
+Unavailable:
+    SafeTransportOversizedEventCount = 0
+End Function
 
 Private Function SafeEventQueueDepth() As Long
     On Error GoTo Unavailable
@@ -10984,6 +10996,13 @@ Private Sub AppendRecorderQueueStats()
     Dim lossDelta As Long
     lossDelta = CurrentTotalAsyncEventLossCount() - m_rqLossBaseline
     If lossDelta < 0 Then lossDelta = 0
+    Dim lossText As String: lossText = CStr(lossDelta)
+    If lossDelta > 0 Then
+        Dim oversizeDelta As Long
+        oversizeDelta = SafeTransportOversizedEventCount() - m_rqOversizeBaseline
+        If oversizeDelta < 0 Then oversizeDelta = 0
+        lossText = lossText & " (transportOversize=" & CStr(oversizeDelta) & ")"
+    End If
 
     Dim avgParseUs As Double, avgFastUs As Double
     If m_rqParsed > 0 Then avgParseUs = m_rqParseMs * 1000# / m_rqParsed
@@ -11001,7 +11020,7 @@ Private Sub AppendRecorderQueueStats()
                      " | maxDrainGapEndAt=" & Format$(m_rqMaxDrainGapEndSec, "0.00") & "s" & _
                      " | parseMs=" & Format$(m_rqParseMs, "0") & " | avgParseUs=" & Format$(avgParseUs, "0") & _
                      " | fastPathMs=" & Format$(m_rqFastMs, "0") & " | avgFastPathUs=" & Format$(avgFastUs, "0") & _
-                     " | asyncLossSinceStart=" & CStr(lossDelta)
+                     " | asyncLossSinceStart=" & lossText
 End Sub
 
 
@@ -16736,7 +16755,7 @@ Private Function TryParseReducedJson(ByRef reduced As String, ByRef parsed As Ob
     Set parsed = Nothing
 
     On Error Resume Next
-    Set candidate = WebJsonConverter.ParseJson(reduced)
+    Set candidate = socket_.ParseJsonText(reduced)
     If Err.Number <> 0 Then
         Err.Clear
         Exit Function

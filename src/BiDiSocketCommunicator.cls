@@ -11,7 +11,9 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "6.7"
+Private Const BIDI_SOCKET_VERSION As String = "6.8"
+Private m_jpUseDouble As Boolean, m_jpUnquoted As Boolean
+Private m_jpBsNext As Long
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
 ' request/system IDs, event FIFO and monotonic timing. Retry classification,
 ' context recovery and SPA synchronization belong to BiDiCommandWrapper.
@@ -2363,7 +2365,7 @@ Public Function ParseEventText(ByVal rawMsg As String, _
     Dim parseErr As Long
     Dim candidate As Object
     On Error Resume Next
-    Set candidate = WebJsonConverter.ParseJson(rawMsg)
+    Set candidate = ParseJsonText(rawMsg)
     parseErr = Err.Number
     Err.Clear
     On Error GoTo 0
@@ -2391,6 +2393,319 @@ Public Function ParseEventText(ByVal rawMsg As String, _
     Set parsed = candidate
     ParseEventText = True
 End Function
+
+' Event JSON parser: port of the parse half of VBA-JSON v2.3.1 as shipped in
+' SeleniumVBA WebJsonConverter. VBA-JSON (c) Tim Hall, MIT License
+' (github.com/VBA-tools/VBA-JSON); based on vba-json (c) 2013 Ryo Yokoyama,
+' BSD License. Full license texts: see WebJsonConverter.
+' Results match WebJsonConverter.ParseJson; only character access is faster.
+
+' Raises WebJsonConverter's own error on input this parser rejects.
+Public Function ParseJsonText(ByRef src As String) As Object
+    Dim fast As Object
+    On Error Resume Next
+    Set fast = JpParse(src)
+    If Err.Number = 0 Then
+        On Error GoTo 0
+        Set ParseJsonText = fast
+        Exit Function
+    End If
+    Err.Clear
+    On Error GoTo 0
+    Set ParseJsonText = WebJsonConverter.ParseJson(src)
+End Function
+
+Private Function JpParse(ByRef src As String) As Object
+    Dim s As String: s = src
+    ' Same CR/LF/TAB removal as ParseJson; skipped when absent.
+    If InStr(1, s, vbCr, vbBinaryCompare) > 0 Then s = Replace(s, vbCr, "")
+    If InStr(1, s, vbLf, vbBinaryCompare) > 0 Then s = Replace(s, vbLf, "")
+    If InStr(1, s, vbTab, vbBinaryCompare) > 0 Then s = Replace(s, vbTab, "")
+
+    Dim b() As Byte: b = s
+    Dim n As Long: n = Len(s)
+    Dim i As Long: i = 1
+    m_jpBsNext = 0
+    m_jpUseDouble = WebJsonConverter.OptionsUseDoubleForLargeNumbers
+    m_jpUnquoted = WebJsonConverter.OptionsAllowUnquotedKeys
+
+    JpSkip b, n, i
+    Select Case JpCh(b, n, i)
+    Case 123: Set JpParse = JpObject(s, b, n, i)
+    Case 91: Set JpParse = JpArray(s, b, n, i)
+    Case 60: Set JpParse = New Scripting.Dictionary
+    Case Else: Err.Raise 10001, "JsonParser", "Expecting '{' or '['"
+    End Select
+End Function
+
+' UTF-16 code unit at 1-based i; -1 outside the text.
+Private Function JpCh(ByRef b() As Byte, ByVal n As Long, ByVal i As Long) As Long
+    If i < 1 Or i > n Then
+        JpCh = -1
+    Else
+        JpCh = b(2 * i - 2) Or (CLng(b(2 * i - 1)) * 256&)
+    End If
+End Function
+
+Private Sub JpSkip(ByRef b() As Byte, ByVal n As Long, ByRef i As Long)
+    Do While i > 0 And i <= n
+        If b(2 * i - 2) <> 32 Or b(2 * i - 1) <> 0 Then Exit Do
+        i = i + 1
+    Loop
+End Sub
+
+Private Function JpObject(ByRef s As String, ByRef b() As Byte, ByVal n As Long, _
+                          ByRef i As Long) As Scripting.Dictionary
+    Dim d As Scripting.Dictionary
+    Dim key As String
+    Dim c As Long, j As Long
+
+    Set d = New Scripting.Dictionary
+    Set JpObject = d
+    JpSkip b, n, i
+    If JpCh(b, n, i) <> 123 Then Err.Raise 10001, "JsonParser", "Expecting '{'"
+    i = i + 1
+
+    Do
+        JpSkip b, n, i
+        c = JpCh(b, n, i)
+        If c = 125 Then
+            i = i + 1
+            Exit Function
+        ElseIf c = 44 Then
+            i = i + 1
+            JpSkip b, n, i
+        End If
+
+        key = JpKey(s, b, n, i)
+        j = i
+        JpSkip b, n, j
+        c = JpCh(b, n, j)
+        If c = 91 Or c = 123 Then
+            Set d.item(key) = JpValue(s, b, n, i)
+        Else
+            d.item(key) = JpValue(s, b, n, i)
+        End If
+    Loop
+End Function
+
+Private Function JpArray(ByRef s As String, ByRef b() As Byte, ByVal n As Long, _
+                         ByRef i As Long) As Collection
+    Dim col As Collection
+    Dim c As Long
+
+    Set col = New Collection
+    Set JpArray = col
+    JpSkip b, n, i
+    If JpCh(b, n, i) <> 91 Then Err.Raise 10001, "JsonParser", "Expecting '['"
+    i = i + 1
+
+    Do
+        JpSkip b, n, i
+        c = JpCh(b, n, i)
+        If c = 93 Then
+            i = i + 1
+            Exit Function
+        ElseIf c = 44 Then
+            i = i + 1
+            JpSkip b, n, i
+        End If
+
+        col.Add JpValue(s, b, n, i)
+    Loop
+End Function
+
+Private Function JpValue(ByRef s As String, ByRef b() As Byte, ByVal n As Long, _
+                         ByRef i As Long) As Variant
+    JpSkip b, n, i
+    Select Case JpCh(b, n, i)
+    Case 123
+        Set JpValue = JpObject(s, b, n, i)
+    Case 91
+        Set JpValue = JpArray(s, b, n, i)
+    Case 34, 39
+        JpValue = JpString(s, b, n, i)
+    Case 116
+        If Mid$(s, i, 4) <> "true" Then Err.Raise 10001, "JsonParser", "Unexpected token"
+        JpValue = True
+        i = i + 4
+    Case 102
+        If Mid$(s, i, 5) <> "false" Then Err.Raise 10001, "JsonParser", "Unexpected token"
+        JpValue = False
+        i = i + 5
+    Case 110
+        If Mid$(s, i, 4) <> "null" Then Err.Raise 10001, "JsonParser", "Unexpected token"
+        JpValue = Null
+        i = i + 4
+    Case 43, 45, 48 To 57
+        JpValue = JpNumber(s, b, n, i)
+    Case Else
+        ' Includes end of input, where WebJsonConverter loops on Empty values.
+        Err.Raise 10001, "JsonParser", "Unexpected token"
+    End Select
+End Function
+
+Private Function JpNumber(ByRef s As String, ByRef b() As Byte, ByVal n As Long, _
+                          ByRef i As Long) As Variant
+    Dim start As Long
+    Dim v As String
+    Dim isLarge As Boolean
+
+    JpSkip b, n, i
+    start = i
+    Do While i > 0 And i <= n
+        Select Case JpCh(b, n, i)
+        Case 43, 45, 46, 48 To 57, 69, 101
+            i = i + 1
+        Case Else
+            v = Mid$(s, start, i - start)
+            If InStr(1, v, ".", vbBinaryCompare) > 0 Then
+                isLarge = (Len(v) >= 17)
+            Else
+                isLarge = (Len(v) >= 16)
+            End If
+            If Not m_jpUseDouble And isLarge Then
+                JpNumber = v
+            Else
+                JpNumber = val(v)
+            End If
+            Exit Function
+        End Select
+    Loop
+    ' End of input: WebJsonConverter returns Empty here.
+End Function
+
+Private Function JpKey(ByRef s As String, ByRef b() As Byte, ByVal n As Long, _
+                       ByRef i As Long) As String
+    Dim c As Long
+    c = JpCh(b, n, i)
+    If c = 34 Or c = 39 Then
+        JpKey = JpString(s, b, n, i)
+    ElseIf m_jpUnquoted Then
+        Do While i > 0 And i <= n
+            c = JpCh(b, n, i)
+            If c <> 32 And c <> 58 Then
+                JpKey = JpKey & Mid$(s, i, 1)
+                i = i + 1
+            Else
+                Exit Do
+            End If
+        Loop
+    Else
+        Err.Raise 10001, "JsonParser", "Expecting '""' or '''"
+    End If
+
+    JpSkip b, n, i
+    If JpCh(b, n, i) <> 58 Then Err.Raise 10001, "JsonParser", "Expecting ':'"
+    i = i + 1
+End Function
+
+Private Function JpString(ByRef s As String, ByRef b() As Byte, ByVal n As Long, _
+                          ByRef i As Long) As String
+    Dim q As String
+    Dim closePos As Long, bs As Long, outLen As Long
+    Dim out As String, ch As String, code As String
+
+    JpSkip b, n, i
+    q = Mid$(s, i, 1)
+    i = i + 1
+    If Len(q) = 0 Then Exit Function
+
+    closePos = InStr(i, s, q, vbBinaryCompare)
+    Do
+        If closePos = 0 Then
+            ' No closing quote: WebJsonConverter scans to the end and returns "".
+            JpStringTail s, n, i
+            JpString = vbNullString
+            Exit Function
+        End If
+
+        bs = JpNextBackslash(s, i)
+        If bs = 0 Or bs > closePos Then
+            If outLen = 0 Then
+                JpString = Mid$(s, i, closePos - i)
+            Else
+                JpAppend out, outLen, Mid$(s, i, closePos - i)
+                JpString = Left$(out, outLen)
+            End If
+            i = closePos + 1
+            Exit Function
+        End If
+
+        If bs > i Then JpAppend out, outLen, Mid$(s, i, bs - i)
+        i = bs + 1
+        ch = Mid$(s, i, 1)
+        Select Case ch
+        Case """", "\", "/", "'"
+            JpAppend out, outLen, ch
+            i = i + 1
+        Case "b"
+            JpAppend out, outLen, vbBack
+            i = i + 1
+        Case "f"
+            JpAppend out, outLen, vbFormFeed
+            i = i + 1
+        Case "n"
+            JpAppend out, outLen, vbNewLine
+            i = i + 1
+        Case "r"
+            JpAppend out, outLen, vbCr
+            i = i + 1
+        Case "t"
+            JpAppend out, outLen, vbTab
+            i = i + 1
+        Case "u"
+            i = i + 1
+            code = Mid$(s, i, 4)
+            JpAppend out, outLen, VBA.ChrW(VBA.val("&h" + code))
+            i = i + 4
+        End Select
+        ' Unknown escape: backslash dropped, next character read normally.
+        ' closePos stays the first quote at or after i unless the escape consumed it.
+        If i > closePos Then closePos = InStr(i, s, q, vbBinaryCompare)
+    Loop
+End Function
+
+' Next backslash at or after i (0 = none). Cached per parse; i only grows, so scanning stays linear.
+Private Function JpNextBackslash(ByRef s As String, ByVal i As Long) As Long
+    If m_jpBsNext = -1 Then Exit Function
+    If m_jpBsNext < i Then
+        m_jpBsNext = InStr(i, s, "\", vbBinaryCompare)
+        If m_jpBsNext = 0 Then m_jpBsNext = -1: Exit Function
+    End If
+    JpNextBackslash = m_jpBsNext
+End Function
+
+' Index movement of WebJsonConverter's string loop when no closing quote remains.
+Private Sub JpStringTail(ByRef s As String, ByVal n As Long, ByRef i As Long)
+    Do While i > 0 And i <= n
+        If Mid$(s, i, 1) = "\" Then
+            i = i + 1
+            Select Case Mid$(s, i, 1)
+            Case """", "\", "/", "'", "b", "f", "n", "r", "t"
+                i = i + 1
+            Case "u"
+                i = i + 5
+            End Select
+        Else
+            i = i + 1
+        End If
+    Loop
+End Sub
+
+Private Sub JpAppend(ByRef buf As String, ByRef bufLen As Long, ByVal text As String)
+    Dim addLen As Long, grow As Long
+    addLen = Len(text)
+    If addLen = 0 Then Exit Sub
+    If bufLen + addLen > Len(buf) Then
+        grow = Len(buf)
+        If grow < addLen Then grow = addLen
+        If grow < 64 Then grow = 64
+        buf = buf & Space$(grow)
+    End If
+    Mid$(buf, bufLen + 1, addLen) = text
+    bufLen = bufLen + addLen
+End Sub
 
 ' Three-state contract preserved: False = empty; True + object = parsed; True + Nothing = rejected.
 Public Function TryGetParsedEvent(ByRef parsed As Object, _
