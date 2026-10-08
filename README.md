@@ -37,9 +37,6 @@ The article uses **Google Flights** as a working example and follows the full wo
 
 It also demonstrates why an API response alone may not be enough to determine that the UI is ready, and how `ArmNetworkSignal` and `ArmVisibilitySignal` can be combined to wait for both backend completion and visible results.
 
-**Read the article:**  
-[Using AI to Automate Dynamic SPA Websites with WebDriver BiDi for SeleniumVBA](https://medium.com/@hanamichi77777/using-ai-to-automate-dynamic-spa-websites-with-webdriver-bidi-for-seleniumvba-e700b76f7219)
-
 ## Validation Benchmarks
 
 For validation, this project uses two challenging automation benchmarks: entering text into the ServiceNow login form and performing a flight search on Google Flights.
