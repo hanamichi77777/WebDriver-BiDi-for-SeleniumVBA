@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 6.9 / MIT License / Copyright (c) hanamichi77777
+' Version 7.0 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -382,10 +382,22 @@ Public Sub Main08()
 End Sub
 
 ' Main09 - Manual Discovery Log recorder
-' Record one meaningful manual action per run. Change the URL and recording
-' window; a narrow window makes causal analysis easier. excludeImagesAndCss
-' filters log entries only and does not block browser resources.
+' Paste the target URL into the input box at startup.
+' Recording starts before navigation, so the initial page load is included.
+' A single run may cover several manual actions or a whole scenario. Wait until
+' the page has settled after the load and after each action. Set
+' RECORDING_SECONDS to fit the scenario. excludeImagesAndCss filters log
+' entries only and does not block browser resources.
 Sub Main09()
+  ' Ask for the target URL before starting the browser, so Cancel needs no cleanup.
+  Dim url As String
+  url = Trim$(InputBox("Paste the URL to record.", "Main09 - Target URL", "https://note.com/"))
+  If Len(url) = 0 Then Exit Sub                       ' Canceled
+  If Not (LCase$(url) Like "http://*" Or LCase$(url) Like "https://*") Then
+      MsgBox "Not a valid http(s) URL: " & url
+      Exit Sub
+  End If
+
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
     
@@ -398,20 +410,20 @@ Sub Main09()
     Dim bidi As New BiDiCommandWrapper
     bidi.ConnectTo .GetWebSocketUrl
 
-    Dim url As String: url = "https://note.com/"
-    bidi.ExecuteNavigateAndGetStatus url
-    
-    Const RECORDING_SECONDS As Long = 20
+    Const RECORDING_SECONDS As Long = 60
     Dim msgText As String, msgCaption As String
-    msgText = "Please prepare the browser for recording." & vbCrLf & vbCrLf & _
-              "Click [OK] to start recording." & vbCrLf & _
-              "Duration: " & RECORDING_SECONDS & " seconds." & vbCrLf & _
-              "Please manually interact with the page immediately after clicking OK."
+    msgText = "Target: " & url & vbCrLf & vbCrLf & _
+              "Click [OK] to open the page and start recording." & vbCrLf & vbCrLf & _
+              "Duration: " & RECORDING_SECONDS & " seconds (after the page load)." & vbCrLf & _
+              "Wait until the page has settled, then interact with it manually."
     msgCaption = "Ready to Record"
     MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
     
-    ' Start immediately before the manual action; True filters image/CSS log entries.
+    ' Start before navigation so the initial page load is part of the log.
+    ' Keep the message box before this call: no events are processed while it is open.
+    ' True filters image/CSS log entries.
     bidi.StartDiscoveryLog excludeImagesAndCss:=True
+    bidi.ExecuteNavigateAndGetStatus url
     bidi.RecordEventsForSeconds RECORDING_SECONDS
     
     ' Saves discovery_log.txt in the same folder as the current VBA host file.

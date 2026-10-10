@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "6.9"
+Private Const BIDI_SOCKET_VERSION As String = "7.0"
 Private m_jpUseDouble As Boolean, m_jpUnquoted As Boolean
 Private m_jpBsNext As Long
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,

@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v6.9
+# WebDriver BiDi for SeleniumVBA v7.0
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -28,7 +28,7 @@ The Discovery Log is therefore more than an execution log. It is a diagnostic an
 
 ### Typical Workflow: From Manual Recording to Verified Automation
 
-1. **Record the entire workflow with clear pauses between actions.** Use `Main09` to capture the complete scenario in a single Discovery Log, from the initial page state through the final result. Set `RECORDING_SECONDS` generously to allow enough time for all manual actions and the page to settle after each one. Wait until the page has fully settled before starting the next action, so each action's requests and DOM changes form a separate block on the timeline.
+1. **Record the entire workflow with clear pauses between actions.** Use `Main09` to capture the complete scenario in a single Discovery Log, from the initial page load through the final result. `Main09` calls `StartDiscoveryLog` before `ExecuteNavigateAndGetStatus`, so the log also shows whether the page keeps loading data or rendering after the load event. Set `RECORDING_SECONDS` generously to allow enough time for all manual actions and the page to settle after each one. Wait until the page has fully settled after the initial load and after each action before starting the next one, so each step's requests and DOM changes form a separate block on the timeline.
 2. **Give the log to an AI assistant as-is.** Each `discovery_log.txt` embeds its own `ANALYSIS REQUEST`, so no extra prompt is needed for the initial analysis. Also provide `BiDiCommandWrapper.cls` and `BiDi_Sample.bas`, so that its suggestions use the actual API. Typical findings include which request marks completion, which background traffic to ignore, and whether the UI changes *before* the relevant request starts (a quiet gap that idle detection alone could mistake for completion). Continue the following steps in the same AI conversation.
 3. **Provide stable locators.** DOM paths in the log are positional. For each element you will operate, copy its outerHTML from DevTools and ask the AI to construct a stable XPath using `data-test`, `id`, `aria-label`, or other suitable attributes. Avoid positional XPath expressions where a more reliable locator is available.
 4. **Ask the AI to generate a complete VBA standard module.** Using the analyzed log, confirmed XPath locators, `BiDiCommandWrapper.cls`, and `BiDi_Sample.bas`, have the AI create a new, standalone `.bas` module implementing the recorded workflow. Include browser initialization, actions, SPA synchronization, result verification, error handling, and cleanup. Use the arm-then-act pattern: call `ArmNetworkSignal` (or `ArmContentSignal` / `ArmVisibilitySignal`) immediately before each action whose completion matters. Use only APIs and argument signatures verified against the supplied source code. Keep the original library and sample modules unchanged.
@@ -63,7 +63,7 @@ Setup and import instructions are available in the **[Wiki](https://github.com/h
 ## Scope and Limitations
 
 * **SPA completion is inferred, not guaranteed.** The default idle consensus is based on observed network activity, Fetch/XHR counters, DOM mutations, and a quiet window. It cannot prove the target application's internal logical completion or rule out future delayed work.
-* **Use explicit completion signals for important actions.** When a specific DOM rewrite or network response marks completion, arm `ArmContentSignal` and/or `ArmNetworkSignal` immediately before the action. A targeted signal is safer than relying on quietness alone.
+* **Use explicit completion signals for important actions.** When a specific DOM rewrite or network response marks completion, arm `ArmContentSignal` and/or `ArmNetworkSignal` immediately before the action. A targeted signal is safer than relying on quietness alone. `ArmNetworkSignal` can also be armed before `ExecuteNavigateAndGetStatus` to gate the post-navigation wait; `ArmContentSignal` and `ArmVisibilitySignal` cannot, because navigation destroys their page-side observers.
 * **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
 * **The browser print preview is not reachable through BiDi.** On Edge 154 (observed 2026-10-03), the print preview opened by `window.print()` (`edge://print/`) appears as a CDP target and as a classic WebDriver window handle, but not in the BiDi `browsingContext.getTree`. Operate the print dialog through classic SeleniumVBA.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
@@ -109,6 +109,7 @@ This procedure opens a login page, lets the user authenticate manually, and wait
 * **No arbitrary `Sleep`:** `ExecuteIsUrlContains` repeatedly checks the current live URL while the wait engine also observes navigation and network activity until a match or timeout occurs.
 * **Idle-aware success condition:** The sample uses `waitNetworkIdle=True`, so a matching URL alone is not treated as sufficient; the configured post-navigation activity must also reach the wrapper's wait conclusion.
 * **Manual credentials by design:** Credentials are not automated. The user must submit the login form within the configured 30-second window.
+* **Role in generated automation:** For sites with multi-factor authentication or new-device checks, place this pattern at the start of a generated module: the user logs in manually, and the automated steps begin after `ExecuteIsUrlContains` confirms the authenticated page. No credentials are kept in the code or the environment.
 * **What to customize:** Replace the login URL, expected URL fragment, and timeout. If an identity provider keeps the same URL after authentication, use a stable authenticated DOM/content signal instead of URL matching.
 
 ### 5. Main05: Choosing Whether an Action Needs a Post-Action Wait
@@ -150,12 +151,14 @@ This procedure demonstrates how multiple synchronization techniques can be combi
 * **Expected outcome:** The example demonstrates a robust diagnostic strategy, but it cannot guarantee immunity from future Google UI or backend changes.
 
 ### 9. Main09: Manual Discovery Log Recorder
-This procedure records an observation window while the user performs manual browser actions.
+This procedure records the initial page load and the manual browser actions that follow in a single observation window.
 
+* **Target URL:** An input box asks for the URL at startup (default: `https://note.com/`), so no code change is needed to record another site.
 * **Pause between actions:** A single run may cover several actions or a whole scenario. After each action, wait until the page has fully settled before starting the next one, so each action's requests and DOM changes form a separate block on the timeline.
 * **What the log captures:** It records the BiDi/network and SPA-probe evidence used by this project, including requests/responses, DOM activity, suppressed noise, armed-signal events, and stability decisions. It should not be described as a dump of every possible browser event.
 * **Filtering is not blocking:** `excludeImagesAndCss=True` removes common image/CSS entries from the saved diagnostic stream; it does not prevent those resources from loading in the page.
-* **Time-window selection:** Set `RECORDING_SECONDS` long enough for the whole scenario plus the settling time after the last action. Starting the recording immediately before the first action keeps unrelated page-startup activity out of the log.
+* **Recording starts before navigation:** `StartDiscoveryLog` is called before `ExecuteNavigateAndGetStatus`, so the log shows whether the page keeps loading data or rendering after the load event. Wait until the page has settled before the first manual action, so the initial load forms its own block on the timeline.
+* **Time-window selection:** `RECORDING_SECONDS` (default: 60) counts from when navigation returns. Set it long enough for the post-load settling, the whole scenario, and the settling time after the last action.
 * **How to use the result:** Use `discovery_log.txt` to decide what should be blocked, ignored, armed, or verified. Do not choose a completion signal from its name alone; confirm its timing and relation to the resulting DOM change.
 
 ### 10. Main10: Content-Signal Gate for the Settle-to-Render Gap
