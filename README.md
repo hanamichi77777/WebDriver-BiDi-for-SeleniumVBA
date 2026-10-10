@@ -26,6 +26,28 @@ The structured log can also be provided to an AI assistant for analysis. By exam
 
 The Discovery Log is therefore more than an execution log. It is a diagnostic and discovery tool for investigating how an unfamiliar third-party SPA behaves—and for discovering what should actually be waited for before reliable automation can be built.
 
+### Typical Workflow: From Manual Recording to Verified Automation
+
+1. **Record with clear pauses between actions.** Use `Main09`; a single run may cover
+   the whole scenario. After each action, wait until the page has fully settled before
+   starting the next one, so each action's requests and DOM changes form a separate
+   block on the timeline.
+2. **Give the log to an AI assistant as-is.** Each `discovery_log.txt` embeds its own
+   `ANALYSIS REQUEST`, so no extra prompt is needed. Typical findings are which
+   request marks completion, which background traffic to ignore, and whether the UI
+   changes *before* the relevant request starts (a quiet gap that idle detection alone
+   could mistake for completion).
+3. **Provide stable locators.** DOM paths in the log are positional. For each element
+   you will operate, copy its outerHTML from DevTools so a stable XPath can be built
+   from `data-test`, `id`, or `aria-label` attributes.
+4. **Write the code with arm-then-act.** Call `ArmNetworkSignal` (or `ArmContentSignal`
+   / `ArmVisibilitySignal`) immediately before each action whose completion matters.
+5. **Re-run with the Discovery Log and confirm.** Check that each wait shows
+   `[SPA-SIGNAL-HIT]`, that `[SPA-WAIT-END] STABLE` comes after the relevant JSON
+   response and its render, and that no `[SPA-CONSENSUS-SUSPECT]` appears.
+6. **Verify values, not just completion.** A correct wait proves the page settled, not
+   that the data is right. Check counts, ordering, or text after each important step.
+
 
 ### AI-Assisted SPA Automation Tutorial
 
@@ -152,12 +174,12 @@ This procedure demonstrates how multiple synchronization techniques can be combi
 * **Expected outcome:** The example demonstrates a robust diagnostic strategy, but it cannot guarantee immunity from future Google UI or backend changes.
 
 ### 9. Main09: Manual Discovery Log Recorder
-This procedure records a narrow observation window while the user performs one meaningful browser action manually.
+This procedure records an observation window while the user performs manual browser actions.
 
-* **Focused recording:** The recommended pattern is one action per run—for example, opening a calendar, selecting a suggestion, or pressing Search—so the causal sequence is easier to interpret.
+* **Pause between actions:** A single run may cover several actions or a whole scenario. After each action, wait until the page has fully settled before starting the next one, so each action's requests and DOM changes form a separate block on the timeline.
 * **What the log captures:** It records the BiDi/network and SPA-probe evidence used by this project, including requests/responses, DOM activity, suppressed noise, armed-signal events, and stability decisions. It should not be described as a dump of every possible browser event.
 * **Filtering is not blocking:** `excludeImagesAndCss=True` removes common image/CSS entries from the saved diagnostic stream; it does not prevent those resources from loading in the page.
-* **Time-window selection:** A longer recording is not always better. Extra background activity can obscure the request and mutation tail associated with the intended action.
+* **Time-window selection:** Set `RECORDING_SECONDS` long enough for the whole scenario plus the settling time after the last action. Starting the recording immediately before the first action keeps unrelated page-startup activity out of the log.
 * **How to use the result:** Use `discovery_log.txt` to decide what should be blocked, ignored, armed, or verified. Do not choose a completion signal from its name alone; confirm its timing and relation to the resulting DOM change.
 
 ### 10. Main10: Content-Signal Gate for the Settle-to-Render Gap
