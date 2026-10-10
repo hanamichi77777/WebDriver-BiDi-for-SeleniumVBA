@@ -48,17 +48,6 @@ The Discovery Log is therefore more than an execution log. It is a diagnostic an
 6. **Verify values, not just completion.** A correct wait proves the page settled, not
    that the data is right. Check counts, ordering, or text after each important step.
 
-
-### AI-Assisted SPA Automation Tutorial
-
-A practical walkthrough is available on Medium showing how to combine the Discovery Log with AI-assisted analysis when automating a dynamic third-party SPA.
-
-The article uses **Google Flights** as a working example and follows the full workflow from manual observation to verified automation:
-
-`Manual operation → Discovery Log → AI analysis → semantic locators → Network / Visibility signals → automated re-run → SIGNAL-HIT / STABLE verification`
-
-It also demonstrates why an API response alone may not be enough to determine that the UI is ready, and how `ArmNetworkSignal` and `ArmVisibilitySignal` can be combined to wait for both backend completion and visible results.
-
 ## Validation Benchmarks
 
 For validation, this project uses two challenging automation benchmarks: entering text into the ServiceNow login form and performing a flight search on Google Flights.
