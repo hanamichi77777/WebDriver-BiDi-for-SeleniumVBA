@@ -33,8 +33,8 @@ The Discovery Log is therefore more than an execution log. It is a diagnostic an
    starting the next one, so each action's requests and DOM changes form a separate
    block on the timeline.
 2. **Give the log to an AI assistant as-is.** Each `discovery_log.txt` embeds its own
-   `ANALYSIS REQUEST`, so no extra prompt is needed. Typical findings are which
-   request marks completion, which background traffic to ignore, and whether the UI
+   `ANALYSIS REQUEST`, so no extra prompt is needed. Also give it `BiDiCommandWrapper.cls`
+   and `BiDi_Sample.bas`, so that its suggestions use the actual API. Typical findings are which request marks completion, which background traffic to ignore, and whether the UI
    changes *before* the relevant request starts (a quiet gap that idle detection alone
    could mistake for completion).
 3. **Provide stable locators.** DOM paths in the log are positional. For each element
