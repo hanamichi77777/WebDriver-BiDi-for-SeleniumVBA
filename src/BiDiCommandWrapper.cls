@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "6.8"
+Private Const BIDI_WRAPPER_VERSION As String = "6.9"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -42,7 +42,7 @@ Private socket_ As BiDiSocketCommunicator
 Private m_boundConnectionGeneration As Long
 ' True when no live session still requires teardown.
 Private m_shutdownCompleted As Boolean
-Private m_useTrustedClick As Boolean        ' default True -> trusted pointer clicks with synthetic fallback; False = synthetic only
+Private m_useTrustedClick As Boolean        ' default False -> synthetic JS clicks (proven path); True = trusted pointer clicks (opt-in)
 Private m_noVisibleMatchPreference As Boolean ' default False -> interactive XPath actions prefer the first visible match
 Private m_debugMode As Boolean              ' Backing field for the DebugMode property. Default On; set in Class_Initialize.
 
@@ -599,7 +599,7 @@ Private Sub Class_Initialize()
     ResetLastSyncState
     m_shutdownCompleted = True
     m_debugMode = True
-    m_useTrustedClick = True
+    m_useTrustedClick = False
 End Sub
 
 Public Property Get Version() As String
@@ -16013,8 +16013,8 @@ Public Property Let PreferVisibleMatch(ByVal value As Boolean)
     m_noVisibleMatchPreference = Not value
 End Property
 
-' True (default): ExecuteClick hit-tests the target center and sends a native pointer click,
-' falling back to element.click() when the target is not topmost. False: element.click() only.
+' False (default): ExecuteClick uses element.click(). True: hit-tests the target center and sends
+' a native pointer click, falling back to element.click() when the target is not topmost.
 ' ExecuteRegisterAutoClicker and the focus click before native key input stay synthetic.
 Public Property Get UseTrustedClick() As Boolean
     UseTrustedClick = m_useTrustedClick
@@ -16116,7 +16116,9 @@ Private Function TryExecutePhase(ByVal ctx As String, _
                                   ByRef outErrSrc As String) As Long
     On Error Resume Next
     
-    ' Trusted by default; PerformTrustedClick falls back to element.click() when not topmost.
+    ' Trusted clicks are opt-in. Measured on Google Flights (v6.8, 3/3 runs): with trusted clicks
+    ' the search page shows "Oops, something went wrong", and enabling them on only some clicks
+    ' still breaks the "Cheapest" recalculation. Use them only for sites that reject synthetic clicks.
     If key = "click" And m_useTrustedClick Then
         outResult = PerformTrustedClick(ctx, args, TIMEOUT)
     Else

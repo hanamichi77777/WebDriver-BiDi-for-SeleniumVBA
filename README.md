@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v6.8
+# WebDriver BiDi for SeleniumVBA v6.9
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -69,6 +69,7 @@ Setup and import instructions are available in the **[Wiki](https://github.com/h
 * **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
 * **The browser print preview is not reachable through BiDi.** On Edge 154 (observed 2026-10-03), the print preview opened by `window.print()` (`edge://print/`) appears as a CDP target and as a classic WebDriver window handle, but not in the BiDi `browsingContext.getTree`. Operate the print dialog through classic SeleniumVBA.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
+* **Trusted clicks are opt-in.** `ExecuteClick` uses the synthetic `element.click()` by default (restored in v6.9). Set `UseTrustedClick = True` only for sites that reject synthetic clicks: on Google Flights, trusted clicks caused the search results page to fail ("Oops, something went wrong") in 3 out of 3 runs. Whether a site breaks under trusted clicks cannot be detected in advance; compare runs with `True` and `False` and check the Discovery Log. File dialogs, new-context capture and downloads always use trusted clicks regardless of this setting.
 
 ---
 
@@ -101,7 +102,7 @@ This procedure automates a live route-search workflow that requires two sequenti
 * **Focused diagnostic recording:** `StartDiscoveryLog` begins after the initial navigation and covers field input, the first search-button action, the resulting page transition, the second search-button action, responses, DOM mutations, and the final stability decision.
 * **Action waits remain enabled:** The input and click operations keep their normal post-action waits because route fields, the intermediate transition, and final submission may trigger asynchronous work.
 * **Intentional two-stage button sequence:** The prefix XPath (`starts-with`) clicks the first button. That action changes the page, after which another button with the exact ID appears and is clicked by the second call. These calls are not duplicate submissions against one unchanged element. When adapting the sample, verify that each XPath belongs to the intended page state before removing either action.
-* **Covered button, intended click:** After the destination is typed, its suggestion list can cover the search button. Clicks are trusted pointer clicks by default (v6.6), and a pointer click at the button center would select the suggestion underneath. The hit test detects this, records `[TRUSTED-HITTEST] reason=covered` with the front element, and clicks the button itself instead, so the search runs with the typed destination.
+* **Covered button, intended click:** After the destination is typed, its suggestion list can cover the search button. The default synthetic click (`element.click()`) targets the button element itself, so the covering list does not intercept it. With `UseTrustedClick = True`, a pointer click at the button center would select the suggestion underneath; the hit test detects this, records `[TRUSTED-HITTEST] reason=covered` with the front element, and clicks the button itself instead, so the search still runs with the typed destination.
 * **How to diagnose failure:** Inspect the Discovery Log before adding fixed delays. Determine whether the problem is an incorrect XPath, a transition that did not complete, relevant traffic excluded as noise, an untracked completion response, or a render that occurs after apparent network quiet.
 
 ### 4. Main04: Manual Login Wait Using URL and Post-Navigation Activity
@@ -142,7 +143,8 @@ This procedure demonstrates how multiple synchronization techniques can be combi
 
 * **Plain locators:** The sample favors ARIA roles and accessible labels over obfuscated CSS classes and sets `--lang=en`. Google keeps hidden duplicates of some controls (for example a second, 0×0 "Done" button); since v6.5 an action whose XPath matches several elements uses the first visible match, so the XPaths need no `[last()]`, `aria-hidden` filters, or positional indexes.
 * **Date by meaning, not position:** The departure date is one week from today. The sample builds it with `Format$(Date + 7, "yyyy-mm-dd")` and selects the calendar cell by its `data-iso` attribute instead of counting grid cells.
-* **Trusted input path:** `ExecuteInputValue` uses the wrapper's active-element-aware input flow to clear, type, and validate values while the framework may replace controls.
+* **Default click mode:** The sample runs with the default synthetic clicks. With `UseTrustedClick = True`, Google Flights showed "Oops, something went wrong" on the results page, and enabling trusted clicks on only some of the clicks still broke the "Cheapest" recalculation.
+* **Active-element-aware input:** `ExecuteInputValue` uses the wrapper's active-element-aware input flow to clear, type, and validate values while the framework may replace controls.
 * **Traffic classification:** Non-essential resources are blocked, while required background requests are merely ignored for idle judgment. The Discovery Log remains the evidence source for revising both lists.
 * **Suggestion-selection gates:** Immediately before clicking the Sapporo suggestion, the sample arms `rpcids=tDoGIe`; immediately before clicking the Paris suggestion, it arms `rpcids=BVAT3`. Each click also requests a 1000 ms stable window. These signals were discovered from the current live workflow and may change independently.
 * **Calendar and result gates:** Before opening the departure calendar, the sample arms the `GetCalendarPicker` network signal and the visibility signal `//div[@data-gs]`. Before pressing Search, it arms `GetShoppingResults`. All `Arm*` signals are one-shot observations rather than stable public APIs.
