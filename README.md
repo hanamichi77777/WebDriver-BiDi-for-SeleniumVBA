@@ -28,25 +28,12 @@ The Discovery Log is therefore more than an execution log. It is a diagnostic an
 
 ### Typical Workflow: From Manual Recording to Verified Automation
 
-1. **Record with clear pauses between actions.** Use `Main09`; a single run may cover
-   the whole scenario. After each action, wait until the page has fully settled before
-   starting the next one, so each action's requests and DOM changes form a separate
-   block on the timeline.
-2. **Give the log to an AI assistant as-is.** Each `discovery_log.txt` embeds its own
-   `ANALYSIS REQUEST`, so no extra prompt is needed. Also give it `BiDiCommandWrapper.cls`
-   and `BiDi_Sample.bas`, so that its suggestions use the actual API. Typical findings are which request marks completion, which background traffic to ignore, and whether the UI
-   changes *before* the relevant request starts (a quiet gap that idle detection alone
-   could mistake for completion).
-3. **Provide stable locators.** DOM paths in the log are positional. For each element
-   you will operate, copy its outerHTML from DevTools so a stable XPath can be built
-   from `data-test`, `id`, or `aria-label` attributes.
-4. **Write the code with arm-then-act.** Call `ArmNetworkSignal` (or `ArmContentSignal`
-   / `ArmVisibilitySignal`) immediately before each action whose completion matters.
-5. **Re-run with the Discovery Log and confirm.** Check that each wait shows
-   `[SPA-SIGNAL-HIT]`, that `[SPA-WAIT-END] STABLE` comes after the relevant JSON
-   response and its render, and that no `[SPA-CONSENSUS-SUSPECT]` appears.
-6. **Verify values, not just completion.** A correct wait proves the page settled, not
-   that the data is right. Check counts, ordering, or text after each important step.
+1. **Record the entire workflow with clear pauses between actions.** Use `Main09` to capture the complete scenario in a single Discovery Log, from the initial page state through the final result. Set `RECORDING_SECONDS` generously to allow enough time for all manual actions and the page to settle after each one. Wait until the page has fully settled before starting the next action, so each action's requests and DOM changes form a separate block on the timeline.
+2. **Give the log to an AI assistant as-is.** Each `discovery_log.txt` embeds its own `ANALYSIS REQUEST`, so no extra prompt is needed for the initial analysis. Also provide `BiDiCommandWrapper.cls` and `BiDi_Sample.bas`, so that its suggestions use the actual API. Typical findings include which request marks completion, which background traffic to ignore, and whether the UI changes *before* the relevant request starts (a quiet gap that idle detection alone could mistake for completion). Continue the following steps in the same AI conversation.
+3. **Provide stable locators.** DOM paths in the log are positional. For each element you will operate, copy its outerHTML from DevTools and ask the AI to construct a stable XPath using `data-test`, `id`, `aria-label`, or other suitable attributes. Avoid positional XPath expressions where a more reliable locator is available.
+4. **Ask the AI to generate a complete VBA standard module.** Using the analyzed log, confirmed XPath locators, `BiDiCommandWrapper.cls`, and `BiDi_Sample.bas`, have the AI create a new, standalone `.bas` module implementing the recorded workflow. Include browser initialization, actions, SPA synchronization, result verification, error handling, and cleanup. Use the arm-then-act pattern: call `ArmNetworkSignal` (or `ArmContentSignal` / `ArmVisibilitySignal`) immediately before each action whose completion matters. Use only APIs and argument signatures verified against the supplied source code. Keep the original library and sample modules unchanged.
+5. **Run the generated module with the Discovery Log and refine.** Execute the automation with recording enabled and give the new log to the AI. For signal-armed waits, confirm `[SPA-SIGNAL-HIT]` and check that `[SPA-WAIT-END] STABLE` follows the relevant JSON response and its render. Investigate any `[SPA-CONSENSUS-SUSPECT]` or missing signal hits. Ask the AI to revise the generated module based on the observed evidence, then repeat until the workflow behaves reliably.
+6. **Verify values, not just completion.** A correct wait proves the page settled, not that the data is right. Check counts, ordering, or text after each important step. Include these checks in the generated module so that incorrect results are detected rather than silently accepted.
 
 ## Validation Benchmarks
 
