@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.2"
+Private Const BIDI_WRAPPER_VERSION As String = "7.3"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -249,6 +249,13 @@ Private m_nextDiscoveryDomPollMs As Double      ' nowMs deadline; 0 = sample on 
 Private m_captureUserActions As Boolean
 Private m_actionSessionToken As String
 Private Const USER_ACTION_PUSH_PREFIX As String = "__SVBA_USER_ACTION__"
+' Stop notification from a dedicated about:blank tab; never from the recorded page.
+Private Const DISCOVERY_STOP_PUSH_PREFIX As String = "__SVBA_DISCOVERY_TAB_STOP__"
+Private m_discoveryStopTabContextId As String
+Private m_discoveryStopTabToken As String
+Private m_discoveryStopRequested As Boolean
+Private m_discoveryStopTabDestroyed As Boolean
+Private m_discoveryStopTabUsed As Boolean
 Private m_userActionPreloadScriptId As String
 ' Per-context document load diagnostics and deferred reattachment for document.open/write.
 ' A repeated DOMContentLoaded in the SAME ready realm may erase document listeners.
@@ -1124,6 +1131,20 @@ Private Sub HandleContextDestroyedEvent(ByVal json As Object)
     If Len(eventCtx) = 0 Then Exit Sub
 
     InvalidateContextState eventCtx, True
+
+    ' Closing the separate control tab is a user-initiated stop, not an action in
+    ' the recorded page. Leave all cleanup to the normal recording loop/caller.
+    If m_isRecording And Len(m_discoveryStopTabContextId) > 0 Then
+        If StrComp(eventCtx, m_discoveryStopTabContextId, vbBinaryCompare) = 0 Then
+            m_discoveryStopTabDestroyed = True
+            If Not m_discoveryStopRequested Then
+                m_discoveryStopRequested = True
+                PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & _
+                                 "s] [DISCOVERY-STOP] source=control-tab-closed | ctx=" & _
+                                 eventCtx & EventArrivalSuffix()
+            End If
+        End If
+    End If
 
     If m_newContextArmed Then
         If StrComp(eventCtx, m_newContextOwnerContextId, vbBinaryCompare) = 0 Then
@@ -7256,6 +7277,9 @@ Private Sub ResetSessionBoundaryState()
     m_nextDiscoveryDomPollMs = 0#
     m_captureUserActions = False
     m_actionSessionToken = vbNullString
+    m_discoveryStopTabContextId = vbNullString
+    m_discoveryStopTabToken = vbNullString
+    m_discoveryStopRequested = False
     m_userActionPreloadScriptId = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
@@ -10191,6 +10215,12 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Dim stagedRequestBodySkipSummary As New Dictionary
     Dim events(3) As String
 
+    ' A stale controller must be closed before a new recording. Check before staging/commit.
+    If Len(m_discoveryStopTabContextId) > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:StartDiscoveryLog", _
+                  "A previous control tab is still registered. Call CloseDiscoveryStopTab first."
+    End If
+
     ' Fail closed when a prior preload could not be removed; never silently ignore actions.
     If Len(m_userActionPreloadScriptId) > 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:StartDiscoveryLog", _
@@ -10337,6 +10367,10 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    m_discoveryStopRequested = False
+    m_discoveryStopTabDestroyed = False
+    m_discoveryStopTabUsed = False
+    m_discoveryStopTabToken = vbNullString
     m_captureUserActions = captureUserActions
     m_actionSessionToken = Format$(stagedStartTime * 1000#, "0")
     m_userActionCount = 0
@@ -10586,6 +10620,9 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "LEGEND | frameUrl is read from page document location and may switch to a writer URL after document.open(). ctxUrl is the first observed NAV/DCL URL for the active READY realm, retained through same-realm rewrites (not a fresh getTree URL). READY uses ctxUrl=(pending) until its realm's first observed DCL. Resolve frames by ctx and verify live browsingContext.getTree before replay; never use frameUrl alone. Child option[selected] is an HTML default attribute; current SELECT choice comes from selectedText/selectedCount. " & vbCrLf
             stm.writeText "LEGEND | Permitted locator attribute values and visible labels/text may still reveal personal information, and paths may carry identifiers. Review the entire log before sharing. [NAV-TARGET] is a separate existing field that may retain query/fragment values. " & vbCrLf
             stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate. [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
+        End If
+        If m_discoveryStopTabUsed Then
+            stm.writeText "LEGEND | [DISCOVERY-CONTROL] marks a separate, opt-in control tab. [DISCOVERY-STOP] source=control-tab means STOP clicked; source=control-tab-closed means the tab was closed; source=time-limit means the safety maximum elapsed. Control-tab cleanup is separate; the target page DOM is unchanged." & vbCrLf
         End If
         stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
         stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
@@ -10838,6 +10875,101 @@ StopFailedCleanup:
     Err.Raise stopErrNumber, stopErrSource, stopErrDescription
 End Sub
 
+Public Property Get DiscoveryStopRequested() As Boolean
+    DiscoveryStopRequested = m_discoveryStopRequested
+End Property
+
+' Creates one separate tab; no elements/scripts are added to the target site.
+' Must be called after StartDiscoveryLog and target navigation, before RecordEventsForSeconds.
+Public Function OpenDiscoveryStopTab() As String
+    If Not m_isRecording Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:OpenDiscoveryStopTab", _
+                  "Call StartDiscoveryLog first."
+    End If
+    If Len(m_recorderTopContextId) = 0 Or Len(m_actionSessionToken) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:OpenDiscoveryStopTab", _
+                  "Recorder top context/token is unavailable."
+    End If
+    If Len(m_discoveryStopTabContextId) > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:OpenDiscoveryStopTab", _
+                  "A recorder control tab already exists."
+    End If
+
+    Dim newCtx As String
+    Dim response As String
+    Dim js As String
+    Dim params As Dictionary
+    On Error GoTo OpenFailed
+
+    newCtx = ExecuteCreateContext(ContextTypeTab)
+    ' The session token contains decimal timestamp digits only. Source context is checked on receipt.
+    js = "const stopCode='" & DISCOVERY_STOP_PUSH_PREFIX & m_actionSessionToken & "';"
+    js = js & "document.title='BiDi Recorder - Stop';"
+    js = js & "document.documentElement.style.cssText='background:#f1f5f9';"
+    js = js & "document.body.replaceChildren();"
+    js = js & "document.body.style.cssText='font:18px Segoe UI,Arial,sans-serif;margin:8vh auto;max-width:560px;text-align:center;color:#182436';"
+    js = js & "const box=document.createElement('div');"
+    js = js & "box.style.cssText='background:white;padding:42px 32px;border-radius:16px;box-shadow:0 4px 22px #0002';"
+    js = js & "const h=document.createElement('h1');h.textContent='BiDi Recorder';box.appendChild(h);"
+    js = js & "const p=document.createElement('p');"
+    js = js & "p.textContent='Use the other tab to record. Return here when finished.';box.appendChild(p);"
+    js = js & "const b=document.createElement('button');b.type='button';"
+    js = js & "b.textContent='STOP RECORDING';"
+    js = js & "b.style.cssText='background:#b91c1c;color:white;border:0;border-radius:9px;padding:19px 32px;font:bold 20px Arial;cursor:pointer';"
+    js = js & "b.addEventListener('click',()=>{if(b.disabled)return;b.disabled=true;"
+    js = js & "b.textContent='Stop requested...';console.info(stopCode);});"
+    js = js & "box.appendChild(b);document.body.appendChild(box);return true;"
+    response = CallScript(js, Nothing, newCtx, Silent:=True, allowAmbiguousRetry:=False)
+
+    ' A new tab may become active on creation. Return focus to the recording target.
+    Set params = New Dictionary
+    params.Add "context", m_recorderTopContextId
+    response = ExecuteBiDiCommand("browsingContext.activate", params, True, _
+                                  allowAmbiguousRetry:=False, allowRecoveryRetry:=False, _
+                                  allowContextRetarget:=False)
+    Call ValidateProtocolResponse(response, "browsingContext.activate")
+
+    m_discoveryStopTabToken = m_actionSessionToken
+    m_discoveryStopTabContextId = newCtx
+    m_discoveryStopRequested = False
+    m_discoveryStopTabDestroyed = False
+    m_discoveryStopTabUsed = True
+    PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & _
+                     "s] [DISCOVERY-CONTROL] status=ready | ctx=" & newCtx & _
+                     " | scope=separate-tab | timeout=RecordEventsForSeconds"
+    OpenDiscoveryStopTab = newCtx
+    Exit Function
+
+OpenFailed:
+    Dim failNumber As Long, failSource As String, failMessage As String
+    failNumber = Err.Number: failSource = Err.source: failMessage = Err.description
+    Resume OpenCleanup
+
+OpenCleanup:
+    On Error Resume Next
+    If Len(newCtx) > 0 Then response = ExecuteCloseContext(newCtx)
+    m_discoveryStopTabToken = vbNullString
+    m_discoveryStopTabContextId = vbNullString
+    m_discoveryStopRequested = False
+    m_discoveryStopTabDestroyed = False
+    On Error GoTo 0
+    Err.Raise failNumber, failSource, failMessage
+End Function
+
+' Close just the controller tab. Do not stop the recording or the browser session here.
+Public Sub CloseDiscoveryStopTab()
+    Dim ctx As String: ctx = m_discoveryStopTabContextId
+    If Len(ctx) = 0 Then Exit Sub
+    Dim wasDestroyed As Boolean: wasDestroyed = m_discoveryStopTabDestroyed
+    m_discoveryStopTabContextId = vbNullString
+    m_discoveryStopTabToken = vbNullString
+    m_discoveryStopTabDestroyed = False
+    ' No close command for a tab whose contextDestroyed was already observed.
+    If wasDestroyed Then Exit Sub
+    Dim ignored As String
+    ignored = ExecuteCloseContext(ctx)
+End Sub
+
 Public Sub RecordEventsForSeconds(ByVal seconds As Long)
     If seconds <= 0 Then Exit Sub
 
@@ -10858,6 +10990,9 @@ Public Sub RecordEventsForSeconds(ByVal seconds As Long)
 
     Do While (socket_.nowMs() - startMs) < durationMs
         ProcessRecorderQueue
+        If Len(m_discoveryStopTabContextId) > 0 Then
+            If m_discoveryStopRequested Then Exit Do
+        End If
 
         If durationMs > 5000 Then
             socket_.PumpMessages 100
@@ -10866,6 +11001,15 @@ Public Sub RecordEventsForSeconds(ByVal seconds As Long)
             socket_.YieldExecution 100, True
         End If
     Loop
+
+    If Len(m_discoveryStopTabContextId) > 0 And Not m_discoveryStopRequested Then
+        ' One last queue drain prevents a near-deadline STOP from being mislabeled as a timeout.
+        ProcessRecorderQueue
+        If Not m_discoveryStopRequested Then
+            PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & _
+                             "s] [DISCOVERY-STOP] source=time-limit | maxSeconds=" & CStr(seconds)
+        End If
+    End If
 
 CleanUp:
     ' Capture the tail while the manual-pump guard is still active, then release it even on an
@@ -15983,12 +16127,30 @@ Private Sub AppendUserActionStats()
                      " | cleanupWarnings=" & CStr(m_userActionCleanupWarnings)
 End Sub
 
+Private Sub HandleDiscoveryStopTabPush(ByVal json As Object, ByVal message As String)
+    If Not m_isRecording Then Exit Sub
+    If Len(m_discoveryStopTabContextId) = 0 Then Exit Sub
+    If m_discoveryStopRequested Then Exit Sub
+    If StrComp(GetPathString(json, "params.source.context"), _
+               m_discoveryStopTabContextId, vbBinaryCompare) <> 0 Then Exit Sub
+    If StrComp(message, DISCOVERY_STOP_PUSH_PREFIX & m_discoveryStopTabToken, _
+               vbBinaryCompare) <> 0 Then Exit Sub
+    m_discoveryStopRequested = True
+    PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & _
+                     "s] [DISCOVERY-STOP] source=control-tab | ctx=" & _
+                     m_discoveryStopTabContextId & EventArrivalSuffix()
+End Sub
+
 Private Sub HandleConsoleLog(ByVal json As Object)
     ' Do not add blanket OERN here; missing paths are already handled and other errors matter.
     Dim text As String: text = GetPathString(json, "params.text")
 
     If Left$(text, Len(USER_ACTION_PUSH_PREFIX)) = USER_ACTION_PUSH_PREFIX Then
         HandleDiscoveryUserActionPush json, text
+        Exit Sub
+    End If
+    If Left$(text, Len(DISCOVERY_STOP_PUSH_PREFIX)) = DISCOVERY_STOP_PUSH_PREFIX Then
+        HandleDiscoveryStopTabPush json, text
         Exit Sub
     End If
 

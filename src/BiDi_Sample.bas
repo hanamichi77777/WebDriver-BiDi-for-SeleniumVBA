@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 7.2 / MIT License / Copyright (c) hanamichi77777
+' Version 7.3 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -381,61 +381,97 @@ Public Sub Main08()
     End With
 End Sub
 
-' Main09 - Manual Discovery Log recorder
-' Paste the target URL into the input box at startup.
-' Recording starts before navigation, so the initial page load is included.
-' A single run may cover several manual actions or a whole scenario. Wait until
-' the page has settled after the load and after each action. Set
-' RECORDING_SECONDS to fit the scenario (60s default). Confirm final edited input
-' with Tab before time runs out. excludeImagesAndCss filters log entries only
-' and does not block browser resources.
-Sub Main09()
-  ' Ask for the target URL before starting the browser, so Cancel needs no cleanup.
-  Dim url As String
-  url = Trim$(InputBox("Paste the URL to record.", "Main09 - Target URL", "https://note.com/"))
-  If Len(url) = 0 Then Exit Sub                       ' Canceled
-  If Not (LCase$(url) Like "http://*" Or LCase$(url) Like "https://*") Then
-      MsgBox "Not a valid http(s) URL: " & url
-      Exit Sub
-  End If
+' Main09 - Manual Discovery Log recorder with a separate STOP tab.
+' The target tab is unchanged. Click STOP RECORDING in the dedicated control tab,
+' or close that tab using X to end recording; 300 seconds is a safety maximum.
+' Wait for the page to settle before each action; typed input values are not logged.
+' No worksheet button or UserForm is needed.
+Public Sub Main09()
+    Const MAX_RECORDING_SECONDS As Long = 300
 
-  Dim driver As WebDriver: Set driver = New WebDriver
-  With driver
+    Dim url As String
+    url = Trim$(InputBox("Paste the URL to record.", "Main09 - Target URL", "https://note.com/"))
+    If Len(url) = 0 Then Exit Sub
+    If Not (LCase$(url) Like "http://*" Or LCase$(url) Like "https://*") Then
+        MsgBox "Not a valid http(s) URL: " & url, vbExclamation
+        Exit Sub
+    End If
 
-    .StartEdge
+    Dim driver As WebDriver
+    Dim bidi As BiDiCommandWrapper
+    Dim caps As WebCapabilities
+    Dim controlCtx As String
+    Dim recordingStarted As Boolean
+    Dim stoppedFromControl As Boolean
+    Dim failure As String
+    Dim closeFailure As String
 
-    Dim caps As WebCapabilities: Set caps = .CreateCapabilities
+    On Error GoTo Failed
+    Set driver = New WebDriver
+    driver.StartEdge
+    Set caps = driver.CreateCapabilities
     caps.AddArguments "--start-maximized"
     caps.EnableBiDiMode
-    .OpenBrowser caps
-    Dim bidi As New BiDiCommandWrapper
-    bidi.ConnectTo .GetWebSocketUrl
+    driver.OpenBrowser caps
 
-    Const RECORDING_SECONDS As Long = 60
-    Dim msgText As String, msgCaption As String
-    msgText = "Target: " & url & vbCrLf & vbCrLf & _
-              "Click [OK] to open the page and start recording." & vbCrLf & vbCrLf & _
-              "Duration: " & RECORDING_SECONDS & " seconds (after the page load)." & vbCrLf & _
-              "Wait until the page has settled, then interact with it manually."
-    msgCaption = "Ready to Record"
-    MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
+    Set bidi = New BiDiCommandWrapper
+    bidi.ConnectTo driver.GetWebSocketUrl
 
-    ' Start before navigation so the initial page load is part of the log.
-    ' Keep the message box before this call: no events are processed while it is open.
-    ' True filters image/CSS log entries. captureUserActions records the elements you operate.
+    MESSAGEbox 0, "Target: " & url & vbCrLf & vbCrLf & _
+               "Click OK to start the recording and open the page." & vbCrLf & _
+               "Operate the target tab. Then use STOP RECORDING in the separate tab " & _
+               "(or close the STOP tab with X)." & vbCrLf & _
+               "Safety maximum: " & MAX_RECORDING_SECONDS & " seconds after page load." & vbCrLf & _
+               "Allow each action to settle before the next one.", _
+               "Ready to Record", MB_OK Or MB_ForeFront
+
+    ' Capture initial navigation and record actions only in the target tab/descendants.
     bidi.StartDiscoveryLog excludeImagesAndCss:=True, captureUserActions:=True
+    recordingStarted = True
     bidi.ExecuteNavigateAndGetStatus url
-    bidi.RecordEventsForSeconds RECORDING_SECONDS
+    controlCtx = bidi.OpenDiscoveryStopTab()
+    Debug.Print "Recorder control tab: " & controlCtx
+    bidi.RecordEventsForSeconds MAX_RECORDING_SECONDS
+    stoppedFromControl = bidi.DiscoveryStopRequested
 
-    ' Saves discovery_log.txt in the same folder as the current VBA host file.
+    ' Close the control tab before saving; this does not discard the already logged stop event.
+    On Error Resume Next
+    bidi.CloseDiscoveryStopTab
+    If Err.Number <> 0 Then closeFailure = Err.description
+    Err.Clear
+    On Error GoTo Failed
     bidi.StopAndSaveDiscoveryLog
+    recordingStarted = False
+    GoTo CleanUp
 
-    MsgBox "Discovery Log Saved!"
+Failed:
+    failure = "Err " & CStr(Err.Number) & ": " & Err.description
+    Resume CleanUp
 
-    bidi.Shutdown: Set bidi = Nothing
-    .CloseBrowser: .Shutdown
+CleanUp:
+    On Error Resume Next
+    If Not bidi Is Nothing Then
+        bidi.CloseDiscoveryStopTab
+        If recordingStarted Then bidi.StopAndSaveDiscoveryLog
+        bidi.Shutdown
+    End If
+    If Not driver Is Nothing Then
+        driver.CloseBrowser
+        driver.Shutdown
+    End If
+    On Error GoTo 0
 
-End With
+    If Len(failure) > 0 Then
+        MsgBox "Recording failed: " & failure & vbCrLf & _
+               "A best-effort Discovery Log save was attempted if recording began.", vbExclamation
+    ElseIf stoppedFromControl Then
+        MsgBox "Recording stopped from the control tab (STOP or X). Discovery Log saved.", vbInformation
+    Else
+        MsgBox "Safety time limit reached. Discovery Log saved.", vbInformation
+    End If
+    If Len(closeFailure) > 0 Then
+        MsgBox "Control tab cleanup warning: " & closeFailure, vbExclamation
+    End If
 End Sub
 
 ' Main10 - Content-signal gate for a response-to-render gap
