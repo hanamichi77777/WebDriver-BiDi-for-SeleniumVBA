@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.1"
+Private Const BIDI_WRAPPER_VERSION As String = "7.2"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -207,6 +207,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
+Private Const USER_ACTION_SCRIPT_VERSION As Long = 8 ' Listener rehook, select labels, button labels and context navigation URLs
 Private Const SPA_PROBE_VERSION As Long = 46 ' Internal probe generation/quiet/filter/health-diagnostic/observation-start/overflow contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
@@ -244,6 +245,29 @@ Private m_discoveryDomCaptureEnabled As Boolean ' manual Discovery: poll SPA pro
 Private m_discoveryManualPumpActive As Boolean  ' True only inside RecordEventsForSeconds
 Private m_discoveryDomContextId As String       ' current top-level context used by manual DOM sampling
 Private m_nextDiscoveryDomPollMs As Double      ' nowMs deadline; 0 = sample on next recorder pump
+' Opt-in, event-driven manual interaction evidence; no input text is captured.
+Private m_captureUserActions As Boolean
+Private m_actionSessionToken As String
+Private Const USER_ACTION_PUSH_PREFIX As String = "__SVBA_USER_ACTION__"
+Private m_userActionPreloadScriptId As String
+' Per-context document load diagnostics and deferred reattachment for document.open/write.
+' A repeated DOMContentLoaded in the SAME ready realm may erase document listeners.
+Private m_userActionReadyRealmByContext As Dictionary
+Private m_userActionLastDclRealmByContext As Dictionary
+' Per-context last observed document-load URL, pinned across same-realm DOM rewrites.
+' Not the page JS document.URL; do not use as an exact frame selector without verification.
+Private m_userActionContextUrlByContext As Dictionary
+Private m_userActionPendingRebind As Dictionary
+Private m_userActionRebindCount As Long
+Private m_userActionRebindErrors As Long
+Private m_userActionRebindGone As Long
+Private m_userActionCount As Long
+Private m_userActionConfirmCount As Long
+Private m_userActionInstallCount As Long
+Private m_userActionTopReadyCount As Long
+Private m_userActionMissingRealm As Long
+Private m_userActionParseErrors As Long
+Private m_userActionCleanupWarnings As Long
 ' During Discovery recording, GLOBAL network.responseCompleted stays subscribed through
 ' navigation URL-stability. Existing global subscriptions are reused; otherwise one is created.
 ' Cleanup is handled by the wrapper-wide active-subscription registry.
@@ -7136,6 +7160,11 @@ End Sub
 
 Private Sub ClearStateCore(ByVal releaseRemoteSubscriptions As Boolean)
     If releaseRemoteSubscriptions Then
+        If Len(m_userActionPreloadScriptId) > 0 Then
+            On Error Resume Next
+            StopDiscoveryUserActionPreload
+            On Error GoTo 0
+        End If
         Dim bodyCleanupFailure As String
         If Not ReleaseBodyDataCollectorBestEffort(bodyCleanupFailure) Then
             If m_debugMode Then Debug.Print "BiDi Warning: ClearState could not confirm body collector cleanup. " & bodyCleanupFailure
@@ -7225,6 +7254,16 @@ Private Sub ResetSessionBoundaryState()
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    m_captureUserActions = False
+    m_actionSessionToken = vbNullString
+    m_userActionPreloadScriptId = vbNullString
+    Set m_userActionReadyRealmByContext = Nothing
+    Set m_userActionLastDclRealmByContext = Nothing
+    Set m_userActionContextUrlByContext = Nothing
+    Set m_userActionPendingRebind = Nothing
+    m_userActionRebindCount = 0
+    m_userActionRebindErrors = 0
+    m_userActionRebindGone = 0
 
     ' A session boundary makes any remote collector id meaningless. User capture patterns are
     ' wrapper preferences and intentionally survive reconnects, like the existing idle filters.
@@ -10126,7 +10165,8 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
                              Optional ByVal captureDomActivity As Boolean = True, _
                              Optional ByVal captureResponseBodies As Boolean = True, _
                              Optional ByVal captureRequestBodies As Boolean = False, _
-                             Optional ByVal excludeScripts As Boolean = True)
+                             Optional ByVal excludeScripts As Boolean = True, _
+                             Optional ByVal captureUserActions As Boolean = False)
     ' Stage all recorder-owned objects and scalars locally. No live recorder state is changed
     ' until session.subscribe succeeds, so a failed start leaves an existing recorder intact
     ' and never creates a half-enabled new recorder.
@@ -10150,6 +10190,14 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Dim stagedRequestBodyCandidateCountByKey As New Dictionary
     Dim stagedRequestBodySkipSummary As New Dictionary
     Dim events(3) As String
+
+    ' Fail closed when a prior preload could not be removed; never silently ignore actions.
+    If Len(m_userActionPreloadScriptId) > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:StartDiscoveryLog", _
+                  "Previous user-action preload cleanup is still pending. Close the browser " & _
+                  "session; start a fresh WebDriver session with a new BiDiCommandWrapper, " & _
+                  "then retry. Do not reuse this wrapper while cleanup remains pending."
+    End If
 
     m_discoveryStartInProgress = True
     On Error GoTo StartFailed
@@ -10289,6 +10337,22 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    m_captureUserActions = captureUserActions
+    m_actionSessionToken = Format$(stagedStartTime * 1000#, "0")
+    m_userActionCount = 0
+    m_userActionConfirmCount = 0
+    m_userActionInstallCount = 0
+    m_userActionTopReadyCount = 0
+    m_userActionMissingRealm = 0
+    m_userActionParseErrors = 0
+    m_userActionCleanupWarnings = 0
+    m_userActionRebindCount = 0
+    m_userActionRebindErrors = 0
+    m_userActionRebindGone = 0
+    Set m_userActionReadyRealmByContext = New Dictionary
+    Set m_userActionLastDclRealmByContext = New Dictionary
+    Set m_userActionContextUrlByContext = New Dictionary
+    Set m_userActionPendingRebind = New Dictionary
 
     ' A reused wrapper starts recording with all carryover diagnostics cleared.
     Set m_waitJsonRecords = Nothing
@@ -10299,6 +10363,21 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
 
     m_isRecording = True
     m_discoveryStartInProgress = False
+
+    ' Manual actions are opt-in. Install once before the caller navigates; preload
+    ' covers the top context and every new descendant without polling by URL.
+    If m_captureUserActions Then
+        Dim actionStartError As String
+        On Error Resume Next
+        StartDiscoveryUserActionPreload
+        If Err.Number <> 0 Then actionStartError = Err.description
+        Err.Clear
+        On Error GoTo StartFailed
+        If Len(actionStartError) > 0 Then
+            PushTimelineLine "[USER-ACTION-ROUTE-SILENT] reason=preload-install-failed | detail=" & _
+                             CompactBodyDiagnostic(actionStartError)
+        End If
+    End If
 
     ' Prime manual DOM capture before control returns to the caller. Querying first drains any
     ' stale pre-recording changeList entries; if no healthy probe exists, the same call injects
@@ -10313,6 +10392,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Debug.Print "BiDi Recorder: Started. (Filter Resources: " & excludeImagesAndCss & _
                 ", Filter Scripts: " & excludeScripts & _
                 ", DOM Activity: " & captureDomActivity & _
+                ", User Actions: " & captureUserActions & _
                 ", Response Bodies: " & IIf(m_bodyCaptureActive, "On", IIf(captureResponseBodies, "Unavailable", "Off")) & _
                 ", Request Bodies: " & IIf(m_requestBodyCaptureActive, "On", IIf(captureRequestBodies, "Unavailable", "Off")) & ")"
     Exit Sub
@@ -10360,9 +10440,26 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     ' not consume the SPA probe outside that explicit manual recording window.
     Call ProcessRecorderQueue
 
+    ' Stop future injections and detach live JS listeners once (not every 300 ms).
+    ' Any network/log events generated during cleanup are drained before summary.
+    If m_captureUserActions And Len(m_userActionPreloadScriptId) > 0 Then
+        Dim actionStopError As String
+        On Error Resume Next
+        StopDiscoveryUserActionPreload
+        If Err.Number <> 0 Then actionStopError = Err.description
+        Err.Clear
+        On Error GoTo StopFailed
+        If Len(actionStopError) > 0 Then
+            m_userActionCleanupWarnings = m_userActionCleanupWarnings + 1
+            PushTimelineLine "[USER-ACTION-CLEANUP-WARN] " & CompactBodyDiagnostic(actionStopError)
+        End If
+    End If
+    ProcessRecorderQueue
+
     ' Record the request-hop summary while the recorder timeline is still writable.
     AppendRecorderUnpairedRequestSummary
     AppendRecorderQueueStats
+    AppendUserActionStats
 
     m_isRecording = False
 
@@ -10399,6 +10496,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         m_discoveryManualPumpActive = False
         m_discoveryDomContextId = vbNullString
         m_nextDiscoveryDomPollMs = 0#
+        m_captureUserActions = False
+        m_actionSessionToken = vbNullString
         ResetDiscoveryBodyRunState
         ResetRecorderRequestHopRunState
         Exit Sub
@@ -10434,6 +10533,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                       " | maxTimeoutMs(default)=" & DEFAULT_IDLE_TIMEOUT_MS & _
                       " | excludeResources=" & m_excludeResources & _
                       " | manualDomCapture=" & m_discoveryDomCaptureEnabled & _
+                      " | manualUserActions=" & m_captureUserActions & _
+                      " | userActionScript=" & USER_ACTION_SCRIPT_VERSION & _
                       " | recorderCtx=" & IIf(Len(m_recorderTopContextId) > 0, m_recorderTopContextId, "unresolved") & vbCrLf
         If m_bodyCaptureRequested Then
             stm.writeText "BODY-CONFIG | requested=True | active=" & bodyCaptureWasActive & _
@@ -10479,6 +10580,13 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<normalized network endpoint; URL fragment removed ([NAV] shows #<fragment-redacted>); query parameter names preserved with values stripped, except the rpcids value and token-shaped action values (operation names such as UpdateItem) retained> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
         stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During Discovery recording, GLOBAL network.responseCompleted remains subscribed through navigation URL-stability so [RES] and BODY candidate coverage are continuous. Per-request latency (dur=) is not computed." & vbCrLf
         stm.writeText "LEGEND | [NAV-TARGET] = the URL passed to ExecuteNavigateAndGetStatus while recording, logged as given (query and fragment included). Review before sharing." & vbCrLf
+        If m_captureUserActions Then
+            stm.writeText "LEGEND | [USER-ACTION] records opt-in manual pointerdown/click/focusin/change event snapshots with target/actionable/ancestor/child/shadowHost clues. These are not verified XPaths; closed Shadow Roots may be opaque and ctx may change after navigation. " & vbCrLf
+            stm.writeText "LEGEND | Typed input contents are NEVER collected by this observer: valueLen= carries character counts only. For INPUT types button/submit/reset/image, the displayed value attribute may be recorded (max 96 chars); other INPUT values are shown as (len=N). On select change, selectedText= can include page-defined option labels, which may contain personal information. Unknown attribute values are omitted; only data-testid, data-test, data-qa, data-cy, and date-shaped data-iso expose data-* values (capped); other data-* attributes retain names only. URL attributes/frameUrl include only origin+pathname; query and fragment are omitted. " & vbCrLf
+            stm.writeText "LEGEND | frameUrl is read from page document location and may switch to a writer URL after document.open(). ctxUrl is the first observed NAV/DCL URL for the active READY realm, retained through same-realm rewrites (not a fresh getTree URL). READY uses ctxUrl=(pending) until its realm's first observed DCL. Resolve frames by ctx and verify live browsingContext.getTree before replay; never use frameUrl alone. Child option[selected] is an HTML default attribute; current SELECT choice comes from selectedText/selectedCount. " & vbCrLf
+            stm.writeText "LEGEND | Permitted locator attribute values and visible labels/text may still reveal personal information, and paths may carry identifiers. Review the entire log before sharing. [NAV-TARGET] is a separate existing field that may retain query/fragment values. " & vbCrLf
+            stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate. [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
+        End If
         stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
         stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
         stm.writeText "LEGEND | [REQ-UNPAIRED] tracks request hops by (request id, redirectCount), including suppressed requests. Categories are exclusive: open-at-end=still had no observed terminal event/redirect advance when recording ended; other=no terminal event observed, but later evidence (such as the next redirect hop) showed the hop was no longer open." & vbCrLf
@@ -10506,7 +10614,11 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         End If
         stm.writeText vbCrLf
         stm.writeText "=== ANALYSIS REQUEST (for AI) ===" & vbCrLf
-        stm.writeText "Using ONLY the data in this log, produce three things for THIS site:" & vbCrLf
+        If m_captureUserActions Then
+            stm.writeText "Using ONLY the data in this log, produce four things for THIS site:" & vbCrLf
+        Else
+            stm.writeText "Using ONLY the data in this log, produce three things for THIS site:" & vbCrLf
+        End If
         stm.writeText vbCrLf
         stm.writeText "1) Network config suggestions" & vbCrLf
         stm.writeText "   - IGNORE (bidi.AddIdleIgnoreNetworkPattern): background telemetry / high-freq APIs that" & vbCrLf
@@ -10606,6 +10718,13 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "A BODY with normalized=True is a canonical AI-oriented representation, not byte-for-byte raw. Small framed bodies below losslessSourceMaxChars are normalized without lossy sampling (compacted=False). compacted=True means some detail may be summarized/sampled; <LONG_STRING len=N>, __ai_omitted_items, and __ai_omitted_members explicitly mark that loss. __ai_envelope__=json-frames marks normalized XSSI/length-framed JSON, and __ai_embedded_json__ marks a JSON string expanded structurally; do not infer omitted values." & vbCrLf
             stm.writeText "Use [BODY-STATS] as the quick outcome summary before inspecting individual BODY records." & vbCrLf
         End If
+        If m_captureUserActions Then
+            stm.writeText vbCrLf & "4) Reconstruct manual actions from [USER-ACTION] as unverified hints" & vbCrLf
+            stm.writeText "   - Use element/ancestor/child/shadowHost attributes and visible text as locator candidates; verify against the live DOM and beware hidden duplicates." & vbCrLf
+            stm.writeText "   - Treat valueLen as a length only. selectedText is the capped visible label of a select choice (not its value attribute); review for personal data. Ask the user for exact typed input values and any full URLs required by replay." & vbCrLf
+            stm.writeText "   - A change event may fire on blur, during or after the next pointerdown. Infer editing order using earlier focusin/pointerdown clues and context; do not treat change order as keystroke order." & vbCrLf
+            stm.writeText "   - For iframe actions, use ctx and ctxUrl as context hints; frameUrl may become a writer URL after document.open(), and neither URL alone proves a frame locator. Verify the live context tree before replay; a frameUrl does not form a cross-frame XPath. Timing proximity alone does not prove causality. New popup windows outside the recorder top context are not covered." & vbCrLf
+        End If
         stm.writeText "=== END REQUEST ===" & vbCrLf
         stm.writeText "--------------------------------------------------------" & vbCrLf
 
@@ -10648,6 +10767,12 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    m_captureUserActions = False
+    m_actionSessionToken = vbNullString
+    Set m_userActionReadyRealmByContext = Nothing
+    Set m_userActionLastDclRealmByContext = Nothing
+    Set m_userActionContextUrlByContext = Nothing
+    Set m_userActionPendingRebind = Nothing
 
     ResetDiscoveryBodyRunState
     ResetRecorderRequestHopRunState
@@ -10673,6 +10798,7 @@ StopFailedCleanup:
     ' treat the raised save error as authoritative.
     On Error Resume Next
 
+    If Len(m_userActionPreloadScriptId) > 0 Then StopDiscoveryUserActionPreload
     If Not stm Is Nothing Then stm.Close
     If Not outStm Is Nothing Then outStm.Close
 
@@ -10693,6 +10819,12 @@ StopFailedCleanup:
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    m_captureUserActions = False
+    m_actionSessionToken = vbNullString
+    Set m_userActionReadyRealmByContext = Nothing
+    Set m_userActionLastDclRealmByContext = Nothing
+    Set m_userActionContextUrlByContext = Nothing
+    Set m_userActionPendingRebind = Nothing
 
     ResetDiscoveryBodyRunState
     ResetRecorderRequestHopRunState
@@ -10759,6 +10891,10 @@ End Sub
 
 Public Sub ProcessRecorderQueue()
     ProcessRecorderQueueCore False
+
+    ' Only the explicit timed manual recorder can issue repair calls. Never inject
+    ' from FormatAndStoreLog / ProcessRecorderQueueCore (non-reentrant dispatcher).
+    If m_discoveryManualPumpActive Then RepairDiscoveryActionListeners
 
     ' Manual Discovery DOM sampling is intentionally outside ProcessRecorderQueueCore and is
     ' gated to RecordEventsForSeconds. Querying the SPA probe calls back through
@@ -11420,6 +11556,44 @@ Private Sub FormatAndStoreLog(ByVal json As Object, Optional ByRef rawText As St
             ' evidence/carryover state; unrelated iframe/tab loads must not erase this wait.
             Dim navCtx As String
             navCtx = GetPathString(json, "params.context")
+            If method = "browsingContext.domContentLoaded" And m_isRecording And m_captureUserActions Then
+                ' On ordinary navigation the new realm emits READY; a document.open/write
+                ' refresh can emit a second DCL without a new READY and erase listeners.
+                If Len(navCtx) > 0 And Not m_userActionReadyRealmByContext Is Nothing Then
+                    If m_userActionReadyRealmByContext.Exists(navCtx) Then
+                        Dim readyRealmForDcl As String
+                        readyRealmForDcl = CStr(m_userActionReadyRealmByContext(navCtx))
+                        If Not m_userActionLastDclRealmByContext Is Nothing Then
+                            ' First DCL in a new READY realm supplies a stable navigation URL.
+                            ' Same-realm document.write DCL must NOT overwrite this locator hint.
+                            Dim newDocumentForContext As Boolean
+                            newDocumentForContext = True
+                            If m_userActionLastDclRealmByContext.Exists(navCtx) Then
+                                newDocumentForContext = _
+                                    (StrComp(CStr(m_userActionLastDclRealmByContext(navCtx)), _
+                                             readyRealmForDcl, vbBinaryCompare) <> 0)
+                            End If
+                            If newDocumentForContext Then
+                                If Not m_userActionContextUrlByContext Is Nothing Then _
+                                    m_userActionContextUrlByContext(navCtx) = _
+                                        NormalizeNavigationDetail(navUrl)
+                            End If
+                            If m_userActionLastDclRealmByContext.Exists(navCtx) Then
+                                If StrComp(CStr(m_userActionLastDclRealmByContext(navCtx)), _
+                                           readyRealmForDcl, vbBinaryCompare) = 0 Then
+                                    If Not m_userActionPendingRebind Is Nothing Then _
+                                        m_userActionPendingRebind(navCtx) = socket_.nowMs()
+                                End If
+                            End If
+                            m_userActionLastDclRealmByContext(navCtx) = readyRealmForDcl
+                        End If
+                    End If
+                End If
+                If Len(navCtx) > 0 And Not m_userActionContextUrlByContext Is Nothing Then
+                    If Not m_userActionContextUrlByContext.Exists(navCtx) Then _
+                        m_userActionContextUrlByContext(navCtx) = NormalizeNavigationDetail(navUrl)
+                End If
+            End If
             If Len(m_renderEvidenceContextId) > 0 And _
                StrComp(navCtx, m_renderEvidenceContextId, vbBinaryCompare) = 0 Then
                 Set m_waitJsonRecords = Nothing
@@ -15335,10 +15509,489 @@ Private Function WrapInSafetyShell(ByVal jsBody As String, ByVal timeoutMs As Lo
     WrapInSafetyShell = js
 End Function
 
+' Event-based manual capture: send each action
+' immediately through the already subscribed log.entryAdded event.
+' The polling recorder has been removed.
+' Input contents are never included; URL evidence is origin + pathname only.
+Private Sub StartDiscoveryUserActionPreload()
+    If Not m_isRecording Or Not m_captureUserActions Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:StartDiscoveryUserActionPreload", _
+                  "StartDiscoveryLog with captureUserActions:=True is required."
+    End If
+    If Len(m_userActionPreloadScriptId) > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:StartDiscoveryUserActionPreload", _
+                  "User-action preload is already installed."
+    End If
+    If Len(m_recorderTopContextId) = 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:StartDiscoveryUserActionPreload", _
+                  "Top recorder browsing context is unresolved."
+    End If
+
+    Dim js As String
+    js = "function(){try{"
+    js = js & "const originalConsole=console,originalInfo=console.info;"
+    js = js & "const nativeInfo=originalInfo.bind(originalConsole);"
+    js = js & "const key=Symbol.for('seleniumvba.user.action.push');"
+    js = js & "if(globalThis[key])return true;"
+    js = js & "const cleanup=[];globalThis[key]={dispose:()=>{cleanup.forEach(f=>{try{f()}catch(_){}});delete globalThis[key];}};"
+    js = js & "const sessionToken='" & m_actionSessionToken & "';"
+    js = js & "    const scrub=s=>String(s==null?'':s).replace(/[\r\n\t|]/g,' ').replace(/\s+/g,' ').trim();"
+    js = js & "    const scrubAttr=s=>String(s==null?'':s).replace(/\r/g,'\\r').replace(/\n/g,'\\n').replace(/\t/g,'\\t').replace(/\|/g,'\\u007c');"
+    js = js & "    const cut=(s,n)=>s.length>n?s.slice(0,n-3)+'...':s;"
+    js = js & "    const safeUrl=raw=>{try{const u=new URL(String(raw||''),document.baseURI);"
+    js = js & "      if(!/^https?:$/.test(u.protocol))return '[non-http-url]';"
+    js = js & "      return cut(scrubAttr(u.origin+u.pathname),120);"
+    js = js & "      }catch(_){return '[url]';}};"
+    js = js & "    const attrValue=(el,a)=>{const n=a.name.toLowerCase(),v=String(a.value||'');"
+    js = js & "      if(n==='value'){"
+    js = js & "        if(el.tagName==='INPUT'&&/^(button|submit|reset|image)$/i.test(el.type||''))"
+    js = js & "          return cut(scrubAttr(v),96);"
+    js = js & "        return '(len='+v.length+')';}"
+    js = js & "      if(/^(href|src|action|formaction|poster)$/.test(n))return safeUrl(v);"
+    js = js & "      if(n==='data-iso')return /^\d{4}-\d{2}-\d{2}$/.test(v)?v:null;"
+    js = js & "      if(/^(data-testid|data-test|data-qa|data-cy)$/.test(n))return cut(scrubAttr(v),96);"
+    js = js & "      if(n==='id'||n==='role'||n==='name'||n==='type'||n==='placeholder'||n==='title'||n==='for'||n.startsWith('aria-'))"
+    js = js & "        return cut(scrubAttr(v),n==='aria-label'||n==='title'||n==='placeholder'?120:96);"
+    js = js & "      return null;};"
+    js = js & "    const tag = el => {"
+    js = js & "      if (!el || el.nodeType!==1) return '(none)';"
+    js = js & "      let out='<'+el.tagName.toLowerCase(), omitted=0;"
+    js = js & "      const pri=['id','role','aria-label','name','type','placeholder','title','data-iso','href','for','data-testid','data-test','data-qa','data-cy'];"
+    js = js & "      const rank=a=>{const n=a.name.toLowerCase(),i=pri.indexOf(n);if(i>=0)return i;if(n.startsWith('aria-'))return 20;if(/^(?:class|style|jsaction|jscontroller|jsname|jslog|jsmodel|jsdata|data-ved)$/.test(n))return 80;if(n.startsWith('data-'))return 30;return 50;};"
+    js = js & "      for (const a of Array.from(el.attributes||[]).sort((x,y)=>rank(x)-rank(y))) {"
+    js = js & "        const v=attrValue(el,a),item=' '+a.name+(v===null?'':'=""'+v.replace(/&/g,'&amp;').replace(/""/g,'&quot;').replace(/</g,'&lt;')+'""');"
+    js = js & "        if (out.length+item.length>230) { omitted++;continue; }"
+    js = js & "        out+=item;"
+    js = js & "      }"
+    js = js & "      return out+'>'+(omitted?' (+'+omitted+' attributes omitted)':'');"
+    js = js & "    };"
+    js = js & "    const textOf = el => {"
+    js = js & "      if (!el || el.nodeType!==1 || el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return '';"
+    js = js & "      const label = el.getAttribute('aria-label');"
+    js = js & "      if (label) return cut(scrub(label),90);"
+    js = js & "      if (el.children && el.children.length>12) return '';"
+    js = js & "      return cut(scrub(el.innerText || el.textContent || ''),90);"
+    js = js & "    };"
+    js = js & "    const isActionable = el => el && el.nodeType===1 && (/^(BUTTON|A|INPUT|SELECT|TEXTAREA|OPTION)$/.test(el.tagName) || /^(button|option|combobox|gridcell|tab|link|checkbox|radio|textbox|menuitem|listbox)$/i.test(el.getAttribute('role')||''));"
+    js = js & "    const pathOf = e => { try {return e.composedPath();} catch (_) {return [e.target];} };"
+    js = js & "    const snap = (e,kind) => {"
+    js = js & "      const path=pathOf(e), els=path.filter(x=>x && x.nodeType===1);"
+    js = js & "      const target=els[0]||null, actionable=els.find(isActionable)||target;"
+    js = js & "      if (!actionable) return null;"
+    js = js & "      let shadowHost=null, dialog=null;"
+    js = js & "      for (const part of path) {"
+    js = js & "        if (!shadowHost && part && part.nodeType===11 && part.host) shadowHost=part.host;"
+    js = js & "        if (!dialog && part && part.nodeType===1 && part.getAttribute('role')==='dialog') dialog=part;"
+    js = js & "      }"
+    js = js & "      const bits=['event='+kind,'target='+tag(target),'actionable='+tag(actionable)];"
+    js = js & "      if (textOf(actionable)) bits.push('text='+textOf(actionable));"
+    js = js & "      bits.push('scope='+(shadowHost?'shadow':'document'));"
+    js = js & "      if (dialog) bits.push('dialog='+tag(dialog));"
+    js = js & "      if (shadowHost) bits.push('shadowHost='+tag(shadowHost));"
+    js = js & "      if (kind==='change' || kind==='focusin') {"
+    js = js & "        const input=target;"
+    js = js & "        if (input && ('value' in input) && /^(INPUT|SELECT|TEXTAREA)$/.test(input.tagName)) {"
+    js = js & "          const value=String(input.value||'');"
+    js = js & "          bits.push('valueLen='+String(input.value||'').length);"
+    js = js & "          if(kind==='change' && input.tagName==='SELECT') {"
+    js = js & "            const chosen=Array.from(input.selectedOptions||[]);"
+    js = js & "            const labels=chosen.slice(0,3).map(o=>cut(scrub(o.label||o.textContent||''),90));"
+    js = js & "            if(labels.length) bits.push('selectedText='+cut(labels.join(' ~ '),140));"
+    js = js & "            bits.push('selectedCount='+chosen.length);"
+    js = js & "            if(chosen.length>3) bits.push('selectedTextTruncated=true');"
+    js = js & "          }"
+    js = js & "          if (input.type==='checkbox'||input.type==='radio') bits.push('checked='+!!input.checked);"
+    js = js & "        }"
+    js = js & "      }"
+    js = js & "      let children=[];"
+    js = js & "      try {"
+    js = js & "        const todo=Array.from(actionable.children||[]).map(el=>({el,depth:1}));"
+    js = js & "        let visited=0;"
+    js = js & "        while(todo.length && visited<40 && children.length<4) {"
+    js = js & "          const node=todo.shift(), child=node.el;visited++;"
+    js = js & "          const lbl=child.getAttribute('aria-label')||((child.children.length<3)?textOf(child):'');"
+    js = js & "          if (lbl) children.push(tag(child)+' '+cut(scrub(lbl),65));"
+    js = js & "          if(node.depth<3)for(const el of Array.from(child.children||[]).slice(0,12))todo.push({el,depth:node.depth+1});"
+    js = js & "        }"
+    js = js & "      } catch (_) {}"
+    js = js & "      if (children.length) bits.push('children='+children.join(' ~ '));"
+    js = js & "      let anc=actionable.parentElement, depth=0;"
+    js = js & "      while (anc && depth<3) { depth++;bits.push('ancestor'+depth+'='+tag(anc));anc=anc.parentElement; }"
+    js = js & "      const line=bits.join(' | ');"
+    js = js & "      return {t:performance.now(), kind, target, actionable, line:cut(line,940), confirmed:false};"
+    js = js & "    };"
+    js = js & "    let seq=0,lastPointer=null,lastSelectChange=null;"
+    js = js & "    const seenEvents=new WeakSet();"
+    js = js & "    const firstSeen=e=>{if(seenEvents.has(e))return false;seenEvents.add(e);return true;};"
+    js = js & "    const emit=(kind,number,line)=>{try{nativeInfo('__SVBA_USER_ACTION__'+"
+    js = js & "      JSON.stringify({token:sessionToken,kind:kind,seq:number,line:line||'',url:safeUrl(location.href)}));}catch(_){}};"
+    js = js & "    const hookedRoots=new WeakSet();"
+    js = js & "    const hookRoots=path=>{for(const root of path){"
+    js = js & "      if(!root||root.nodeType!==11||!root.host||hookedRoots.has(root))continue;"
+    js = js & "      hookedRoots.add(root);"
+    js = js & "      const onShadowChange=e=>{try{"
+    js = js & "        hookRoots(pathOf(e));if(!firstSeen(e))return;"
+    js = js & "        const item=snap(e,'change');if(item)emit('change',++seq,item.line);"
+    js = js & "      }catch(_){}};"
+    js = js & "      root.addEventListener('change',onShadowChange,true);"
+    js = js & "      cleanup.push(()=>root.removeEventListener('change',onShadowChange,true));"
+    js = js & "      const onShadowFocus=e=>{try{"
+    js = js & "        hookRoots(pathOf(e));if(!firstSeen(e))return;"
+    js = js & "        const p=lastPointer,path=pathOf(e);"
+    js = js & "        if(p&&performance.now()-p.t<800&&path.includes(p.target))return;"
+    js = js & "        const item=snap(e,'focusin');if(item)emit('focusin',++seq,item.line);"
+    js = js & "      }catch(_){}};"
+    js = js & "      root.addEventListener('focusin',onShadowFocus,true);"
+    js = js & "      cleanup.push(()=>root.removeEventListener('focusin',onShadowFocus,true));"
+    js = js & "    }};"
+    js = js & "    emit('installed',0,'');"
+    js = js & "    const onDocumentPointer=e=>{try{hookRoots(pathOf(e));"
+    js = js & "      if(!firstSeen(e))return;lastSelectChange=null;"
+    js = js & "      const item=snap(e,'pointerdown');if(!item)return;item.seq=++seq;"
+    js = js & "      lastPointer=item;emit('pointerdown',item.seq,item.line);"
+    js = js & "    }catch(_){}};"
+    js = js & "    document.addEventListener('pointerdown',onDocumentPointer,true);"
+    js = js & "    cleanup.push(()=>document.removeEventListener('pointerdown',onDocumentPointer,true));"
+    js = js & "    const onDocumentClick=e=>{try{hookRoots(pathOf(e));"
+    js = js & "      if(!firstSeen(e))return;"
+    js = js & "      const p=lastPointer,path=pathOf(e),now=performance.now();"
+    js = js & "      if(lastSelectChange && now-lastSelectChange.t<350 &&"
+    js = js & "         path.includes(lastSelectChange.target)){lastSelectChange=null;return;}"
+    js = js & "      if(p&&now-p.t<1500&&(path.includes(p.target)||path.includes(p.actionable))){"
+    js = js & "        emit('click-confirm',p.seq,'');lastPointer=null;return;}"
+    js = js & "      const item=snap(e,'click');if(item)emit('click',++seq,item.line);"
+    js = js & "    }catch(_){}};"
+    js = js & "    document.addEventListener('click',onDocumentClick,true);"
+    js = js & "    cleanup.push(()=>document.removeEventListener('click',onDocumentClick,true));"
+    js = js & "    const onDocumentFocus=e=>{try{hookRoots(pathOf(e));"
+    js = js & "      if(!firstSeen(e))return;"
+    js = js & "      const p=lastPointer,path=pathOf(e);"
+    js = js & "      if(p&&performance.now()-p.t<800&&path.includes(p.target))return;"
+    js = js & "      const item=snap(e,'focusin');if(item)emit('focusin',++seq,item.line);"
+    js = js & "    }catch(_){}};"
+    js = js & "    document.addEventListener('focusin',onDocumentFocus,true);"
+    js = js & "    cleanup.push(()=>document.removeEventListener('focusin',onDocumentFocus,true));"
+    js = js & "    const onDocumentChange=e=>{try{hookRoots(pathOf(e));"
+    js = js & "      if(!firstSeen(e))return;"
+    js = js & "      const item=snap(e,'change');if(item)emit('change',++seq,item.line);"
+    js = js & "      if(e.target&&e.target.tagName==='SELECT')"
+    js = js & "        lastSelectChange={target:e.target,t:performance.now()};"
+    js = js & "    }catch(_){}};"
+    js = js & "    document.addEventListener('change',onDocumentChange,true);"
+    js = js & "    cleanup.push(()=>document.removeEventListener('change',onDocumentChange,true));"
+    js = js & "    globalThis[key].rehook=()=>{try{"
+    js = js & "      lastPointer=null;lastSelectChange=null;"
+    js = js & "      for(const [name,fn] of [['pointerdown',onDocumentPointer],['click',onDocumentClick],"
+    js = js & "        ['focusin',onDocumentFocus],['change',onDocumentChange]]) {"
+    js = js & "        document.removeEventListener(name,fn,true);document.addEventListener(name,fn,true);"
+    js = js & "      }return true;}catch(_){return false;}};"
+    js = js & "return true;"
+    js = js & "}catch(_){return false;}}"
+
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", js
+    params.Add "contexts", Array(m_recorderTopContextId)
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand("script.addPreloadScript", params, True, _
+                             allowAmbiguousRetry:=False, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False)
+    Dim parsed As Object
+    Set parsed = ValidateProtocolResponse(raw, "script.addPreloadScript")
+    m_userActionPreloadScriptId = RequirePathString(parsed, "result.script", ERR_BIDI_PROTOCOL, _
+        "BiDi:StartDiscoveryUserActionPreload", "User-action preload response lacked a script ID.")
+    PushTimelineLine "[USER-ACTION-ROUTE] preload=installed | scope=top-and-descendants | nativeConsoleInfo=bound | script=" & CStr(USER_ACTION_SCRIPT_VERSION)
+    ' Existing documents are not covered retroactively by addPreloadScript.
+    ' One-time installation also covers already-open descendant frames.
+    On Error Resume Next
+    Dim initialFailures As Long
+    initialFailures = ApplyDiscoveryActionScriptToContexts(js, False)
+    If initialFailures > 0 Then
+        PushTimelineLine "[USER-ACTION-ROUTE-WARN] currentContextsNotInstalled=" & CStr(initialFailures)
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+Private Sub StopDiscoveryUserActionPreload()
+    If Len(m_userActionPreloadScriptId) = 0 Then Exit Sub
+    Dim errNum As Long, errSource As String, errDesc As String
+    Dim removeFailed As Boolean
+    If TryRemovePreloadScript(m_userActionPreloadScriptId, False, errNum, errSource, errDesc) Then
+        m_userActionPreloadScriptId = vbNullString
+    Else
+        removeFailed = True
+    End If
+    ' Detach listeners in live recorder frames even when preload removal failed.
+    Dim cleanupErrors As Long
+    On Error Resume Next
+    cleanupErrors = ApplyDiscoveryActionScriptToContexts(vbNullString, True)
+    If Err.Number <> 0 Then cleanupErrors = cleanupErrors + 1
+    Err.Clear
+    On Error GoTo 0
+    If removeFailed Then
+        Err.Raise IIf(errNum <> 0, errNum, ERR_ACTION_FAILED), _
+                  "BiDi:StopDiscoveryUserActionPreload", "Failed to remove user-action preload: " & errDesc
+    End If
+    If cleanupErrors > 0 Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:StopDiscoveryUserActionPreload", _
+                  "Could not detach listeners in " & CStr(cleanupErrors) & " live context(s)."
+    End If
+End Sub
+
+Private Sub CollectDiscoveryActionContextIds(ByVal node As Object, ByRef ids As Collection)
+    Dim ctx As String: ctx = GetPathString(node, "context")
+    If Len(ctx) > 0 Then ids.Add ctx
+    Dim children As Collection: Set children = GetPathObject(node, "children")
+    If children Is Nothing Then Exit Sub
+    Dim child As Variant
+    For Each child In children
+        If IsObject(child) Then CollectDiscoveryActionContextIds child, ids
+    Next child
+End Sub
+
+Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, ByVal dispose As Boolean) As Long
+    If Len(m_recorderTopContextId) = 0 Then Exit Function
+    Dim treeParams As New Dictionary
+    treeParams.Add "root", m_recorderTopContextId
+    Dim raw As String
+    raw = ExecuteBiDiCommand("browsingContext.getTree", treeParams, True)
+    Dim parsed As Object: Set parsed = ValidateProtocolResponse(raw, "browsingContext.getTree")
+    Dim roots As Collection: Set roots = GetPathObject(parsed, "result.contexts")
+    If roots Is Nothing Then Exit Function
+    Dim ids As New Collection
+    Dim node As Variant
+    For Each node In roots
+        If IsObject(node) Then CollectDiscoveryActionContextIds node, ids
+    Next node
+    Dim code As String
+    If dispose Then
+        code = "var k=Symbol.for('seleniumvba.user.action.push');" & _
+               "var r=globalThis[k];if(r&&typeof r.dispose==='function')r.dispose();return true;"
+    Else
+        code = "return (" & js & ")();"
+    End If
+    Dim id As Variant
+    For Each id In ids
+        On Error Resume Next
+        Call CallScript(code, Nothing, CStr(id), False, False, 3000, Silent:=True)
+        If Err.Number <> 0 Then ApplyDiscoveryActionScriptToContexts = ApplyDiscoveryActionScriptToContexts + 1
+        Err.Clear
+        On Error GoTo 0
+    Next id
+End Function
+
+Private Function DiscoveryRehookTargetIsGone(ByVal contextId As String, _
+                                             ByRef treeKnown As Boolean) As Boolean
+    ' Query the live context tree only after a failed rehook (never per user event).
+    ' No inference from error message text; failures to query leave status=failed.
+    On Error GoTo TreeUnavailable
+    treeKnown = False
+    If Len(m_recorderTopContextId) = 0 Then Exit Function
+    Dim params As New Dictionary
+    params.Add "root", m_recorderTopContextId
+    Dim raw As String
+    raw = ExecuteBiDiCommand("browsingContext.getTree", params, True)
+    Dim parsed As Object
+    Set parsed = ValidateProtocolResponse(raw, "browsingContext.getTree")
+    Dim roots As Collection
+    Set roots = GetPathObject(parsed, "result.contexts")
+    If roots Is Nothing Then Exit Function
+    treeKnown = True
+    DiscoveryRehookTargetIsGone = Not ContextTreeContainsExactId(roots, contextId)
+    Exit Function
+TreeUnavailable:
+    Err.Clear
+End Function
+
+Private Sub RepairDiscoveryActionListeners()
+    If Not m_isRecording Or Not m_captureUserActions Then Exit Sub
+    If Len(m_userActionPreloadScriptId) = 0 Then Exit Sub
+    If m_userActionPendingRebind Is Nothing Then Exit Sub
+    If m_userActionPendingRebind.count = 0 Then Exit Sub
+
+    ' Idempotent rebind: remove and add the four document listeners. This covers
+    ' document.open() deleting event handlers while preserving the JS realm and token.
+    Const REBIND_JS As String = _
+        "var k=Symbol.for('seleniumvba.user.action.push');" & _
+        "var r=globalThis[k];" & _
+        "return !!(r&&typeof r.rehook==='function'&&r.rehook());"
+
+    Dim ids As Variant: ids = m_userActionPendingRebind.keys
+    Dim ctx As Variant
+    For Each ctx In ids
+        If Not m_userActionPendingRebind.Exists(CStr(ctx)) Then GoTo NextRebindContext
+        ' Permit a new-document preload READY to arrive before touching this frame.
+        If (socket_.nowMs() - CDbl(m_userActionPendingRebind(CStr(ctx)))) < 300# Then _
+            GoTo NextRebindContext
+        m_userActionPendingRebind.Remove CStr(ctx)
+
+        Dim ok As Boolean, callError As String, result As Variant
+        ok = False
+        callError = vbNullString
+        result = Empty
+        On Error Resume Next
+        result = GetCleanResult(CallScript(REBIND_JS, Nothing, CStr(ctx), _
+                                False, False, 3000, Silent:=True, allowAmbiguousRetry:=False))
+        If Err.Number <> 0 Then callError = Err.description
+        Err.Clear
+        On Error GoTo 0
+        If Len(callError) = 0 Then
+            If Not IsObject(result) Then
+                If VarType(result) = vbBoolean Then ok = CBool(result)
+            End If
+        End If
+        If ok Then
+            m_userActionRebindCount = m_userActionRebindCount + 1
+            PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & "s] [USER-ACTION-REHOOK] status=ok | ctx=" & CStr(ctx)
+        Else
+            Dim treeKnown As Boolean, gone As Boolean, reason As String
+            treeKnown = False
+            gone = DiscoveryRehookTargetIsGone(CStr(ctx), treeKnown)
+            If gone And treeKnown Then
+                m_userActionRebindGone = m_userActionRebindGone + 1
+                PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & "s] [USER-ACTION-REHOOK] status=gone | ctx=" & CStr(ctx) & _
+                                 " | detail=context-not-in-live-tree"
+            Else
+                m_userActionRebindErrors = m_userActionRebindErrors + 1
+                If Len(callError) > 0 Then
+                    reason = Left$(Replace(Replace(Replace(callError, "|", "/"), vbCr, " "), vbLf, " "), 150)
+                ElseIf IsObject(result) Then
+                    reason = "unexpected-object-return"
+                ElseIf VarType(result) = vbBoolean Then
+                    reason = "returned-false"
+                Else
+                    reason = "missing-or-unexpected-result"
+                End If
+                If Not treeKnown Then reason = reason & ";tree-unavailable"
+                PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & "s] [USER-ACTION-REHOOK] status=failed | ctx=" & CStr(ctx) & _
+                                 " | detail=" & reason
+            End If
+        End If
+NextRebindContext:
+    Next ctx
+End Sub
+
+Private Sub HandleDiscoveryUserActionPush(ByVal json As Object, ByVal message As String)
+    If Not m_isRecording Then Exit Sub
+    If Len(m_userActionPreloadScriptId) = 0 Then Exit Sub
+    On Error GoTo InvalidPayload
+
+    Dim payload As Object
+    Set payload = WebJsonConverter.ParseJson(Mid$(message, Len(USER_ACTION_PUSH_PREFIX) + 1))
+    If payload Is Nothing Then GoTo InvalidPayload
+    If TypeName(payload) <> "Dictionary" Then GoTo InvalidPayload
+    If GetPathString(payload, "token") <> m_actionSessionToken Then Exit Sub
+
+    Dim kind As String: kind = GetPathString(payload, "kind")
+    If Len(kind) = 0 Then GoTo InvalidPayload
+    Dim seqValue As String: seqValue = GetPathString(payload, "seq")
+    If Not IsNumeric(seqValue) Then GoTo InvalidPayload
+    Dim seq As Long: seq = CLng(seqValue)
+    If seq < 0 Then GoTo InvalidPayload
+
+    Dim contextId As String: contextId = GetPathString(json, "params.source.context")
+    If Len(contextId) = 0 Then contextId = "(missing)"
+    Dim realmId As String: realmId = GetPathString(json, "params.source.realm")
+    If Len(realmId) = 0 Then
+        realmId = "(missing)"
+        m_userActionMissingRealm = m_userActionMissingRealm + 1
+    End If
+
+    Dim relTime As String
+    relTime = Format$((socket_.nowMs() / 1000#) - m_recorderStartTime, "0.00") & "s"
+    Dim common As String
+    common = "realm=" & realmId & " | seq=" & CStr(seq) & " | ctx=" & contextId
+
+    Dim ctxUrlSuffix As String: ctxUrlSuffix = " | ctxUrl=(unobserved)"
+    If Not m_userActionContextUrlByContext Is Nothing Then
+        If m_userActionContextUrlByContext.Exists(contextId) Then
+            ctxUrlSuffix = " | ctxUrl=" & CStr(m_userActionContextUrlByContext(contextId))
+        End If
+    End If
+
+    Select Case kind
+        Case "installed"
+            ' The previous realm's ctxUrl is stale until this realm's first DCL.
+            ' Never present that stale value in the READY line as a live frame hint.
+            If m_userActionLastDclRealmByContext Is Nothing Then
+                ctxUrlSuffix = " | ctxUrl=(pending)"
+            ElseIf Not m_userActionLastDclRealmByContext.Exists(contextId) Then
+                ctxUrlSuffix = " | ctxUrl=(pending)"
+            ElseIf StrComp(CStr(m_userActionLastDclRealmByContext(contextId)), _
+                           realmId, vbBinaryCompare) <> 0 Then
+                ctxUrlSuffix = " | ctxUrl=(pending)"
+            End If
+            If Len(contextId) > 0 And contextId <> "(missing)" Then
+                If Not m_userActionReadyRealmByContext Is Nothing Then
+                    If m_userActionReadyRealmByContext.Exists(contextId) Then
+                        If StrComp(CStr(m_userActionReadyRealmByContext(contextId)), _
+                                   realmId, vbBinaryCompare) <> 0 Then
+                            If Not m_userActionPendingRebind Is Nothing Then
+                                If m_userActionPendingRebind.Exists(contextId) Then _
+                                    m_userActionPendingRebind.Remove contextId
+                            End If
+                        End If
+                    End If
+                    m_userActionReadyRealmByContext(contextId) = realmId
+                End If
+            End If
+            m_userActionInstallCount = m_userActionInstallCount + 1
+            If contextId = m_recorderTopContextId Then _
+                m_userActionTopReadyCount = m_userActionTopReadyCount + 1
+            PushTimelineLine "[" & relTime & "] [USER-ACTION-READY] " & common & _
+                             " | frameUrl=" & NormalizeNavigationDetail(GetPathString(payload, "url")) & _
+                             ctxUrlSuffix & EventArrivalSuffix()
+        Case "click-confirm"
+            m_userActionConfirmCount = m_userActionConfirmCount + 1
+            PushTimelineLine "[" & relTime & "] [USER-ACTION-CONFIRM] " & common & _
+                             " | event=click" & EventArrivalSuffix()
+        Case "pointerdown", "click", "focusin", "change"
+            Dim line As String: line = GetPathString(payload, "line")
+            If Len(line) = 0 Then GoTo InvalidPayload
+            m_userActionCount = m_userActionCount + 1
+            PushTimelineLine "[" & relTime & "] [USER-ACTION] " & common & _
+                             " | frameUrl=" & NormalizeNavigationDetail(GetPathString(payload, "url")) & _
+                             ctxUrlSuffix & " | " & line & EventArrivalSuffix()
+        Case Else
+            GoTo InvalidPayload
+    End Select
+    Exit Sub
+
+InvalidPayload:
+    m_userActionParseErrors = m_userActionParseErrors + 1
+    Err.Clear
+End Sub
+
+
+Private Sub AppendUserActionStats()
+    If Not m_captureUserActions Then Exit Sub
+    If m_userActionTopReadyCount = 0 Then
+        PushTimelineLine "[USER-ACTION-ROUTE-SILENT] reason=top-installed-not-observed | " & _
+                         "scope=recorder-top | note=possible-silent-console-or-no-install"
+    End If
+    PushTimelineLine "[end] [USER-ACTION-STATS] captured=" & CStr(m_userActionCount) & _
+                     " | confirms=" & CStr(m_userActionConfirmCount) & _
+                     " | installs=" & CStr(m_userActionInstallCount) & _
+                     " | topReady=" & CStr(m_userActionTopReadyCount) & _
+                     " | missingRealm=" & CStr(m_userActionMissingRealm) & _
+                     " | parseErrors=" & CStr(m_userActionParseErrors) & _
+                     " | rehooks=" & CStr(m_userActionRebindCount) & _
+                     " | rehookErrors=" & CStr(m_userActionRebindErrors) & _
+                     " | rehookGone=" & CStr(m_userActionRebindGone) & _
+                     " | cleanupWarnings=" & CStr(m_userActionCleanupWarnings)
+End Sub
+
 Private Sub HandleConsoleLog(ByVal json As Object)
     ' Do not add blanket OERN here; missing paths are already handled and other errors matter.
     Dim text As String: text = GetPathString(json, "params.text")
-    
+
+    If Left$(text, Len(USER_ACTION_PUSH_PREFIX)) = USER_ACTION_PUSH_PREFIX Then
+        HandleDiscoveryUserActionPush json, text
+        Exit Sub
+    End If
+
     If InStr(text, "BiDi-AutoClicker") > 0 Then
         Debug.Print ">>> [BROWSER] " & text
     End If
@@ -15351,6 +16004,12 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     If socket_ Is Nothing Then
         m_shutdownCompleted = True
         Exit Sub
+    End If
+
+    If Len(m_userActionPreloadScriptId) > 0 Then
+        On Error Resume Next
+        StopDiscoveryUserActionPreload
+        On Error GoTo 0
     End If
 
     ' Teardown is best-effort and may legitimately run on a degraded session; release the

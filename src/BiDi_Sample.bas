@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 7.1 / MIT License / Copyright (c) hanamichi77777
+' Version 7.2 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -386,8 +386,9 @@ End Sub
 ' Recording starts before navigation, so the initial page load is included.
 ' A single run may cover several manual actions or a whole scenario. Wait until
 ' the page has settled after the load and after each action. Set
-' RECORDING_SECONDS to fit the scenario. excludeImagesAndCss filters log
-' entries only and does not block browser resources.
+' RECORDING_SECONDS to fit the scenario (60s default). Confirm final edited input
+' with Tab before time runs out. excludeImagesAndCss filters log entries only
+' and does not block browser resources.
 Sub Main09()
   ' Ask for the target URL before starting the browser, so Cancel needs no cleanup.
   Dim url As String
@@ -421,8 +422,8 @@ Sub Main09()
 
     ' Start before navigation so the initial page load is part of the log.
     ' Keep the message box before this call: no events are processed while it is open.
-    ' True filters image/CSS log entries.
-    bidi.StartDiscoveryLog excludeImagesAndCss:=True
+    ' True filters image/CSS log entries. captureUserActions records the elements you operate.
+    bidi.StartDiscoveryLog excludeImagesAndCss:=True, captureUserActions:=True
     bidi.ExecuteNavigateAndGetStatus url
     bidi.RecordEventsForSeconds RECORDING_SECONDS
 
