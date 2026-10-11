@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v7.0
+# WebDriver BiDi for SeleniumVBA v7.1
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -26,7 +26,7 @@ The structured log can also be provided to an AI assistant for analysis. By exam
 
 The Discovery Log is therefore more than an execution log. It is a diagnostic and discovery tool for investigating how an unfamiliar third-party SPA behaves—and for discovering what should actually be waited for before reliable automation can be built.
 
-**Current limitation (v7.0):** Manual recording captures network and DOM activity, but does not directly identify which elements the user clicked or interacted with. An AI assistant can infer a possible sequence of actions from this evidence, but cannot reliably derive the correct XPath locators from the log alone. On complex SPA sites, expect to inspect most—and sometimes nearly all—of the action targets in DevTools when first building the automation. The main benefit is assistance with understanding asynchronous behavior and implementing the workflow, not eliminating manual XPath verification.
+**Current limitation:** Manual recording captures network and DOM activity, but does not directly identify which elements the user clicked or interacted with. An AI assistant can infer a possible sequence of actions from this evidence, but cannot reliably derive the correct XPath locators from the log alone. On complex SPA sites, expect to inspect most—and sometimes nearly all—of the action targets in DevTools when first building the automation. The main benefit is assistance with understanding asynchronous behavior and implementing the workflow, not eliminating manual XPath verification.
 
 ### Typical Workflow: From Manual Recording to Verified Automation
 
@@ -36,6 +36,8 @@ The Discovery Log is therefore more than an execution log. It is a diagnostic an
    - Immediately before each action whose completion matters, arm the completion signal identified in the log (arm-then-act).
    - Use DOM paths from the log as clues to construct provisional XPaths immediately before each action. Flag uncertain locators for manual verification.
    - Use only APIs and argument signatures verified against the supplied source code.
+
+   Also tell the AI the text you typed and any value you chose. The log records network and DOM activity, not what you typed, and network keys keep query parameter names but strip their values. The start URL is the exception: the log records it as `[NAV-TARGET]`, exactly as passed to `ExecuteNavigateAndGetStatus`. The `ANALYSIS REQUEST` tells the AI to ask you for any value the log does not contain instead of guessing it.
 
    Continue the following steps in the same AI conversation.
 3. **Verify action targets in DevTools and replace the provisional XPaths with stable locators.** DOM paths in the log describe changed elements, often using positions or auto-generated ids; they do not identify the actual clicked element and may not match on the next run. Especially on complex SPAs, manual inspection will often be needed for most or all action locators. For each provisional XPath, give the AI a screenshot of the DevTools Elements panel showing the intended element and two or three levels of its ancestors, since the element to operate is often a parent of the visible text. If an attribute value used in the XPath is long or easy to misread, also paste that value, or the element's own outerHTML, as text. Ask the AI to construct a stable XPath from meaningful attributes such as `aria-label`, `role`, `data-*`, or non-generated `id`s, and verify that it identifies the intended visible element rather than a hidden duplicate. Replace and verify every provisional XPath before moving on. Once verified, a stable locator generally needs revisiting only if the site's DOM or behavior changes or the locator fails.
@@ -164,6 +166,7 @@ This procedure records the initial page load and the manual browser actions that
 * **What the log captures:** It records the BiDi/network and SPA-probe evidence used by this project, including requests/responses, DOM activity, suppressed noise, armed-signal events, and stability decisions. It should not be described as a dump of every possible browser event.
 * **Filtering is not blocking:** `excludeImagesAndCss=True` removes common image/CSS entries from the saved diagnostic stream; it does not prevent those resources from loading in the page.
 * **Recording starts before navigation:** `StartDiscoveryLog` is called before `ExecuteNavigateAndGetStatus`, so the log shows whether the page keeps loading data or rendering after the load event. Wait until the page has settled before the first manual action, so the initial load forms its own block on the timeline.
+* **Start URL kept as entered (v7.1):** The URL entered at startup is recorded as `[NAV-TARGET]`, including its query values and fragment, so code generated from the log can open the same page. The line is not redacted; review it before sharing the log.
 * **Time-window selection:** `RECORDING_SECONDS` (default: 60) counts from when navigation returns. Set it long enough for the post-load settling, the whole scenario, and the settling time after the last action.
 * **How to use the result:** Use `discovery_log.txt` to decide what should be blocked, ignored, armed, or verified. Do not choose a completion signal from its name alone; confirm its timing and relation to the resulting DOM change.
 

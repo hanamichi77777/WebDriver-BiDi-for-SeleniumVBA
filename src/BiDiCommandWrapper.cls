@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.0"
+Private Const BIDI_WRAPPER_VERSION As String = "7.1"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -2888,6 +2888,9 @@ Public Function ExecuteNavigateAndGetStatus(ByVal targetUrl As String, _
     vMaxTimeout = SanitizeMs(maxTimeoutMs, "maxTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)
     targetCtx = ResolveTargetContext(contextId)
     RequireCurrentCaptureGeneration captureGeneration, METHOD_NAME
+
+    ' Log the caller-supplied URL as given; network keys stay normalized.
+    If m_isRecording Then LogSignalLine "[NAV-TARGET] url=" & targetUrl
 
     Dim responseCompletedAvailableForStatus As Boolean
 
@@ -6629,6 +6632,11 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
             End If
 
             recoveryAttemptCount = recoveryAttemptCount + 1
+            LogSignalLine "[RECOVERY] attempt=" & CStr(recoveryAttemptCount) & "/" & _
+                          CStr(MAX_CONTEXT_RECOVERY_RETRIES) & " | method=" & method & _
+                          " | trigger=" & CStr(localErrNum) & _
+                          " | detail=" & CompactBodyDiagnostic(localErrDesc) & _
+                          " | backoffMs=" & CStr(backoffMs)
             m_isRecovering = True
 
             ' F1: Wrapper recovery is a critical phase. Disable the communicator's guarded
@@ -6656,10 +6664,6 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
 
             If recoveryErr = 0 And allowContextRetarget Then
                 ' Explicit targets must not depend on the main binding.
-                If m_debugMode Then
-                    Debug.Print "BiDi [RECOVERY]: Attempting to refresh context (" & recoveryAttemptCount & "/" & MAX_CONTEXT_RECOVERY_RETRIES & ")..."
-                End If
-
                 Call UpdateMainContextId(True, True) ' forceRefresh:=True, Silent:=True
                 recoveryErr = Err.Number
                 recoveryErrDesc = Err.description
@@ -10474,6 +10478,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         End If
         stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<normalized network endpoint; URL fragment removed ([NAV] shows #<fragment-redacted>); query parameter names preserved with values stripped, except the rpcids value and token-shaped action values (operation names such as UpdateItem) retained> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
         stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During Discovery recording, GLOBAL network.responseCompleted remains subscribed through navigation URL-stability so [RES] and BODY candidate coverage are continuous. Per-request latency (dur=) is not computed." & vbCrLf
+        stm.writeText "LEGEND | [NAV-TARGET] = the URL passed to ExecuteNavigateAndGetStatus while recording, logged as given (query and fragment included). Review before sharing." & vbCrLf
         stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
         stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
         stm.writeText "LEGEND | [REQ-UNPAIRED] tracks request hops by (request id, redirectCount), including suppressed requests. Categories are exclusive: open-at-end=still had no observed terminal event/redirect advance when recording ended; other=no terminal event observed, but later evidence (such as the next redirect hop) showed the hop was no longer open." & vbCrLf
@@ -10593,6 +10598,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText vbCrLf
         stm.writeText "Per-line features to use: id (same id across a redirect chain), key (normalized endpoint)," & vbCrLf
         stm.writeText "idle (skip|track), [SPA-ACT] (sampled/coalesced DOM mutation evidence), [SUPPRESSED] (filtered-noise tally aggregated by normalized host+path plus query presence; each key carries idle=skip|track)." & vbCrLf
+        stm.writeText "Exact-value rule for automation code: normalized URL key= entries such as name= may have had their values stripped; [NAV] fragments are redacted, and valueLen= is not input text." & vbCrLf
+        stm.writeText "Use [NAV-TARGET] when present for the caller-supplied navigation URL. For any missing URL values, fragments, or typed input text, ASK THE USER; do not silently omit, substitute, or infer them." & vbCrLf
         If m_bodyCaptureRequested Or m_requestBodyCaptureRequested Then
             stm.writeText "If BODY STORE is present, correlate RESPONSE to [RES] and REQUEST to [REQ] by the same ShortId + key. Treat [BODY-SKIP]/[BODY-MISS] as capture outcomes, not evidence that the HTTP body was empty. With default patterns, child-frame/cross-site/unknown-scope JSON is intentionally skipped; explicit body patterns are an opt-in allow-list override." & vbCrLf
         stm.writeText "For multiplexed POST endpoints that reuse the same normalized key, one captured BODY is only one call sample. If additional calls are [BODY-SKIP] reason=cap or unselected, do NOT assume they used the same operation, payload, or response semantics." & vbCrLf
@@ -13810,7 +13817,8 @@ Private Function GetActionJs(ByVal actionType As String) As String
         Case "input"
             js = js & "try{let e=arguments[0],v=arguments[1];"
             js = js & "const da=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement){a=a.shadowRoot.activeElement;}return a;};"
-            js = js & "const isTextTarget=(a)=>!!(a&&a.isConnected&&!a.disabled&&!a.readOnly&&(a.tagName==='TEXTAREA'||(a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type))));"
+            ' Text-like input types that support the selection API (search included).
+            js = js & "const isTextTarget=(a)=>!!(a&&a.isConnected&&!a.disabled&&!a.readOnly&&(a.tagName==='TEXTAREA'||(a.tagName==='INPUT'&&/^(text|search|url|tel)?$/.test(a.type||''))));"
             js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
             js = js & "e.scrollIntoView({block:'center',inline:'center'});if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');"
             js = js & "e.click();e.focus();"
@@ -13865,7 +13873,8 @@ Private Function GetActionJs(ByVal actionType As String) As String
         Case "input_keys"
 
             js = js & "try{let e=arguments[0],v=arguments[1];const da=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement){a=a.shadowRoot.activeElement;}return a;};"
-            js = js & "const isTextTarget=(a)=>!!(a&&a.isConnected&&typeof a.selectionStart==='number'&&(a.tagName==='TEXTAREA'||(a.tagName==='INPUT'&&(a.type==='text'||a.type===''||!a.type))));"
+            ' Text-like input types that support the selection API (search included).
+            js = js & "const isTextTarget=(a)=>!!(a&&a.isConnected&&typeof a.selectionStart==='number'&&(a.tagName==='TEXTAREA'||(a.tagName==='INPUT'&&/^(text|search|url|tel)?$/.test(a.type||''))));"
             js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');e.scrollIntoView({block:'center',inline:'center'});if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');e.click();e.focus();"
             js = js & "if(!e.isConnected)throw new Error('STALE_ELEMENT_PRE_INPUT');let prev=null,stb=0;for(let t=performance.now();performance.now()-t<3000;){hb();let a=da();"
             js = js & "if(isTextTarget(a)){if(a===prev){stb++;if(stb>=2){e=a;break;}}else{prev=a;stb=1;}}else{prev=null;stb=0;}await new Promise(r=>setTimeout(r,15));}"
@@ -16168,7 +16177,7 @@ Private Sub TrySyncPhase(ByVal ctx As String, _
     
     ' Ordinary synchronization failure does not undo the completed interaction.
     If syncErrNum <> 0 And m_debugMode Then
-        Debug.Print "[" & Format(Now, "hh:mm:ss") & "] BiDi Warning: Post-action Sync failed (Status: " & syncErrNum & "). DOM mutations only (no pending requests). Consider extending idle timeout."
+        Debug.Print "[" & Format(Now, "hh:mm:ss") & "] BiDi Warning: Post-action Sync failed (Status: " & syncErrNum & "): " & syncErrDesc
     End If
 End Sub
 

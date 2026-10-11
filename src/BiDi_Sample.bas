@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 7.0 / MIT License / Copyright (c) hanamichi77777
+' Version 7.1 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -400,9 +400,9 @@ Sub Main09()
 
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
-    
+
     .StartEdge
-    
+
     Dim caps As WebCapabilities: Set caps = .CreateCapabilities
     caps.AddArguments "--start-maximized"
     caps.EnableBiDiMode
@@ -418,22 +418,22 @@ Sub Main09()
               "Wait until the page has settled, then interact with it manually."
     msgCaption = "Ready to Record"
     MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
-    
+
     ' Start before navigation so the initial page load is part of the log.
     ' Keep the message box before this call: no events are processed while it is open.
     ' True filters image/CSS log entries.
     bidi.StartDiscoveryLog excludeImagesAndCss:=True
     bidi.ExecuteNavigateAndGetStatus url
     bidi.RecordEventsForSeconds RECORDING_SECONDS
-    
+
     ' Saves discovery_log.txt in the same folder as the current VBA host file.
     bidi.StopAndSaveDiscoveryLog
-    
+
     MsgBox "Discovery Log Saved!"
-    
+
     bidi.Shutdown: Set bidi = Nothing
     .CloseBrowser: .Shutdown
-    
+
 End With
 End Sub
 
