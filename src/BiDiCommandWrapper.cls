@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.3"
+Private Const BIDI_WRAPPER_VERSION As String = "7.4"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -389,6 +389,8 @@ Private Const DOWNLOAD_CORRELATION_UUID As String = "download"
 Private Const DOWNLOAD_CORRELATION_CONTEXT_NAV As String = "context+navigation"
 Private Const DOWNLOAD_CORRELATION_UNCORRELATABLE As String = "uncorrelatable"
 Private Const DEFAULT_DOWNLOAD_TIMEOUT_MS As Long = 30000
+' Retain late download events after an armed batch failure without changing the batch wait.
+Private Const DOWNLOAD_FORENSIC_GRACE_MS As Long = 30000
 Private m_downloadArmed As Boolean
 Private m_downloadOwnerContextId As String
 Private m_downloadContextMissWarned As Boolean
@@ -401,6 +403,8 @@ Private m_downloadFirstUncorrelatableContext As String
 
 ' The same transaction store is used whether expectedCount is 1 or greater.
 Private m_downloadBatchActive As Boolean
+Private m_downloadForensicGraceArmed As Boolean
+Private m_downloadForensicFailureTick As Currency
 Private m_downloadBatchExpectedCount As Long
 Private m_downloadBatchDispatchCount As Long
 Private m_downloadBatchOverStarted As Boolean
@@ -415,6 +419,8 @@ Private m_downloadBatchTransactions As Dictionary
 ' It is owned by the download batch APIs, independent of live capture
 ' state, and survives ResetDownloadCaptureState/ClearState until replaced or explicitly cleared.
 Private m_lastDownloadFailureDiagnostic As Dictionary
+' The optional recorder subscription is independent of batch download capture.
+Private m_recDownloadEventsAvailable As Boolean
 
 ' browser.setDownloadBehavior is browser-side state that may outlive this wrapper/WebSocket.
 ' Once this wrapper attempts to change it, Shutdown must best-effort clear the global behavior
@@ -1418,6 +1424,29 @@ Private Function GetDownloadDiagnosticField(ByVal params As Object, ByVal key As
     End If
 End Function
 
+Private Function DiscoveryDownloadFileName(ByVal pathText As String) As String
+    If pathText = "(missing)" Or pathText = "(null)" Then
+        DiscoveryDownloadFileName = pathText
+        Exit Function
+    End If
+    Dim slashPos As Long
+    Dim backslashPos As Long
+    slashPos = InStrRev(pathText, "/")
+    backslashPos = InStrRev(pathText, "\")
+    If backslashPos > slashPos Then slashPos = backslashPos
+    DiscoveryDownloadFileName = Mid$(pathText, slashPos + 1)
+End Function
+
+Private Sub AppendDiscoveryDownloadSignal(ByVal line As String)
+    If Not m_isRecording Then Exit Sub
+    PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & "s] " & line
+End Sub
+
+Private Function DiscoveryDownloadEventsStatus() As String
+    DiscoveryDownloadEventsStatus = "unavailable"
+    If m_recDownloadEventsAvailable Then DiscoveryDownloadEventsStatus = "on"
+End Function
+
 Private Function TryGetDownloadCorrelationValue(ByVal p As Object, _
                                                 ByVal key As String, _
                                                 ByRef value As String) As Boolean
@@ -1656,9 +1685,13 @@ Private Sub HandleDownloadBatchEndEvent(ByVal json As Object, ByVal p As Object)
     tx("filePath") = filePath
     tx("state") = LCase$(terminalStatus)
 
+    ' Keep the full browser-reported path in local diagnostics, not in the AI timeline.
     LogSignalLine "[DOWNLOAD-BATCH-END-MATCHED] key=" & correlationKey & _
                   " | status=" & terminalStatus & _
-                  " | filepath=" & filePath
+                  " | filepath=" & filePath, skipTimeline:=True
+    AppendDiscoveryDownloadSignal "[DOWNLOAD-BATCH-END-MATCHED] key=" & correlationKey & _
+                  " | status=" & terminalStatus & _
+                  " | filepath=" & DiscoveryDownloadFileName(filePath)
 End Sub
 
 Private Function DownloadBatchTerminalCount() As Long
@@ -1711,6 +1744,8 @@ Private Sub ArmDownloadBatch(ByVal contextId As String, _
     m_downloadDroppedEventsAtArm = CurrentDownloadRelevantLossCount()
     m_downloadBatchActive = True
     m_downloadArmed = True
+    m_downloadForensicGraceArmed = False
+    m_downloadForensicFailureTick = 0
 
     LogSignalLine "[DOWNLOAD-BATCH-ARM] ctx=" & contextId & _
                   " | expected=" & CStr(expectedCount) & _
@@ -1925,11 +1960,20 @@ Private Sub HandleDownloadWillBeginEvent(ByVal json As Object)
         Exit Sub
     End If
 
-    LogSignalLine "[DOWNLOAD-WILL-BEGIN] ctx=" & GetDownloadDiagnosticField(p, "context") & _
-                  " | download=" & GetDownloadDiagnosticField(p, "download") & _
-                  " | navigation=" & GetDownloadDiagnosticField(p, "navigation") & _
-                  " | filename=" & GetDownloadDiagnosticField(p, "suggestedFilename") & _
-                  " | url=" & GetDownloadDiagnosticField(p, "url")
+    Dim rawLine As String
+    rawLine = "[DOWNLOAD-WILL-BEGIN] ctx=" & GetDownloadDiagnosticField(p, "context") & _
+              " | download=" & GetDownloadDiagnosticField(p, "download") & _
+              " | navigation=" & GetDownloadDiagnosticField(p, "navigation") & _
+              " | filename=" & GetDownloadDiagnosticField(p, "suggestedFilename") & _
+              " | url=" & GetDownloadDiagnosticField(p, "url")
+    LogSignalLine rawLine, skipTimeline:=True
+    If m_isRecording Then
+        AppendDiscoveryDownloadSignal "[DOWNLOAD-WILL-BEGIN] ctx=" & GetDownloadDiagnosticField(p, "context") & _
+            " | download=" & GetDownloadDiagnosticField(p, "download") & _
+            " | navigation=" & GetDownloadDiagnosticField(p, "navigation") & _
+            " | filename=" & GetDownloadDiagnosticField(p, "suggestedFilename") & _
+            " | url=" & NormalizeEndpointKey(GetDownloadDiagnosticField(p, "url"))
+    End If
 
     HandleDownloadBatchWillBeginEvent json, p
 End Sub
@@ -1942,11 +1986,21 @@ Private Sub HandleDownloadEndEvent(ByVal json As Object)
         Exit Sub
     End If
 
-    LogSignalLine "[DOWNLOAD-END] ctx=" & GetDownloadDiagnosticField(p, "context") & _
-                  " | download=" & GetDownloadDiagnosticField(p, "download") & _
-                  " | navigation=" & GetDownloadDiagnosticField(p, "navigation") & _
-                  " | status=" & GetDownloadDiagnosticField(p, "status") & _
-                  " | filepath=" & GetDownloadDiagnosticField(p, "filepath")
+    Dim rawLine As String
+    rawLine = "[DOWNLOAD-END] ctx=" & GetDownloadDiagnosticField(p, "context") & _
+              " | download=" & GetDownloadDiagnosticField(p, "download") & _
+              " | navigation=" & GetDownloadDiagnosticField(p, "navigation") & _
+              " | status=" & GetDownloadDiagnosticField(p, "status") & _
+              " | filepath=" & GetDownloadDiagnosticField(p, "filepath")
+    LogSignalLine rawLine, skipTimeline:=True
+
+    If m_isRecording Then
+        AppendDiscoveryDownloadSignal "[DOWNLOAD-END] ctx=" & GetDownloadDiagnosticField(p, "context") & _
+            " | download=" & GetDownloadDiagnosticField(p, "download") & _
+            " | navigation=" & GetDownloadDiagnosticField(p, "navigation") & _
+            " | status=" & GetDownloadDiagnosticField(p, "status") & _
+            " | filepath=" & DiscoveryDownloadFileName(GetDownloadDiagnosticField(p, "filepath"))
+    End If
 
     HandleDownloadBatchEndEvent json, p
 End Sub
@@ -2064,6 +2118,15 @@ Private Sub CaptureLastDownloadFailureDiagnostic(ByVal errNum As Long, _
     d.Add "batchCollisionSecondCorrelationKey", m_downloadBatchCollisionSecondCorrelationKey
 
     Set m_lastDownloadFailureDiagnostic = d
+    ' Arming precedes dispatch. Include ambiguous post-arm failures even when
+    ' the click acknowledgement never arrived; do not claim a click occurred.
+    If captureInitialized And Not socket_ Is Nothing Then
+        ' Ignore nonfatal diagnostic errors when checking the fresh timestamp call.
+        Err.Clear
+        m_downloadForensicFailureTick = socket_.NowTicks()
+        If Err.Number = 0 Then m_downloadForensicGraceArmed = True
+        Err.Clear
+    End If
     Err.Clear
     On Error GoTo 0
 End Sub
@@ -2259,6 +2322,9 @@ Private Function ExecuteDownloadsCore(ByVal triggerLocatorKind As ElementLocator
 
     On Error GoTo Failed
 
+    ' A new download attempt supersedes any prior batch-failure grace period.
+    m_downloadForensicGraceArmed = False
+    m_downloadForensicFailureTick = 0
     ResetDownloadCaptureState
 
     Dim downloadCaptureInitialized As Boolean
@@ -6617,6 +6683,8 @@ Private Function ExecuteBiDiCommand(ByVal method As String, _
                 End If
                 If livenessMs <= 0 Then
                     localErrDesc = localErrDesc & " | PeerLiveness=not-probed(wait-budget)"
+                ElseIf m_boundConnectionGeneration = 0 Then
+                    localErrDesc = localErrDesc & " | PeerLiveness=not-probed(unbound)"
                 ElseIf CheckAlive(livenessMs) Then
                     localErrDesc = localErrDesc & " | PeerLiveness=responsive"
                 Else
@@ -7253,6 +7321,9 @@ End Sub
 Private Sub ResetSessionBoundaryState()
     m_isRecording = False
     m_isProcessingQueue = False
+    m_recDownloadEventsAvailable = False
+    m_downloadForensicGraceArmed = False
+    m_downloadForensicFailureTick = 0
 
     ' Dispatch-loss counters are session-scoped, matching the communicator loss counters.
     m_dispatchEventLossCount = 0
@@ -10258,6 +10329,19 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
                   "Unable to establish the global network.responseCompleted subscription required by Discovery Log."
     End If
 
+    ' Download events are optional: failure cannot disable the ordinary recorder.
+    ' Existing wrapper-wide subscriptions are reused by ExecuteSessionSubscribe.
+    Dim stagedDownloadEventsAvailable As Boolean
+    Dim downloadSubscribeResult As String
+    On Error Resume Next
+    downloadSubscribeResult = Me.ExecuteSessionSubscribe(Array( _
+        "browsingContext.downloadWillBegin", "browsingContext.downloadEnd"), , True)
+    Err.Clear
+    On Error GoTo StartFailed
+    stagedDownloadEventsAvailable = _
+        m_activeSubscriptions.Exists("browsingContext.downloadWillBegin") And _
+        m_activeSubscriptions.Exists("browsingContext.downloadEnd")
+
     ' Body capture is opt-in and capability-probed by attempting the collector once. Failure does
     ' not disable the ordinary Discovery recorder. A previous unconfirmed collector cleanup blocks
     ' creation of another collector so we never accumulate browser-side collectors blindly.
@@ -10342,6 +10426,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_droppedHeadCount = 0
     ResetRecorderRequestHopRunState
     m_recorderTopContextId = stagedRecorderCtx
+    m_recDownloadEventsAvailable = stagedDownloadEventsAvailable
     m_bodyCaptureRequested = captureResponseBodies
     m_bodyCaptureActive = stagedBodyCaptureActive
     m_bodyCaptureUnavailableReason = stagedBodyUnavailableReason
@@ -10569,6 +10654,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                       " | manualDomCapture=" & m_discoveryDomCaptureEnabled & _
                       " | manualUserActions=" & m_captureUserActions & _
                       " | userActionScript=" & USER_ACTION_SCRIPT_VERSION & _
+                      " | downloadEvents=" & DiscoveryDownloadEventsStatus() & _
                       " | recorderCtx=" & IIf(Len(m_recorderTopContextId) > 0, m_recorderTopContextId, "unresolved") & vbCrLf
         If m_bodyCaptureRequested Then
             stm.writeText "BODY-CONFIG | requested=True | active=" & bodyCaptureWasActive & _
@@ -10613,10 +10699,12 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         End If
         stm.writeText "LEGEND | [RES] carries: id=<reqId; a redirect chain reuses the SAME id, pairing its hops> key=<normalized network endpoint; URL fragment removed ([NAV] shows #<fragment-redacted>); query parameter names preserved with values stripped, except the rpcids value and token-shaped action values (operation names such as UpdateItem) retained> idle=<skip|track: was this URL in the idle probes ignore set>" & vbCrLf
         stm.writeText "LEGEND | [REQ]=request start (network.beforeRequestSent; recording-only, not wired to consensus). During Discovery recording, GLOBAL network.responseCompleted remains subscribed through navigation URL-stability so [RES] and BODY candidate coverage are continuous. Per-request latency (dur=) is not computed." & vbCrLf
+        stm.writeText "LEGEND | downloadEvents=on means both BiDi download events were subscribed; unavailable means the recorder cannot determine whether downloads occurred. [DOWNLOAD-WILL-BEGIN] and [DOWNLOAD-END] correlate by download/navigation IDs (download may be (missing); then match by context+navigation); [DOWNLOAD-END] status=complete is browser-reported, not a disk verification. URL keys are normalized; filepath is a basename only. Filenames and paths can still disclose sensitive details; review before sharing." & vbCrLf
+        stm.writeText "LEGEND | A [RES] 200 followed by [ERR] net::ERR_ABORTED for a file may reflect handoff to native download handling; this pair ALONE proves neither successful nor failed download. Check [DOWNLOAD-END] when downloadEvents=on." & vbCrLf
         stm.writeText "LEGEND | [NAV-TARGET] = the URL passed to ExecuteNavigateAndGetStatus while recording, logged as given (query and fragment included). Review before sharing." & vbCrLf
         If m_captureUserActions Then
             stm.writeText "LEGEND | [USER-ACTION] records opt-in manual pointerdown/click/focusin/change event snapshots with target/actionable/ancestor/child/shadowHost clues. These are not verified XPaths; closed Shadow Roots may be opaque and ctx may change after navigation. " & vbCrLf
-            stm.writeText "LEGEND | Typed input contents are NEVER collected by this observer: valueLen= carries character counts only. For INPUT types button/submit/reset/image, the displayed value attribute may be recorded (max 96 chars); other INPUT values are shown as (len=N). On select change, selectedText= can include page-defined option labels, which may contain personal information. Unknown attribute values are omitted; only data-testid, data-test, data-qa, data-cy, and date-shaped data-iso expose data-* values (capped); other data-* attributes retain names only. URL attributes/frameUrl include only origin+pathname; query and fragment are omitted. " & vbCrLf
+            stm.writeText "LEGEND | Typed input contents are NEVER collected by this observer: valueLen= carries character counts only. For INPUT types button/submit/reset/image, the displayed value attribute may be recorded (max 96 chars); other INPUT values are shown as (len=N). On select change, selectedText= can include page-defined option labels, which may contain personal information. Unknown attribute values are omitted; only data-testid, data-test, data-qa, data-cy, and date-shaped data-iso expose data-* values (capped); other data-* attributes retain names only. URL attributes/frameUrl are resolved against the page base URL (where applicable), sanitized to origin+pathname, and capped; query and fragment are omitted. These are NOT literal DOM attributes. " & vbCrLf
             stm.writeText "LEGEND | frameUrl is read from page document location and may switch to a writer URL after document.open(). ctxUrl is the first observed NAV/DCL URL for the active READY realm, retained through same-realm rewrites (not a fresh getTree URL). READY uses ctxUrl=(pending) until its realm's first observed DCL. Resolve frames by ctx and verify live browsingContext.getTree before replay; never use frameUrl alone. Child option[selected] is an HTML default attribute; current SELECT choice comes from selectedText/selectedCount. " & vbCrLf
             stm.writeText "LEGEND | Permitted locator attribute values and visible labels/text may still reveal personal information, and paths may carry identifiers. Review the entire log before sharing. [NAV-TARGET] is a separate existing field that may retain query/fragment values. " & vbCrLf
             stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate. [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
@@ -10758,6 +10846,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         If m_captureUserActions Then
             stm.writeText vbCrLf & "4) Reconstruct manual actions from [USER-ACTION] as unverified hints" & vbCrLf
             stm.writeText "   - Use element/ancestor/child/shadowHost attributes and visible text as locator candidates; verify against the live DOM and beware hidden duplicates." & vbCrLf
+            stm.writeText "   - href/src in [USER-ACTION] are resolved and sanitized, not literal DOM attributes. Never build an exact @href XPath from them; prefer ancestor IDs, visible text, or a distinctive path segment verified against the live DOM." & vbCrLf
             stm.writeText "   - Treat valueLen as a length only. selectedText is the capped visible label of a select choice (not its value attribute); review for personal data. Ask the user for exact typed input values and any full URLs required by replay." & vbCrLf
             stm.writeText "   - A change event may fire on blur, during or after the next pointerdown. Infer editing order using earlier focusin/pointerdown clues and context; do not treat change order as keystroke order." & vbCrLf
             stm.writeText "   - For iframe actions, use ctx and ctxUrl as context hints; frameUrl may become a writer URL after document.open(), and neither URL alone proves a frame locator. Verify the live context tree before replay; a frameUrl does not form a cross-frame XPath. Timing proximity alone does not prove causality. New popup windows outside the recorder top context are not covered." & vbCrLf
@@ -13153,10 +13242,31 @@ End Function
 
 ' Critical incident selection is deliberately narrow so this ring cannot become a second
 ' high-rate Discovery Log. It retains one-shot capture/fatal evidence even when recording is OFF.
+Private Function DownloadForensicGraceActive() As Boolean
+    If Not m_downloadForensicGraceArmed Then Exit Function
+    On Error GoTo Unavailable
+    If socket_.elapsedMs(m_downloadForensicFailureTick) <= DOWNLOAD_FORENSIC_GRACE_MS Then
+        DownloadForensicGraceActive = True
+    Else
+        m_downloadForensicGraceArmed = False
+    End If
+    Exit Function
+Unavailable:
+    m_downloadForensicGraceArmed = False
+End Function
+
 Private Function IsForensicIncidentSignal(ByVal line As String) As Boolean
+    If InStr(1, line, "[DOWNLOAD-", vbBinaryCompare) = 1 Then
+        If InStr(1, line, "[DOWNLOAD-BATCH-", vbBinaryCompare) = 1 Then
+            IsForensicIncidentSignal = True
+        Else
+            IsForensicIncidentSignal = m_downloadBatchActive Or DownloadForensicGraceActive()
+        End If
+        Exit Function
+    End If
+
     IsForensicIncidentSignal = _
         (InStr(1, line, "[FATAL-RESET]", vbBinaryCompare) = 1 Or _
-         InStr(1, line, "[DOWNLOAD-", vbBinaryCompare) = 1 Or _
          InStr(1, line, "[FILE-DIALOG-", vbBinaryCompare) = 1 Or _
          InStr(1, line, "[NEW-CONTEXT-", vbBinaryCompare) = 1 Or _
          InStr(1, line, "[TRANSPORT-OVERSIZE]", vbBinaryCompare) = 1 Or _
@@ -13193,10 +13303,11 @@ End Sub
 
 ' LogSignalLine remains the Discovery Log/developer-trace path, but selected critical markers are
 ' also copied to the independent forensic ring regardless of m_isRecording or DebugMode.
-Private Sub LogSignalLine(ByVal line As String)
+Private Sub LogSignalLine(ByVal line As String, _
+                          Optional ByVal skipTimeline As Boolean = False)
     If IsForensicIncidentSignal(line) Then PushForensicIncidentLine line
 
-    If m_isRecording Then
+    If m_isRecording And Not skipTimeline Then
         Dim relTime As String
         relTime = Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s"
         PushTimelineLine "[" & relTime & "] " & line
@@ -15850,7 +15961,8 @@ Private Sub StartDiscoveryUserActionPreload()
     ' One-time installation also covers already-open descendant frames.
     On Error Resume Next
     Dim initialFailures As Long
-    initialFailures = ApplyDiscoveryActionScriptToContexts(js, False)
+    Dim failedInitialContexts As String
+    initialFailures = ApplyDiscoveryActionScriptToContexts(js, False, failedInitialContexts)
     If initialFailures > 0 Then
         PushTimelineLine "[USER-ACTION-ROUTE-WARN] currentContextsNotInstalled=" & CStr(initialFailures)
     End If
@@ -15869,8 +15981,9 @@ Private Sub StopDiscoveryUserActionPreload()
     End If
     ' Detach listeners in live recorder frames even when preload removal failed.
     Dim cleanupErrors As Long
+    Dim failedContexts As String
     On Error Resume Next
-    cleanupErrors = ApplyDiscoveryActionScriptToContexts(vbNullString, True)
+    cleanupErrors = ApplyDiscoveryActionScriptToContexts(vbNullString, True, failedContexts)
     If Err.Number <> 0 Then cleanupErrors = cleanupErrors + 1
     Err.Clear
     On Error GoTo 0
@@ -15880,7 +15993,8 @@ Private Sub StopDiscoveryUserActionPreload()
     End If
     If cleanupErrors > 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:StopDiscoveryUserActionPreload", _
-                  "Could not detach listeners in " & CStr(cleanupErrors) & " live context(s)."
+                  "Could not detach listeners in " & CStr(cleanupErrors) & _
+                  " live context(s). Contexts=" & failedContexts
     End If
 End Sub
 
@@ -15895,12 +16009,72 @@ Private Sub CollectDiscoveryActionContextIds(ByVal node As Object, ByRef ids As 
     Next child
 End Sub
 
-Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, ByVal dispose As Boolean) As Long
+' Each user-action maintenance call is best-effort and targets an exact browsing context.
+' Bypass CallScript's 30s correlation floor without changing normal browser actions.
+Private Function TryCallDiscoveryActionInContext(ByVal contextId As String, _
+                                                 ByVal functionDeclaration As String, _
+                                                 ByRef failure As String) As Boolean
+    failure = vbNullString
+    On Error GoTo Failed
+
+    Dim target As New Dictionary
+    target.Add "context", contextId
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", functionDeclaration
+    params.Add "arguments", New Collection
+    params.Add "target", target
+    params.Add "awaitPromise", False
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand("script.callFunction", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
+    Dim parsed As Object
+    Set parsed = ValidateProtocolResponse(raw, "script.callFunction")
+
+    ' Install and rehook return Boolean; a protocol success with false is a failure.
+    Dim resultValue As Variant
+    Assign resultValue, GetPathValue(parsed, "result.result.value")
+    If VarType(resultValue) <> vbBoolean Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryCallDiscoveryActionInContext", _
+                  "User-action maintenance did not return a Boolean result."
+    End If
+    If Not CBool(resultValue) Then
+        failure = "returned-false"
+        Exit Function
+    End If
+    TryCallDiscoveryActionInContext = True
+    Exit Function
+
+Failed:
+    failure = "Err " & CStr(Err.Number) & ": " & Err.description
+    Err.Clear
+End Function
+
+Private Function TryDisposeUserActionInContext(ByVal contextId As String, _
+                                               ByRef failure As String) As Boolean
+    Const DISPOSE_JS As String = _
+        "function(){var k=Symbol.for('seleniumvba.user.action.push');" & _
+        "var r=globalThis[k];if(r&&typeof r.dispose==='function')r.dispose();return true;}"
+    TryDisposeUserActionInContext = _
+        TryCallDiscoveryActionInContext(contextId, DISPOSE_JS, failure)
+End Function
+
+Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, _
+                                                       ByVal dispose As Boolean, _
+                                                       ByRef failedContexts As String) As Long
+    failedContexts = vbNullString
     If Len(m_recorderTopContextId) = 0 Then Exit Function
     Dim treeParams As New Dictionary
     treeParams.Add "root", m_recorderTopContextId
     Dim raw As String
-    raw = ExecuteBiDiCommand("browsingContext.getTree", treeParams, True)
+    raw = ExecuteBiDiCommand("browsingContext.getTree", treeParams, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
     Dim parsed As Object: Set parsed = ValidateProtocolResponse(raw, "browsingContext.getTree")
     Dim roots As Collection: Set roots = GetPathObject(parsed, "result.contexts")
     If roots Is Nothing Then Exit Function
@@ -15910,19 +16084,29 @@ Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, ByVal 
         If IsObject(node) Then CollectDiscoveryActionContextIds node, ids
     Next node
     Dim code As String
-    If dispose Then
-        code = "var k=Symbol.for('seleniumvba.user.action.push');" & _
-               "var r=globalThis[k];if(r&&typeof r.dispose==='function')r.dispose();return true;"
-    Else
-        code = "return (" & js & ")();"
-    End If
+    If Not dispose Then code = "function(){return (" & js & ")();}"
     Dim id As Variant
+    Dim failure As String
+    Dim ok As Boolean
     For Each id In ids
-        On Error Resume Next
-        Call CallScript(code, Nothing, CStr(id), False, False, 3000, Silent:=True)
-        If Err.Number <> 0 Then ApplyDiscoveryActionScriptToContexts = ApplyDiscoveryActionScriptToContexts + 1
-        Err.Clear
-        On Error GoTo 0
+        If dispose Then
+            ok = TryDisposeUserActionInContext(CStr(id), failure)
+        Else
+            ok = TryCallDiscoveryActionInContext(CStr(id), code, failure)
+        End If
+        If Not ok Then
+            ApplyDiscoveryActionScriptToContexts = ApplyDiscoveryActionScriptToContexts + 1
+            If Len(failedContexts) > 0 Then failedContexts = failedContexts & ","
+            failedContexts = failedContexts & CStr(id)
+            If dispose Then
+                ' Keep each failed ID visible even if the aggregate warning is truncated.
+                PushTimelineLine "[USER-ACTION-CLEANUP-WARN] ctx=" & CStr(id) & _
+                                 " | detail=" & CompactBodyDiagnostic(failure)
+            Else
+                PushTimelineLine "[USER-ACTION-ROUTE-WARN] ctx=" & CStr(id) & _
+                                 " | detail=" & CompactBodyDiagnostic(failure)
+            End If
+        End If
     Next id
 End Function
 
@@ -15936,7 +16120,11 @@ Private Function DiscoveryRehookTargetIsGone(ByVal contextId As String, _
     Dim params As New Dictionary
     params.Add "root", m_recorderTopContextId
     Dim raw As String
-    raw = ExecuteBiDiCommand("browsingContext.getTree", params, True)
+    raw = ExecuteBiDiCommand("browsingContext.getTree", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
     Dim parsed As Object
     Set parsed = ValidateProtocolResponse(raw, "browsingContext.getTree")
     Dim roots As Collection
@@ -15971,21 +16159,9 @@ Private Sub RepairDiscoveryActionListeners()
             GoTo NextRebindContext
         m_userActionPendingRebind.Remove CStr(ctx)
 
-        Dim ok As Boolean, callError As String, result As Variant
-        ok = False
-        callError = vbNullString
-        result = Empty
-        On Error Resume Next
-        result = GetCleanResult(CallScript(REBIND_JS, Nothing, CStr(ctx), _
-                                False, False, 3000, Silent:=True, allowAmbiguousRetry:=False))
-        If Err.Number <> 0 Then callError = Err.description
-        Err.Clear
-        On Error GoTo 0
-        If Len(callError) = 0 Then
-            If Not IsObject(result) Then
-                If VarType(result) = vbBoolean Then ok = CBool(result)
-            End If
-        End If
+        Dim ok As Boolean, callError As String
+        ok = TryCallDiscoveryActionInContext(CStr(ctx), _
+                                             "function(){" & REBIND_JS & "}", callError)
         If ok Then
             m_userActionRebindCount = m_userActionRebindCount + 1
             PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & "s] [USER-ACTION-REHOOK] status=ok | ctx=" & CStr(ctx)
@@ -16001,10 +16177,6 @@ Private Sub RepairDiscoveryActionListeners()
                 m_userActionRebindErrors = m_userActionRebindErrors + 1
                 If Len(callError) > 0 Then
                     reason = Left$(Replace(Replace(Replace(callError, "|", "/"), vbCr, " "), vbLf, " "), 150)
-                ElseIf IsObject(result) Then
-                    reason = "unexpected-object-return"
-                ElseIf VarType(result) = vbBoolean Then
-                    reason = "returned-false"
                 Else
                     reason = "missing-or-unexpected-result"
                 End If
