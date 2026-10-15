@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 7.4 / MIT License / Copyright (c) hanamichi77777
+' Version 7.5 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -385,6 +385,10 @@ End Sub
 ' The target tab is unchanged. Click STOP RECORDING in the dedicated control tab,
 ' or close that tab using X to end recording; 300 seconds is a safety maximum.
 ' Wait for the page to settle before each action; typed input values are not logged.
+' Popups and new tabs opened from the target are recorded too (capturePopupActions
+' defaults to True); [USER-ACTION-SCOPE] status=added lines list those contexts.
+' alert/confirm/prompt dialogs may be closed automatically while recording,
+' depending on the browser and the session's prompt handling.
 ' No worksheet button or UserForm is needed.
 Public Sub Main09()
     Const MAX_RECORDING_SECONDS As Long = 300
@@ -425,7 +429,8 @@ Public Sub Main09()
                "Allow each action to settle before the next one.", _
                "Ready to Record", MB_OK Or MB_ForeFront
 
-    ' Capture initial navigation and record actions only in the target tab/descendants.
+    ' Capture initial navigation and record actions in the target tab, its frames,
+    ' and popups/new tabs it opens. The STOP tab and unrelated tabs are excluded.
     bidi.StartDiscoveryLog excludeImagesAndCss:=True, captureUserActions:=True
     recordingStarted = True
     bidi.ExecuteNavigateAndGetStatus url
@@ -685,8 +690,9 @@ End Sub
 
 ' Main13 - New tab / new window capture through browsingContext.contextCreated
 ' ExecuteOpenNewContext clicks the trigger exactly once and returns the
-' newly created top-level browsing context. originalOpener correlation excludes
-' foreign contexts, and multiple candidates fail instead of being guessed.
+' newly created top-level browsing context. originalOpener correlation accepts the
+' owner context or another frame in the owner's tab (openerScope=owner|same-tab),
+' excludes foreign contexts, and multiple candidates fail instead of being guessed.
 Public Sub Main13()
 
     Dim driver As New WebDriver
@@ -729,6 +735,7 @@ Public Sub Main13()
         Debug.Print "New tab kind: " & CStr(tabResult("kind"))
         Debug.Print "New tab correlation: " & CStr(tabResult("correlation"))
         Debug.Print "New tab originalOpener: " & CStr(tabResult("originalOpener"))
+        Debug.Print "New tab openerScope: " & CStr(tabResult("openerScope"))
 
         bidi.ExecuteCloseContext tabContext
 

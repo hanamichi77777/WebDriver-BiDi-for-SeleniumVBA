@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.4"
+Private Const BIDI_WRAPPER_VERSION As String = "7.5"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -207,7 +207,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const USER_ACTION_SCRIPT_VERSION As Long = 8 ' Listener rehook, select labels, button labels and context navigation URLs
+Private Const USER_ACTION_SCRIPT_VERSION As Long = 10 ' v10: rehook(keep) keeps pointer pairing for popup ensure; v9: non-rendered text excluded, actionable=(none)
 Private Const SPA_PROBE_VERSION As Long = 46 ' Internal probe generation/quiet/filter/health-diagnostic/observation-start/overflow contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
@@ -275,6 +275,28 @@ Private m_userActionTopReadyCount As Long
 Private m_userActionMissingRealm As Long
 Private m_userActionParseErrors As Long
 Private m_userActionCleanupWarnings As Long
+' Popup/new-tab action capture (StartDiscoveryLog capturePopupActions, default True; needs captureUserActions).
+' The observer preload is registered for ALL contexts; scope is enforced on receipt:
+' recorder top + descendant frames + top-level contexts whose originalOpener is in scope.
+Private m_capturePopupActions As Boolean
+Private m_popupScopeAllowed As Dictionary      ' ctx -> True (in scope)
+Private m_popupScopeRejected As Dictionary     ' ctx -> True (decided out of scope)
+Private m_userActionSeenContexts As Dictionary ' ctx -> True (sent a token push; dispose target)
+Private m_popupPending As Collection           ' Array(ctx, json, message, relTime, arrival, receivedMs)
+Private m_popupScopeOpenedCount As Long
+Private m_popupDeferredCount As Long
+Private m_popupDeferredAcceptedCount As Long
+Private m_popupOutOfScopeDropped As Long
+Private m_popupUnresolvedDropped As Long
+Private m_popupPendingOverflow As Long
+Private Const POPUP_PENDING_MAX As Long = 200
+Private Const POPUP_PENDING_RESOLVE_MS As Double = 300#
+Private Const POPUP_PENDING_GIVEUP_MS As Double = 3000#
+Private m_popupNextResolveMs As Double
+Private m_popupOpenedContexts As Dictionary    ' top-level contexts added via originalOpener
+Private m_popupEnsureDue As Dictionary         ' ctx -> nowMs when the observer check is due
+Private m_userActionInstallJs As String        ' observer function (popup mode only)
+Private Const POPUP_ENSURE_DELAY_MS As Double = 100#
 ' During Discovery recording, GLOBAL network.responseCompleted stays subscribed through
 ' navigation URL-stability. Existing global subscriptions are reused; otherwise one is created.
 ' Cleanup is handled by the wrapper-wide active-subscription registry.
@@ -380,6 +402,10 @@ Private m_newContextCandidateCount As Long
 Private m_newContextForeignIgnoredCount As Long
 Private m_newContextDroppedEventsAtArm As Long
 Private m_newContextBaseline As Dictionary
+' Every context in the owner's top-level tab at arm time. A frame-based page may call
+' window.open from a sibling frame, so originalOpener can differ from the clicked frame.
+Private m_newContextOwnerTabIds As Dictionary
+Private m_newContextOpenerScope As String
 
 ' Unified download capture. One engine handles a String XPath, a one-item Array/Collection,
 ' or multiple triggers. The outer Dictionary is keyed by a protocol correlation key and each
@@ -1078,6 +1104,9 @@ Private Sub HandleContextCreatedEvent(ByVal json As Object)
     If m_validatedContexts Is Nothing Then Set m_validatedContexts = New Dictionary
     m_validatedContexts(eventCtx) = True
 
+    ' Recorder popup scope must be decided for every context, armed or not.
+    If m_capturePopupActions Then NotePopupScopeContextCreated json, eventCtx
+
     If Not m_newContextArmed Then Exit Sub
 
     Dim parentId As String
@@ -1092,8 +1121,14 @@ Private Sub HandleContextCreatedEvent(ByVal json As Object)
     openerId = GetPathString(json, "params.originalOpener")
 
     Dim correlationMode As String
+    Dim openerScope As String
     If Len(openerId) > 0 Then
-        If StrComp(openerId, m_newContextOwnerContextId, vbBinaryCompare) <> 0 Then
+        If StrComp(openerId, m_newContextOwnerContextId, vbBinaryCompare) = 0 Then
+            openerScope = "owner"
+        ElseIf Not m_newContextOwnerTabIds Is Nothing Then
+            If m_newContextOwnerTabIds.Exists(openerId) Then openerScope = "same-tab"
+        End If
+        If Len(openerScope) = 0 Then
             m_newContextForeignIgnoredCount = m_newContextForeignIgnoredCount + 1
             LogSignalLine "[NEW-CONTEXT-IGNORED] ctx=" & eventCtx & _
                           " | reason=foreign-opener | opener=" & openerId & _
@@ -1113,11 +1148,13 @@ Private Sub HandleContextCreatedEvent(ByVal json As Object)
         m_newContextOriginalOpener = openerId
         m_newContextClientWindow = GetPathString(json, "params.clientWindow")
         m_newContextCorrelationMode = correlationMode
+        m_newContextOpenerScope = openerScope
 
         LogSignalLine "[NEW-CONTEXT-CAPTURED] ctx=" & eventCtx & _
                       " | owner=" & m_newContextOwnerContextId & _
                       " | correlation=" & correlationMode & _
-                      " | opener=" & IIf(Len(openerId) > 0, openerId, "(none)")
+                      " | opener=" & IIf(Len(openerId) > 0, openerId, "(none)") & _
+                      IIf(Len(openerScope) > 0, " | openerScope=" & openerScope, "")
         Exit Sub
     End If
 
@@ -1247,6 +1284,8 @@ Private Sub ResetNewContextCaptureState()
     m_newContextForeignIgnoredCount = 0
     m_newContextDroppedEventsAtArm = 0
     Set m_newContextBaseline = New Dictionary
+    Set m_newContextOwnerTabIds = New Dictionary
+    m_newContextOpenerScope = ""
 End Sub
 
 Private Sub ArmNewContextCapture(ByVal ownerContextId As String, _
@@ -1282,6 +1321,21 @@ Private Sub ArmNewContextCapture(ByVal ownerContextId As String, _
         Dim existingId As String
         existingId = GetPathString(ctx, "context")
         If Len(existingId) > 0 Then m_newContextBaseline(existingId) = True
+
+        ' Record the whole tab (top-level node + all frames) that contains the owner.
+        Dim tabIds As New Collection
+        Set tabIds = New Collection
+        CollectDiscoveryActionContextIds ctx, tabIds
+        Dim tabId As Variant, ownerInTab As Boolean
+        ownerInTab = False
+        For Each tabId In tabIds
+            If StrComp(CStr(tabId), ownerContextId, vbBinaryCompare) = 0 Then ownerInTab = True
+        Next tabId
+        If ownerInTab Then
+            For Each tabId In tabIds
+                m_newContextOwnerTabIds(CStr(tabId)) = True
+            Next tabId
+        End If
     Next ctx
 
     ' Drain events accumulated during getTree while the local capture arm is still down.
@@ -1388,6 +1442,7 @@ Private Function BuildNewContextResult() As Dictionary
     result.Add "correlation", m_newContextCorrelationMode
     result.Add "candidateCount", m_newContextCandidateCount
     result.Add "foreignIgnored", m_newContextForeignIgnoredCount
+    result.Add "openerScope", m_newContextOpenerScope
 
     Dim kind As String
     kind = "unknown"
@@ -2863,11 +2918,11 @@ Public Function ExecuteGetTitleByContextId(ByVal contextId As String) As String
     ExecuteGetTitleByContextId = CStr(GetCleanResult(strRes))
 End Function
 
-Public Function ExecuteHandleUserPrompt(ByVal Accept As Boolean, Optional ByVal userText As String = "", Optional ByVal contextId As String = "") As String
+Public Function ExecuteHandleUserPrompt(ByVal accept As Boolean, Optional ByVal userText As String = "", Optional ByVal contextId As String = "") As String
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
     Dim params As New Dictionary
     params.Add "context", targetCtx
-    params.Add "accept", Accept
+    params.Add "accept", accept
     If Len(userText) > 0 Then params.Add "userText", userText
 
     ' Preserve dispatch failures before attempting to validate any response text. handleUserPrompt
@@ -7347,6 +7402,7 @@ Private Sub ResetSessionBoundaryState()
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     m_captureUserActions = False
+    ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
     m_discoveryStopTabContextId = vbNullString
     m_discoveryStopTabToken = vbNullString
@@ -10261,7 +10317,8 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
                              Optional ByVal captureResponseBodies As Boolean = True, _
                              Optional ByVal captureRequestBodies As Boolean = False, _
                              Optional ByVal excludeScripts As Boolean = True, _
-                             Optional ByVal captureUserActions As Boolean = False)
+                             Optional ByVal captureUserActions As Boolean = False, _
+                             Optional ByVal capturePopupActions As Boolean = True)
     ' Stage all recorder-owned objects and scalars locally. No live recorder state is changed
     ' until session.subscribe succeeds, so a failed start leaves an existing recorder intact
     ' and never creates a half-enabled new recorder.
@@ -10299,6 +10356,9 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
                   "session; start a fresh WebDriver session with a new BiDiCommandWrapper, " & _
                   "then retry. Do not reuse this wrapper while cleanup remains pending."
     End If
+
+    ' capturePopupActions (default True) only takes effect with captureUserActions:=True;
+    ' pass capturePopupActions:=False to keep the observer on the recorder top tree only.
 
     m_discoveryStartInProgress = True
     On Error GoTo StartFailed
@@ -10472,6 +10532,17 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     Set m_userActionLastDclRealmByContext = New Dictionary
     Set m_userActionContextUrlByContext = New Dictionary
     Set m_userActionPendingRebind = New Dictionary
+    ResetPopupActionScopeState
+    m_capturePopupActions = captureUserActions And capturePopupActions
+    If m_capturePopupActions Then
+        Set m_popupScopeAllowed = New Dictionary
+        Set m_popupScopeRejected = New Dictionary
+        Set m_userActionSeenContexts = New Dictionary
+        Set m_popupPending = New Collection
+        Set m_popupOpenedContexts = New Dictionary
+        Set m_popupEnsureDue = New Dictionary
+        If Len(m_recorderTopContextId) > 0 Then m_popupScopeAllowed(m_recorderTopContextId) = True
+    End If
 
     ' A reused wrapper starts recording with all carryover diagnostics cleared.
     Set m_waitJsonRecords = Nothing
@@ -10558,6 +10629,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     ' while that flag is True. RecordEventsForSeconds owns the final manual DOM sample; Stop does
     ' not consume the SPA probe outside that explicit manual recording window.
     Call ProcessRecorderQueue
+    If m_capturePopupActions Then ResolvePendingPopupPushesSafe True
 
     ' Stop future injections and detach live JS listeners once (not every 300 ms).
     ' Any network/log events generated during cleanup are drained before summary.
@@ -10574,6 +10646,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         End If
     End If
     ProcessRecorderQueue
+    If m_capturePopupActions Then ResolvePendingPopupPushesSafe True
 
     ' Record the request-hop summary while the recorder timeline is still writable.
     AppendRecorderUnpairedRequestSummary
@@ -10616,6 +10689,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         m_discoveryDomContextId = vbNullString
         m_nextDiscoveryDomPollMs = 0#
         m_captureUserActions = False
+        ResetPopupActionScopeState
         m_actionSessionToken = vbNullString
         ResetDiscoveryBodyRunState
         ResetRecorderRequestHopRunState
@@ -10654,6 +10728,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                       " | manualDomCapture=" & m_discoveryDomCaptureEnabled & _
                       " | manualUserActions=" & m_captureUserActions & _
                       " | userActionScript=" & USER_ACTION_SCRIPT_VERSION & _
+                      IIf(m_capturePopupActions, " | popupActions=True", "") & _
                       " | downloadEvents=" & DiscoveryDownloadEventsStatus() & _
                       " | recorderCtx=" & IIf(Len(m_recorderTopContextId) > 0, m_recorderTopContextId, "unresolved") & vbCrLf
         If m_bodyCaptureRequested Then
@@ -10708,6 +10783,13 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "LEGEND | frameUrl is read from page document location and may switch to a writer URL after document.open(). ctxUrl is the first observed NAV/DCL URL for the active READY realm, retained through same-realm rewrites (not a fresh getTree URL). READY uses ctxUrl=(pending) until its realm's first observed DCL. Resolve frames by ctx and verify live browsingContext.getTree before replay; never use frameUrl alone. Child option[selected] is an HTML default attribute; current SELECT choice comes from selectedText/selectedCount. " & vbCrLf
             stm.writeText "LEGEND | Permitted locator attribute values and visible labels/text may still reveal personal information, and paths may carry identifiers. Review the entire log before sharing. [NAV-TARGET] is a separate existing field that may retain query/fragment values. " & vbCrLf
             stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate. [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
+            stm.writeText "LEGEND | event=focusin means an element gained focus, not necessarily an explicit user action. It may occur when focus returns to the opener after a popup closes, or after a keyboard Tab move. Do not replay focusin alone as a click or keystroke; interpret it using surrounding actions and context transitions." & vbCrLf
+            stm.writeText "LEGEND | actionable=(none) means no button, link, form control, or ARIA widget role was on the event path (page background, a text-selection drag, or a custom clickable element without a role). Such lines carry no text=/children=; targetText= appears only when the target is not html/body, has at most 3 child elements, and its whole visible text is 60 chars or less (a short label, never a container dump). Do NOT turn an actionable=(none) line into a replay step without confirming it against the live DOM." & vbCrLf
+            If m_capturePopupActions Then
+                stm.writeText "LEGEND | popupActions=True: the action observer is registered for ALL browsing contexts, but a [USER-ACTION] is logged only from the recorder top context, its descendant frames, and top-level contexts whose BiDi originalOpener (or parent frame) is already in scope. [USER-ACTION-SCOPE] status=added marks such a popup/tab with its opener ctx and first URL; use it to switch browsing context during replay (the popup is a separate top-level context, not a frame). Pushes from unrelated tabs and the STOP tab are discarded without logging their content; counts appear in [USER-ACTION-SCOPE-STATS]." & vbCrLf
+                stm.writeText "LEGEND | [USER-ACTION-SCOPE] status=ensured means the observer was re-attached or installed shortly (about 100-300 ms) after that popup's domContentLoaded (needed for window.open('') + document.write popups, and for same-origin window.open(url) popups whose initial about:blank realm is reused: their only READY shows frameUrl=[non-http-url]); actions made before it may be missing; ensure-failed means it could not be attached." & vbCrLf
+                stm.writeText "LEGEND | scopeDeferred=true marks an action held until its context's scope was resolved; its [t] and at= are the original receipt times, so it may physically appear after later lines (order by [t]). [SPA-ACT] DOM sampling still covers only the recorder top context; network lines from popups carry ctx=other:." & vbCrLf
+            End If
         End If
         If m_discoveryStopTabUsed Then
             stm.writeText "LEGEND | [DISCOVERY-CONTROL] marks a separate, opt-in control tab. [DISCOVERY-STOP] source=control-tab means STOP clicked; source=control-tab-closed means the tab was closed; source=time-limit means the safety maximum elapsed. Control-tab cleanup is separate; the target page DOM is unchanged." & vbCrLf
@@ -10715,8 +10797,9 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
         stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
         stm.writeText "LEGEND | [REQ-UNPAIRED] tracks request hops by (request id, redirectCount), including suppressed requests. Categories are exclusive: open-at-end=still had no observed terminal event/redirect advance when recording ended; other=no terminal event observed, but later evidence (such as the next redirect hop) showed the hop was no longer open." & vbCrLf
+        stm.writeText "LEGEND | Known observation (Edge): a new top-level context opened by a rel=noopener / target=_blank link may never report network.responseCompleted for its document request although its domContentLoaded/load arrive (ctx=other:...). Such a hop stays open-at-end; by itself it is NOT evidence of an unfinished wait or a too-short timeout." & vbCrLf
         stm.writeText "LEGEND | [ERR]/[BLOCK] carry request id + normalized key; if fetchError omits its URL, the recorder falls back to the beforeRequestSent id->URL/key cache (including suppressed requests). Path/matrix assignment values such as ;ord=... or /_dc_unique_id=... are stripped to name= so volatile identifiers do not fragment keys." & vbCrLf
-        stm.writeText "LEGEND | ctx= on [REQ]/[RES]/[ERR]/[BLOCK] appears only for events outside the recorder top-level context (CONFIG recorderCtx): ctx=(empty) = no browsing context, typically a Web Worker; its Fetch/XHR is invisible to idle consensus and never enters render-evidence checks. ctx=other:<first 8 chars> = another tab or frame. No ctx= = recorder context (if recorderCtx=unresolved, only (empty) is marked)." & vbCrLf
+        stm.writeText "LEGEND | ctx= on [REQ]/[RES]/[ERR]/[BLOCK]/[NAV] appears only for events outside the recorder top-level context (CONFIG recorderCtx): ctx=(empty) = no browsing context, typically a Web Worker; its Fetch/XHR is invisible to idle consensus and never enters render-evidence checks. ctx=other:<first 8 chars> = another tab or frame. No ctx= = recorder context (if recorderCtx=unresolved, only (empty) is marked)." & vbCrLf
         stm.writeText "LEGEND | [SPA-ACT] ends with n=<entries listed in this sample>; dropped=<mutation entries beyond the probe's 50-entry list> appears on overflow. Dropped content mutations still count as render evidence (render=DOM:(overflow), path unknown). [SPA-WAIT-END] changeOverflow= totals dropped entries for that wait; nonzero means its [SPA-ACT] lines are incomplete." & vbCrLf
         stm.writeText "LEGEND | [SPA-ACT]=sampled/coalesced DOM mutation burst (NOT an exhaustive event stream; absence does not prove no mutation)  [SPA-STABLE]=consensus  [SPA-WAIT-BEGIN/END]=one wait (END has achieved quiet + observed confirmation-window duration; neither is a safety-margin score)  [SUPPRESSED]=filtered-noise tally aggregated by normalized host+path; query presence '?' is retained but query parameter names/values are omitted; idle=skip|track. excludeScripts=True moves script loads (URL path ending .js/.mjs) into [SUPPRESSED]; script loads are not Fetch/XHR and never drive consensus" & vbCrLf
         stm.writeText "LEGEND | [SPA-PROBE-INITIALIZING]/[SPA-PROBE-READY]=normal first-use/new-document lazy initialization. [SPA-PROBE-UNHEALTHY]/[SPA-PROBE-RECOVERED]=a probe already verified healthy in the same document was later missing/unhealthy and recovered. Unverified samples contribute NO stability evidence; READY/RECOVERED restart the full confirmation window. WAIT-END reports probeHealthy, probeInitializations, probeRecoveries, and detectedUnhealthyMs." & vbCrLf
@@ -10849,7 +10932,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "   - href/src in [USER-ACTION] are resolved and sanitized, not literal DOM attributes. Never build an exact @href XPath from them; prefer ancestor IDs, visible text, or a distinctive path segment verified against the live DOM." & vbCrLf
             stm.writeText "   - Treat valueLen as a length only. selectedText is the capped visible label of a select choice (not its value attribute); review for personal data. Ask the user for exact typed input values and any full URLs required by replay." & vbCrLf
             stm.writeText "   - A change event may fire on blur, during or after the next pointerdown. Infer editing order using earlier focusin/pointerdown clues and context; do not treat change order as keystroke order." & vbCrLf
-            stm.writeText "   - For iframe actions, use ctx and ctxUrl as context hints; frameUrl may become a writer URL after document.open(), and neither URL alone proves a frame locator. Verify the live context tree before replay; a frameUrl does not form a cross-frame XPath. Timing proximity alone does not prove causality. New popup windows outside the recorder top context are not covered." & vbCrLf
+            stm.writeText "   - For iframe actions, use ctx and ctxUrl as context hints; frameUrl may become a writer URL after document.open(), and neither URL alone proves a frame locator. Verify the live context tree before replay; a frameUrl does not form a cross-frame XPath. Timing proximity alone does not prove causality." & _
+                          IIf(m_capturePopupActions, " Popup/new-tab actions are covered only for contexts listed by [USER-ACTION-SCOPE] status=added; switch to that ctx before replaying them.", " New popup windows outside the recorder top context are not covered.") & vbCrLf
         End If
         stm.writeText "=== END REQUEST ===" & vbCrLf
         stm.writeText "--------------------------------------------------------" & vbCrLf
@@ -10894,6 +10978,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     m_captureUserActions = False
+    ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
@@ -10946,6 +11031,7 @@ StopFailedCleanup:
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     m_captureUserActions = False
+    ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
@@ -11128,6 +11214,11 @@ Public Sub ProcessRecorderQueue()
     ' Only the explicit timed manual recorder can issue repair calls. Never inject
     ' from FormatAndStoreLog / ProcessRecorderQueueCore (non-reentrant dispatcher).
     If m_discoveryManualPumpActive Then RepairDiscoveryActionListeners
+    ' Same rule: browsingContext.getTree for unresolved popup scope runs only here.
+    If m_discoveryManualPumpActive And m_capturePopupActions Then
+        ResolvePendingPopupPushesSafe False
+        EnsurePopupObserversDueSafe
+    End If
 
     ' Manual Discovery DOM sampling is intentionally outside ProcessRecorderQueueCore and is
     ' gated to RecordEventsForSeconds. Querying the SPA probe calls back through
@@ -11783,12 +11874,14 @@ Private Sub FormatAndStoreLog(ByVal json As Object, Optional ByRef rawText As St
             Dim navUrl As String
             If Not TryGetScalarTextField(params, "url", navUrl) Then Exit Sub
             ' Normalize navigation URLs so opaque authentication payloads cannot bloat the log.
-            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(navUrl)
+            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(navUrl) & RecorderContextSuffix(params)
 
             ' Only a document load in the current render-evidence context invalidates that
             ' evidence/carryover state; unrelated iframe/tab loads must not erase this wait.
             Dim navCtx As String
             navCtx = GetPathString(json, "params.context")
+            If m_capturePopupActions And method = "browsingContext.domContentLoaded" Then _
+                NotePopupDocumentLoaded navCtx
             If method = "browsingContext.domContentLoaded" And m_isRecording And m_captureUserActions Then
                 ' On ordinary navigation the new realm emits READY; a document.open/write
                 ' refresh can emit a second DCL without a new READY and erase listeners.
@@ -15821,7 +15914,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "      return out+'>'+(omitted?' (+'+omitted+' attributes omitted)':'');"
     js = js & "    };"
     js = js & "    const textOf = el => {"
-    js = js & "      if (!el || el.nodeType!==1 || el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return '';"
+    js = js & "      if (!el || el.nodeType!==1 || el.isContentEditable || /^(INPUT|TEXTAREA|SELECT|SCRIPT|STYLE|NOSCRIPT|TEMPLATE|TITLE|HEAD)$/.test(el.tagName)) return '';"
     js = js & "      const label = el.getAttribute('aria-label');"
     js = js & "      if (label) return cut(scrub(label),90);"
     js = js & "      if (el.children && el.children.length>12) return '';"
@@ -15831,15 +15924,16 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    const pathOf = e => { try {return e.composedPath();} catch (_) {return [e.target];} };"
     js = js & "    const snap = (e,kind) => {"
     js = js & "      const path=pathOf(e), els=path.filter(x=>x && x.nodeType===1);"
-    js = js & "      const target=els[0]||null, actionable=els.find(isActionable)||target;"
+    js = js & "      const target=els[0]||null, found=els.find(isActionable)||null, actionable=found||target;"
     js = js & "      if (!actionable) return null;"
     js = js & "      let shadowHost=null, dialog=null;"
     js = js & "      for (const part of path) {"
     js = js & "        if (!shadowHost && part && part.nodeType===11 && part.host) shadowHost=part.host;"
     js = js & "        if (!dialog && part && part.nodeType===1 && part.getAttribute('role')==='dialog') dialog=part;"
     js = js & "      }"
-    js = js & "      const bits=['event='+kind,'target='+tag(target),'actionable='+tag(actionable)];"
-    js = js & "      if (textOf(actionable)) bits.push('text='+textOf(actionable));"
+    js = js & "      const bits=['event='+kind,'target='+tag(target),'actionable='+(found?tag(found):'(none)')];"
+    js = js & "      if (found) { if (textOf(found)) bits.push('text='+textOf(found)); }"
+    js = js & "      else if (target && !/^(HTML|BODY)$/.test(target.tagName) && (target.children||[]).length<=3) { const tt=textOf(target); if (tt && tt.length<=60 && !tt.endsWith('...')) bits.push('targetText='+tt); }"
     js = js & "      bits.push('scope='+(shadowHost?'shadow':'document'));"
     js = js & "      if (dialog) bits.push('dialog='+tag(dialog));"
     js = js & "      if (shadowHost) bits.push('shadowHost='+tag(shadowHost));"
@@ -15859,7 +15953,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "        }"
     js = js & "      }"
     js = js & "      let children=[];"
-    js = js & "      try {"
+    js = js & "      if (found) try {"
     js = js & "        const todo=Array.from(actionable.children||[]).map(el=>({el,depth:1}));"
     js = js & "        let visited=0;"
     js = js & "        while(todo.length && visited<40 && children.length<4) {"
@@ -15934,8 +16028,8 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    }catch(_){}};"
     js = js & "    document.addEventListener('change',onDocumentChange,true);"
     js = js & "    cleanup.push(()=>document.removeEventListener('change',onDocumentChange,true));"
-    js = js & "    globalThis[key].rehook=()=>{try{"
-    js = js & "      lastPointer=null;lastSelectChange=null;"
+    js = js & "    globalThis[key].rehook=(keep)=>{try{"
+    js = js & "      if(!keep){lastPointer=null;lastSelectChange=null;}"
     js = js & "      for(const [name,fn] of [['pointerdown',onDocumentPointer],['click',onDocumentClick],"
     js = js & "        ['focusin',onDocumentFocus],['change',onDocumentChange]]) {"
     js = js & "        document.removeEventListener(name,fn,true);document.addEventListener(name,fn,true);"
@@ -15945,7 +16039,10 @@ Private Sub StartDiscoveryUserActionPreload()
 
     Dim params As New Dictionary
     params.Add "functionDeclaration", js
-    params.Add "contexts", Array(m_recorderTopContextId)
+    ' Popup mode registers for all contexts (new tabs/popups have no ID yet); scope is enforced
+    ' on receipt in RoutePopupScopedPush. Default mode keeps the top-tree-only registration.
+    If Not m_capturePopupActions Then params.Add "contexts", Array(m_recorderTopContextId)
+    If m_capturePopupActions Then m_userActionInstallJs = js
 
     Dim raw As String
     raw = ExecuteBiDiCommand("script.addPreloadScript", params, True, _
@@ -15956,7 +16053,11 @@ Private Sub StartDiscoveryUserActionPreload()
     Set parsed = ValidateProtocolResponse(raw, "script.addPreloadScript")
     m_userActionPreloadScriptId = RequirePathString(parsed, "result.script", ERR_BIDI_PROTOCOL, _
         "BiDi:StartDiscoveryUserActionPreload", "User-action preload response lacked a script ID.")
-    PushTimelineLine "[USER-ACTION-ROUTE] preload=installed | scope=top-and-descendants | nativeConsoleInfo=bound | script=" & CStr(USER_ACTION_SCRIPT_VERSION)
+    If m_capturePopupActions Then
+        PushTimelineLine "[USER-ACTION-ROUTE] preload=installed | scope=top-descendants-and-opened | preloadTargets=all-contexts | filter=parent-or-originalOpener | nativeConsoleInfo=bound | script=" & CStr(USER_ACTION_SCRIPT_VERSION)
+    Else
+        PushTimelineLine "[USER-ACTION-ROUTE] preload=installed | scope=top-and-descendants | nativeConsoleInfo=bound | script=" & CStr(USER_ACTION_SCRIPT_VERSION)
+    End If
     ' Existing documents are not covered retroactively by addPreloadScript.
     ' One-time installation also covers already-open descendant frames.
     On Error Resume Next
@@ -15983,7 +16084,7 @@ Private Sub StopDiscoveryUserActionPreload()
     Dim cleanupErrors As Long
     Dim failedContexts As String
     On Error Resume Next
-    cleanupErrors = ApplyDiscoveryActionScriptToContexts(vbNullString, True, failedContexts)
+    cleanupErrors = ApplyDiscoveryActionScriptToContexts(vbNullString, True, failedContexts, m_capturePopupActions)
     If Err.Number <> 0 Then cleanupErrors = cleanupErrors + 1
     Err.Clear
     On Error GoTo 0
@@ -16064,11 +16165,14 @@ End Function
 
 Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, _
                                                        ByVal dispose As Boolean, _
-                                                       ByRef failedContexts As String) As Long
+                                                       ByRef failedContexts As String, _
+                                                       Optional ByVal allLiveContexts As Boolean = False) As Long
     failedContexts = vbNullString
     If Len(m_recorderTopContextId) = 0 Then Exit Function
     Dim treeParams As New Dictionary
-    treeParams.Add "root", m_recorderTopContextId
+    ' allLiveContexts (popup-mode dispose): query every live context, then touch only those
+    ' in scope or that sent a push; unrelated tabs are never called.
+    If Not allLiveContexts Then treeParams.Add "root", m_recorderTopContextId
     Dim raw As String
     raw = ExecuteBiDiCommand("browsingContext.getTree", treeParams, True, _
                              allowAmbiguousRetry:=True, _
@@ -16089,6 +16193,12 @@ Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, _
     Dim failure As String
     Dim ok As Boolean
     For Each id In ids
+        If allLiveContexts Then
+            If Not IsPopupDisposeTarget(CStr(id)) Then GoTo NextApplyContext
+        ElseIf m_capturePopupActions And Not dispose Then
+            ' Already-open frames of the recorder tree are in scope from the start.
+            If Not m_popupScopeAllowed Is Nothing Then m_popupScopeAllowed(CStr(id)) = True
+        End If
         If dispose Then
             ok = TryDisposeUserActionInContext(CStr(id), failure)
         Else
@@ -16107,6 +16217,7 @@ Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, _
                                  " | detail=" & CompactBodyDiagnostic(failure)
             End If
         End If
+NextApplyContext:
     Next id
 End Function
 
@@ -16192,6 +16303,19 @@ End Sub
 Private Sub HandleDiscoveryUserActionPush(ByVal json As Object, ByVal message As String)
     If Not m_isRecording Then Exit Sub
     If Len(m_userActionPreloadScriptId) = 0 Then Exit Sub
+    Dim relTime As String
+    relTime = Format$((socket_.nowMs() / 1000#) - m_recorderStartTime, "0.00") & "s"
+    Dim arrival As String: arrival = EventArrivalSuffix()
+    If m_capturePopupActions Then
+        If Not RoutePopupScopedPush(json, message, relTime, arrival) Then Exit Sub
+    End If
+    HandleDiscoveryUserActionPushCore json, message, relTime, arrival, False
+End Sub
+
+' relTime/arrival are captured at receipt so a deferred (scope-pending) push keeps its timing.
+Private Sub HandleDiscoveryUserActionPushCore(ByVal json As Object, ByVal message As String, _
+                                              ByVal relTime As String, ByVal arrival As String, _
+                                              ByVal deferred As Boolean)
     On Error GoTo InvalidPayload
 
     Dim payload As Object
@@ -16215,8 +16339,7 @@ Private Sub HandleDiscoveryUserActionPush(ByVal json As Object, ByVal message As
         m_userActionMissingRealm = m_userActionMissingRealm + 1
     End If
 
-    Dim relTime As String
-    relTime = Format$((socket_.nowMs() / 1000#) - m_recorderStartTime, "0.00") & "s"
+    If deferred Then arrival = " | scopeDeferred=true" & arrival
     Dim common As String
     common = "realm=" & realmId & " | seq=" & CStr(seq) & " | ctx=" & contextId
 
@@ -16258,18 +16381,18 @@ Private Sub HandleDiscoveryUserActionPush(ByVal json As Object, ByVal message As
                 m_userActionTopReadyCount = m_userActionTopReadyCount + 1
             PushTimelineLine "[" & relTime & "] [USER-ACTION-READY] " & common & _
                              " | frameUrl=" & NormalizeNavigationDetail(GetPathString(payload, "url")) & _
-                             ctxUrlSuffix & EventArrivalSuffix()
+                             ctxUrlSuffix & arrival
         Case "click-confirm"
             m_userActionConfirmCount = m_userActionConfirmCount + 1
             PushTimelineLine "[" & relTime & "] [USER-ACTION-CONFIRM] " & common & _
-                             " | event=click" & EventArrivalSuffix()
+                             " | event=click" & arrival
         Case "pointerdown", "click", "focusin", "change"
             Dim line As String: line = GetPathString(payload, "line")
             If Len(line) = 0 Then GoTo InvalidPayload
             m_userActionCount = m_userActionCount + 1
             PushTimelineLine "[" & relTime & "] [USER-ACTION] " & common & _
                              " | frameUrl=" & NormalizeNavigationDetail(GetPathString(payload, "url")) & _
-                             ctxUrlSuffix & " | " & line & EventArrivalSuffix()
+                             ctxUrlSuffix & " | " & line & arrival
         Case Else
             GoTo InvalidPayload
     End Select
@@ -16280,6 +16403,316 @@ InvalidPayload:
     Err.Clear
 End Sub
 
+
+' ===== Popup / new-tab action scope (capturePopupActions) =====
+' The preload runs in every context, so scope is decided here, on receipt:
+'   recorder top context -> its descendant frames -> top-level contexts whose BiDi
+'   originalOpener is in scope (noopener links included) -> their frames, and so on.
+' Never call the browser from these routines except ResolvePendingPopupPushes, which runs
+' only from ProcessRecorderQueue (outside the non-reentrant dispatcher) and from Stop.
+
+Private Sub ResetPopupActionScopeState()
+    m_capturePopupActions = False
+    Set m_popupScopeAllowed = Nothing
+    Set m_popupScopeRejected = Nothing
+    Set m_userActionSeenContexts = Nothing
+    Set m_popupPending = Nothing
+    m_popupScopeOpenedCount = 0
+    m_popupDeferredCount = 0
+    m_popupDeferredAcceptedCount = 0
+    m_popupOutOfScopeDropped = 0
+    m_popupUnresolvedDropped = 0
+    m_popupPendingOverflow = 0
+    m_popupNextResolveMs = 0#
+    Set m_popupOpenedContexts = Nothing
+    Set m_popupEnsureDue = Nothing
+    m_userActionInstallJs = vbNullString
+End Sub
+
+' Dispatcher-safe: dictionary/timeline updates only.
+Private Sub NotePopupScopeContextCreated(ByVal json As Object, ByVal ctx As String)
+    On Error GoTo Done
+    If Not m_isRecording Then Exit Sub
+    If m_popupScopeAllowed Is Nothing Then Exit Sub
+    If m_popupScopeAllowed.Exists(ctx) Then Exit Sub
+
+    Dim parentId As String: parentId = GetPathString(json, "params.parent")
+    Dim openerId As String: openerId = GetPathString(json, "params.originalOpener")
+    Dim inScope As Boolean
+    If Len(parentId) > 0 Then
+        inScope = m_popupScopeAllowed.Exists(parentId)
+    ElseIf Len(openerId) > 0 Then
+        inScope = m_popupScopeAllowed.Exists(openerId)
+    End If
+
+    If inScope Then
+        AddPopupScopeContext ctx, parentId, openerId, GetPathString(json, "params.url"), True
+    Else
+        ' STOP tab, user-opened tabs and frames of unrelated tabs land here.
+        m_popupScopeRejected(ctx) = True
+        FlushPopupPendingForContext ctx, False
+    End If
+Done:
+    Err.Clear
+End Sub
+
+Private Sub AddPopupScopeContext(ByVal ctx As String, ByVal parentId As String, _
+                                 ByVal openerId As String, ByVal url As String, _
+                                 ByVal fromEvent As Boolean)
+    If m_popupScopeAllowed.Exists(ctx) Then Exit Sub
+    m_popupScopeAllowed(ctx) = True
+    If Not m_popupScopeRejected Is Nothing Then
+        If m_popupScopeRejected.Exists(ctx) Then m_popupScopeRejected.Remove ctx
+    End If
+    If Len(parentId) = 0 Then
+        ' Only new top-level contexts are announced; in-scope frames are implied by parent.
+        m_popupScopeOpenedCount = m_popupScopeOpenedCount + 1
+        If Not m_popupOpenedContexts Is Nothing Then m_popupOpenedContexts(ctx) = True
+        PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & _
+                         "s] [USER-ACTION-SCOPE] status=added | ctx=" & ctx & _
+                         " | via=originalOpener | opener=" & openerId & _
+                         " | url=" & NormalizeNavigationDetail(url) & _
+                         " | source=" & IIf(fromEvent, "contextCreated", "getTree") & _
+                         IIf(fromEvent, EventArrivalSuffix(), "")
+    End If
+    FlushPopupPendingForContext ctx, True
+End Sub
+
+' Returns True when the push may be handled now. Unknown contexts are held (bounded);
+' content of out-of-scope pushes is never logged, only counted.
+Private Function RoutePopupScopedPush(ByVal json As Object, ByVal message As String, _
+                                      ByVal relTime As String, ByVal arrival As String) As Boolean
+    If m_popupScopeAllowed Is Nothing Then
+        RoutePopupScopedPush = True
+        Exit Function
+    End If
+    ' Stale/foreign tokens are ignored exactly as the core handler would ignore them.
+    If InStr(1, message, """token"":""" & m_actionSessionToken & """", vbBinaryCompare) = 0 Then Exit Function
+
+    Dim ctx As String: ctx = GetPathString(json, "params.source.context")
+    If Len(ctx) = 0 Then
+        m_popupOutOfScopeDropped = m_popupOutOfScopeDropped + 1
+        Exit Function
+    End If
+    If Not m_userActionSeenContexts Is Nothing Then m_userActionSeenContexts(ctx) = True
+
+    If m_popupScopeAllowed.Exists(ctx) Then
+        RoutePopupScopedPush = True
+        Exit Function
+    End If
+    If Not m_popupScopeRejected Is Nothing Then
+        If m_popupScopeRejected.Exists(ctx) Then
+            m_popupOutOfScopeDropped = m_popupOutOfScopeDropped + 1
+            Exit Function
+        End If
+    End If
+
+    If m_popupPending Is Nothing Then Set m_popupPending = New Collection
+    If m_popupPending.count >= POPUP_PENDING_MAX Then
+        m_popupPendingOverflow = m_popupPendingOverflow + 1
+        Exit Function
+    End If
+    m_popupPending.Add Array(ctx, json, message, relTime, arrival, socket_.nowMs())
+    m_popupDeferredCount = m_popupDeferredCount + 1
+End Function
+
+Private Sub FlushPopupPendingForContext(ByVal ctx As String, ByVal accept As Boolean)
+    If m_popupPending Is Nothing Then Exit Sub
+    If m_popupPending.count = 0 Then Exit Sub
+    Dim keep As New Collection
+    Dim item As Variant
+    For Each item In m_popupPending
+        If StrComp(CStr(item(0)), ctx, vbBinaryCompare) = 0 Then
+            If accept Then
+                m_popupDeferredAcceptedCount = m_popupDeferredAcceptedCount + 1
+                HandleDiscoveryUserActionPushCore item(1), CStr(item(2)), CStr(item(3)), CStr(item(4)), True
+            Else
+                m_popupOutOfScopeDropped = m_popupOutOfScopeDropped + 1
+            End If
+        Else
+            keep.Add item
+        End If
+    Next item
+    Set m_popupPending = keep
+End Sub
+
+Private Sub ResolvePendingPopupPushesSafe(ByVal force As Boolean)
+    On Error GoTo Failed
+    ResolvePendingPopupPushes force
+    Exit Sub
+Failed:
+    Err.Clear
+End Sub
+
+' Settles pushes whose context never produced a decisive contextCreated (event loss,
+' tabs that existed before recording). Uses one live browsingContext.getTree.
+Private Sub ResolvePendingPopupPushes(ByVal force As Boolean)
+    If Not m_isRecording Or Not m_capturePopupActions Then Exit Sub
+    If m_popupPending Is Nothing Then Exit Sub
+    If m_popupPending.count = 0 Then Exit Sub
+
+    Dim nowValue As Double: nowValue = socket_.nowMs()
+    If Not force Then
+        If nowValue < m_popupNextResolveMs Then Exit Sub
+        Dim oldest As Variant: oldest = m_popupPending(1)
+        If (nowValue - CDbl(oldest(5))) < POPUP_PENDING_RESOLVE_MS Then Exit Sub
+    End If
+    m_popupNextResolveMs = nowValue + 500#
+
+    Dim parentById As New Dictionary
+    Dim openerById As New Dictionary
+    Dim urlById As New Dictionary
+    Dim treeKnown As Boolean
+    treeKnown = TryCollectPopupTree(parentById, openerById, urlById)
+
+    If treeKnown Then
+        Dim changed As Boolean
+        Dim k As Variant
+        Dim pId As String, oId As String
+        Dim member As Boolean
+        Do
+            changed = False
+            For Each k In parentById.keys
+                If Not m_popupScopeAllowed.Exists(CStr(k)) Then
+                    pId = CStr(parentById(k))
+                    oId = CStr(openerById(k))
+                    member = False
+                    If Len(pId) > 0 Then
+                        member = m_popupScopeAllowed.Exists(pId)
+                    ElseIf Len(oId) > 0 Then
+                        member = m_popupScopeAllowed.Exists(oId)
+                    End If
+                    If member Then
+                        AddPopupScopeContext CStr(k), pId, oId, CStr(urlById(k)), False
+                        changed = True
+                    End If
+                End If
+            Next k
+        Loop While changed
+    End If
+
+    Dim keep As New Collection
+    Dim item As Variant
+    Dim ctx As String
+    For Each item In m_popupPending
+        ctx = CStr(item(0))
+        If m_popupScopeAllowed.Exists(ctx) Then
+            m_popupDeferredAcceptedCount = m_popupDeferredAcceptedCount + 1
+            HandleDiscoveryUserActionPushCore item(1), CStr(item(2)), CStr(item(3)), CStr(item(4)), True
+        ElseIf treeKnown And parentById.Exists(ctx) Then
+            ' Live but not related to the recorder tree: decided out of scope.
+            m_popupScopeRejected(ctx) = True
+            m_popupOutOfScopeDropped = m_popupOutOfScopeDropped + 1
+        ElseIf force Or (nowValue - CDbl(item(5))) >= POPUP_PENDING_GIVEUP_MS Then
+            ' Context already gone (or tree unavailable): membership cannot be proven.
+            m_popupUnresolvedDropped = m_popupUnresolvedDropped + 1
+        Else
+            keep.Add item
+        End If
+    Next item
+    Set m_popupPending = keep
+End Sub
+
+Private Function TryCollectPopupTree(ByVal parentById As Dictionary, _
+                                     ByVal openerById As Dictionary, _
+                                     ByVal urlById As Dictionary) As Boolean
+    On Error GoTo Unavailable
+    Dim params As New Dictionary
+    Dim raw As String
+    raw = ExecuteBiDiCommand("browsingContext.getTree", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
+    Dim parsed As Object: Set parsed = ValidateProtocolResponse(raw, "browsingContext.getTree")
+    Dim roots As Collection: Set roots = GetPathObject(parsed, "result.contexts")
+    If roots Is Nothing Then Exit Function
+    Dim node As Variant
+    For Each node In roots
+        If IsObject(node) Then CollectPopupTreeNode node, vbNullString, parentById, openerById, urlById
+    Next node
+    TryCollectPopupTree = True
+    Exit Function
+Unavailable:
+    Err.Clear
+End Function
+
+Private Sub CollectPopupTreeNode(ByVal node As Object, ByVal parentId As String, _
+                                 ByVal parentById As Dictionary, _
+                                 ByVal openerById As Dictionary, _
+                                 ByVal urlById As Dictionary)
+    Dim ctx As String: ctx = GetPathString(node, "context")
+    If Len(ctx) = 0 Then Exit Sub
+    parentById(ctx) = parentId
+    openerById(ctx) = GetPathString(node, "originalOpener")
+    urlById(ctx) = GetPathString(node, "url")
+    Dim children As Collection: Set children = GetPathObject(node, "children")
+    If children Is Nothing Then Exit Sub
+    Dim child As Variant
+    For Each child In children
+        If IsObject(child) Then CollectPopupTreeNode child, ctx, parentById, openerById, urlById
+    Next child
+End Sub
+
+' Dispatcher-safe: schedule only. A popup written by window.open('') + document.write may
+' never run the preload (initial about:blank) and document.open() erases listeners.
+Private Sub NotePopupDocumentLoaded(ByVal ctx As String)
+    If Len(ctx) = 0 Then Exit Sub
+    If m_popupOpenedContexts Is Nothing Or m_popupEnsureDue Is Nothing Then Exit Sub
+    If Not m_popupOpenedContexts.Exists(ctx) Then Exit Sub
+    m_popupEnsureDue(ctx) = socket_.nowMs() + POPUP_ENSURE_DELAY_MS
+End Sub
+
+Private Sub EnsurePopupObserversDueSafe()
+    On Error GoTo Failed
+    EnsurePopupObserversDue
+    Exit Sub
+Failed:
+    Err.Clear
+End Sub
+
+' Idempotent: rehook when the observer exists in the realm, install when it does not.
+' Runs outside the dispatcher (ProcessRecorderQueue, manual pump only).
+Private Sub EnsurePopupObserversDue()
+    If Not m_isRecording Or Not m_capturePopupActions Then Exit Sub
+    If m_popupEnsureDue Is Nothing Then Exit Sub
+    If m_popupEnsureDue.count = 0 Then Exit Sub
+    If Len(m_userActionInstallJs) = 0 Or Len(m_userActionPreloadScriptId) = 0 Then Exit Sub
+
+    Dim nowValue As Double: nowValue = socket_.nowMs()
+    Dim ensureJs As String
+    ensureJs = "function(){var k=Symbol.for('seleniumvba.user.action.push');var r=globalThis[k];" & _
+               "if(r&&typeof r.rehook==='function')return r.rehook(true);return (" & m_userActionInstallJs & ")();}"
+    Dim ids As Variant: ids = m_popupEnsureDue.keys
+    Dim ctx As Variant
+    Dim ok As Boolean, failure As String
+    For Each ctx In ids
+        If m_popupEnsureDue.Exists(CStr(ctx)) Then
+            If nowValue >= CDbl(m_popupEnsureDue(CStr(ctx))) Then
+                m_popupEnsureDue.Remove CStr(ctx)
+                failure = vbNullString
+                ok = TryCallDiscoveryActionInContext(CStr(ctx), ensureJs, failure)
+                PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & _
+                                 "s] [USER-ACTION-SCOPE] status=" & IIf(ok, "ensured", "ensure-failed") & _
+                                 " | ctx=" & CStr(ctx) & _
+                                 IIf(ok, "", " | detail=" & CompactBodyDiagnostic(failure))
+            End If
+        End If
+    Next ctx
+End Sub
+
+' Popup-mode dispose touches only contexts in scope or that actually ran the observer.
+Private Function IsPopupDisposeTarget(ByVal ctx As String) As Boolean
+    If Not m_popupScopeAllowed Is Nothing Then
+        If m_popupScopeAllowed.Exists(ctx) Then
+            IsPopupDisposeTarget = True
+            Exit Function
+        End If
+    End If
+    If Not m_userActionSeenContexts Is Nothing Then
+        IsPopupDisposeTarget = m_userActionSeenContexts.Exists(ctx)
+    End If
+End Function
 
 Private Sub AppendUserActionStats()
     If Not m_captureUserActions Then Exit Sub
@@ -16297,6 +16730,20 @@ Private Sub AppendUserActionStats()
                      " | rehookErrors=" & CStr(m_userActionRebindErrors) & _
                      " | rehookGone=" & CStr(m_userActionRebindGone) & _
                      " | cleanupWarnings=" & CStr(m_userActionCleanupWarnings)
+    If m_capturePopupActions Then
+        Dim scopeCount As Long
+        If Not m_popupScopeAllowed Is Nothing Then scopeCount = m_popupScopeAllowed.count
+        Dim stillPending As Long
+        If Not m_popupPending Is Nothing Then stillPending = m_popupPending.count
+        PushTimelineLine "[end] [USER-ACTION-SCOPE-STATS] scopeContexts=" & CStr(scopeCount) & _
+                         " | openedContexts=" & CStr(m_popupScopeOpenedCount) & _
+                         " | deferred=" & CStr(m_popupDeferredCount) & _
+                         " | deferredAccepted=" & CStr(m_popupDeferredAcceptedCount) & _
+                         " | outOfScopeDropped=" & CStr(m_popupOutOfScopeDropped) & _
+                         " | unresolvedDropped=" & CStr(m_popupUnresolvedDropped) & _
+                         " | pendingOverflow=" & CStr(m_popupPendingOverflow) & _
+                         " | pendingAtEnd=" & CStr(stillPending)
+    End If
 End Sub
 
 Private Sub HandleDiscoveryStopTabPush(ByVal json As Object, ByVal message As String)
