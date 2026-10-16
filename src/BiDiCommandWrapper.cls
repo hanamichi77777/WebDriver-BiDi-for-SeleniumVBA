@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.5"
+Private Const BIDI_WRAPPER_VERSION As String = "7.6"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -195,6 +195,16 @@ Private Const BODY_AI_LOSSLESS_SOURCE_MAX_CHARS As Long = 4096   ' half of log c
 ' navigation/realm churn cannot become a tight script.evaluate retry loop.
 Private Const DISCOVERY_DOM_POLL_MS As Long = 100
 Private Const DISCOVERY_PROBE_RETRY_MS As Long = 500
+' v7.6: a script call sent to a top-level context whose navigation has started is held by the
+' browser until the new document commits (seen as a 5-22 s recorder stall ending in Context Lost).
+' Manual DOM sampling therefore pauses from navigationStarted until the new document appears.
+' The cap equals the transport floor, so a pause never costs more than the hung call it replaces.
+Private Const DISCOVERY_NAV_POLL_PAUSE_MAX_MS As Long = 30000
+' v7.6: the manual poll's probe query is bounded and never enters context recovery. The pause
+' above cannot cover a query sent just before navigationStarted reaches VBA (seen on Edge on
+' every link click), so this bound is what limits such a stall. Same bound as the v7.4
+' maintenance calls.
+Private Const DISCOVERY_POLL_COMMAND_TIMEOUT_MS As Long = 2000
 ' Bounded critical-incident ring independent of Discovery Log recording.
 Private Const MAX_FORENSIC_INCIDENT_LOG_SIZE As Long = 512
 Private Const MAX_FORENSIC_INCIDENT_LINE_CHARS As Long = 2048
@@ -207,7 +217,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const USER_ACTION_SCRIPT_VERSION As Long = 10 ' v10: rehook(keep) keeps pointer pairing for popup ensure; v9: non-rendered text excluded, actionable=(none)
+Private Const USER_ACTION_SCRIPT_VERSION As Long = 12 ' v12: sibling=k/n for id-less elements with same-tag siblings; non-breaking spaces in text= kept as \u00a0; v11: select change inside Shadow DOM and label activation no longer add duplicate click lines, and a click on an icon/span inside a button or link no longer adds a focusin line; v10: rehook(keep) keeps pointer pairing for popup ensure; v9: non-rendered text excluded, actionable=(none)
 Private Const SPA_PROBE_VERSION As Long = 46 ' Internal probe generation/quiet/filter/health-diagnostic/observation-start/overflow contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
@@ -245,6 +255,12 @@ Private m_discoveryDomCaptureEnabled As Boolean ' manual Discovery: poll SPA pro
 Private m_discoveryManualPumpActive As Boolean  ' True only inside RecordEventsForSeconds
 Private m_discoveryDomContextId As String       ' current top-level context used by manual DOM sampling
 Private m_nextDiscoveryDomPollMs As Double      ' nowMs deadline; 0 = sample on next recorder pump
+Private m_discoveryNavPauseCtx As String        ' top-level context whose navigation pauses DOM sampling ("" = none)
+Private m_discoveryNavPauseSinceMs As Double    ' nowMs when that pause began
+Private m_discoveryNavPauseDocUrl As String     ' last DCL URL of the sampled top context (fragment check)
+Private m_discoveryNavPauseCount As Long        ' [RECORDER-QUEUE-STATS] navPollPauses
+Private m_discoveryNavPauseTimeouts As Long     ' [RECORDER-QUEUE-STATS] navPauseTimeouts
+Private m_discoveryPollQueryFailures As Long    ' [RECORDER-QUEUE-STATS] pollQueryFailures
 ' Opt-in, event-driven manual interaction evidence; no input text is captured.
 Private m_captureUserActions As Boolean
 Private m_actionSessionToken As String
@@ -260,6 +276,9 @@ Private m_userActionPreloadScriptId As String
 ' Per-context document load diagnostics and deferred reattachment for document.open/write.
 ' A repeated DOMContentLoaded in the SAME ready realm may erase document listeners.
 Private m_userActionReadyRealmByContext As Dictionary
+Private m_userActionSeenPushKeys As Dictionary   ' ctx|realm|kind|seq already logged (pushes can be re-delivered)
+Private m_userActionReplayDropped As Long
+Private m_userActionCtxUrlByRealm As Dictionary  ' realm -> ctxUrl, restored when Back brings a cached page back
 Private m_userActionLastDclRealmByContext As Dictionary
 ' Per-context last observed document-load URL, pinned across same-realm DOM rewrites.
 ' Not the page JS document.URL; do not use as an exact frame selector without verification.
@@ -934,6 +953,7 @@ Private Sub DispatchGlobalEvents(ByVal json As Object, Optional ByRef rawText As
             m_navigationDetected = True
             m_navigationContextId = GetPathString(json, "params.context")
             ObserveNavigationStartedForActiveNavigate json
+            NoteDiscoveryNavigationStarted json
 
             If m_cachedRealmIds.Exists(m_navigationContextId) Then
                 m_cachedRealmIds.Remove m_navigationContextId
@@ -1174,6 +1194,12 @@ Private Sub HandleContextDestroyedEvent(ByVal json As Object)
     If Len(eventCtx) = 0 Then Exit Sub
 
     InvalidateContextState eventCtx, True
+    ReleaseDiscoveryNavPause eventCtx
+
+    ' A popup that closed before its observer check must not log a false ensure-failed.
+    If Not m_popupEnsureDue Is Nothing Then
+        If m_popupEnsureDue.Exists(eventCtx) Then m_popupEnsureDue.Remove eventCtx
+    End If
 
     ' Closing the separate control tab is a user-initiated stop, not an action in
     ' the recorded page. Leave all cleanup to the normal recording loop/caller.
@@ -2008,6 +2034,7 @@ End Function
 
 
 Private Sub HandleDownloadWillBeginEvent(ByVal json As Object)
+    ReleaseDiscoveryNavPause GetPathString(json, "params.context")
     Dim p As Object
     Set p = GetPathObject(json, "params")
     If p Is Nothing Then
@@ -7401,6 +7428,7 @@ Private Sub ResetSessionBoundaryState()
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    ClearDiscoveryNavPause
     m_captureUserActions = False
     ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
@@ -7409,6 +7437,8 @@ Private Sub ResetSessionBoundaryState()
     m_discoveryStopRequested = False
     m_userActionPreloadScriptId = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
+    Set m_userActionSeenPushKeys = Nothing
+    Set m_userActionCtxUrlByRealm = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
     Set m_userActionContextUrlByContext = Nothing
     Set m_userActionPendingRebind = Nothing
@@ -10512,6 +10542,8 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    ClearDiscoveryNavPause
+    m_discoveryNavPauseDocUrl = vbNullString
     m_discoveryStopRequested = False
     m_discoveryStopTabDestroyed = False
     m_discoveryStopTabUsed = False
@@ -10529,6 +10561,9 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_userActionRebindErrors = 0
     m_userActionRebindGone = 0
     Set m_userActionReadyRealmByContext = New Dictionary
+    Set m_userActionSeenPushKeys = New Dictionary
+    Set m_userActionCtxUrlByRealm = New Dictionary
+    m_userActionReplayDropped = 0
     Set m_userActionLastDclRealmByContext = New Dictionary
     Set m_userActionContextUrlByContext = New Dictionary
     Set m_userActionPendingRebind = New Dictionary
@@ -10688,6 +10723,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         m_discoveryManualPumpActive = False
         m_discoveryDomContextId = vbNullString
         m_nextDiscoveryDomPollMs = 0#
+        ClearDiscoveryNavPause
         m_captureUserActions = False
         ResetPopupActionScopeState
         m_actionSessionToken = vbNullString
@@ -10782,9 +10818,12 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "LEGEND | Typed input contents are NEVER collected by this observer: valueLen= carries character counts only. For INPUT types button/submit/reset/image, the displayed value attribute may be recorded (max 96 chars); other INPUT values are shown as (len=N). On select change, selectedText= can include page-defined option labels, which may contain personal information. Unknown attribute values are omitted; only data-testid, data-test, data-qa, data-cy, and date-shaped data-iso expose data-* values (capped); other data-* attributes retain names only. URL attributes/frameUrl are resolved against the page base URL (where applicable), sanitized to origin+pathname, and capped; query and fragment are omitted. These are NOT literal DOM attributes. " & vbCrLf
             stm.writeText "LEGEND | frameUrl is read from page document location and may switch to a writer URL after document.open(). ctxUrl is the first observed NAV/DCL URL for the active READY realm, retained through same-realm rewrites (not a fresh getTree URL). READY uses ctxUrl=(pending) until its realm's first observed DCL. Resolve frames by ctx and verify live browsingContext.getTree before replay; never use frameUrl alone. Child option[selected] is an HTML default attribute; current SELECT choice comes from selectedText/selectedCount. " & vbCrLf
             stm.writeText "LEGEND | Permitted locator attribute values and visible labels/text may still reveal personal information, and paths may carry identifiers. Review the entire log before sharing. [NAV-TARGET] is a separate existing field that may retain query/fragment values. " & vbCrLf
-            stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate. [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
-            stm.writeText "LEGEND | event=focusin means an element gained focus, not necessarily an explicit user action. It may occur when focus returns to the opener after a popup closes, or after a keyboard Tab move. Do not replay focusin alone as a click or keystroke; interpret it using surrounding actions and context transitions." & vbCrLf
-            stm.writeText "LEGEND | actionable=(none) means no button, link, form control, or ARIA widget role was on the event path (page background, a text-selection drag, or a custom clickable element without a role). Such lines carry no text=/children=; targetText= appears only when the target is not html/body, has at most 3 child elements, and its whole visible text is 60 chars or less (a short label, never a container dump). Do NOT turn an actionable=(none) line into a replay step without confirming it against the live DOM." & vbCrLf
+            stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate, as are the click and focusin that a clicked <label> forwards to its control (the label click is the action; the control's change still follows). [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
+            stm.writeText "LEGEND | A pointerdown with no [USER-ACTION-CONFIRM] can be a drag: HTML5 drag-and-drop, a slider, a scrollbar, or a text selection. Drops, scrolling, hover, and individual key presses (Enter, Tab, Esc, arrows) are not recorded, and neither are edits inside contenteditable editors (for example rich-text editors in an iframe). Do not replay such a pointerdown as a click without checking the live page." & vbCrLf
+            stm.writeText "LEGEND | replayDropped (in [USER-ACTION-STATS]) counts action pushes the browser delivered again for the same realm and seq; each is logged only once. On Edge this happened when Back restored a page from the back/forward cache: no [NAV] appears, and [USER-ACTION-RESTORED] marks the page shown again. Replay that step with history navigation (ExecuteTraverseHistory), not a fresh navigate." & vbCrLf
+            stm.writeText "LEGEND | event=focusin means an element gained focus, not necessarily an explicit user action. It may occur when focus returns to the opener after a popup closes, or after a keyboard Tab move. It also fires on the element that last had focus whenever the browser window or tab regains focus, including after Back shows a cached page ([USER-ACTION-RESTORED]); such a focusin is not a user action. Do not replay focusin alone as a click or keystroke; interpret it using surrounding actions and context transitions." & vbCrLf
+            stm.writeText "LEGEND | actionable=(none) means no button, link, form control, label with a control, or ARIA widget role was on the event path (page background, a text-selection drag, or a custom clickable element without a role). Such lines carry no text=/children=; targetText= appears only when the target is not html/body, has at most 3 child elements, and its whole visible text is 60 chars or less (a short label, never a container dump). Do NOT turn an actionable=(none) line into a replay step without confirming it against the live DOM." & vbCrLf
+            stm.writeText "LEGEND | sibling=k/n gives the position of the actionable element (or the target when actionable=(none)) among its parent's child elements with the same tag, as in XPath parent/button[k]. It appears only for elements without an id that have same-tag siblings, and it is the position at event time, not a stable locator; prefer text or attributes when they are distinctive. In text=/targetText=, \u00a0 marks a non-breaking space (U+00A0) that the page text really contains. XPath normalize-space() does not treat it as a space: build such text in VBA with ChrW(160), or match the words around it with contains()." & vbCrLf
             If m_capturePopupActions Then
                 stm.writeText "LEGEND | popupActions=True: the action observer is registered for ALL browsing contexts, but a [USER-ACTION] is logged only from the recorder top context, its descendant frames, and top-level contexts whose BiDi originalOpener (or parent frame) is already in scope. [USER-ACTION-SCOPE] status=added marks such a popup/tab with its opener ctx and first URL; use it to switch browsing context during replay (the popup is a separate top-level context, not a frame). Pushes from unrelated tabs and the STOP tab are discarded without logging their content; counts appear in [USER-ACTION-SCOPE-STATS]." & vbCrLf
                 stm.writeText "LEGEND | [USER-ACTION-SCOPE] status=ensured means the observer was re-attached or installed shortly (about 100-300 ms) after that popup's domContentLoaded (needed for window.open('') + document.write popups, and for same-origin window.open(url) popups whose initial about:blank realm is reused: their only READY shows frameUrl=[non-http-url]); actions made before it may be missing; ensure-failed means it could not be attached." & vbCrLf
@@ -10796,6 +10835,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         End If
         stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
         stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
+        stm.writeText "LEGEND | navPollPauses (in [RECORDER-QUEUE-STATS]) counts top-level navigations during which manual [SPA-ACT] DOM sampling paused, from browsingContext.navigationStarted until the new document's READY/domContentLoaded/load (or a Back/Forward cache restore, the context closing, or a download starting). No [SPA-ACT] is sampled during a pause; user actions and network lines continue. navPauseTimeouts counts pauses that reached the 30 s cap. pollQueryFailures counts manual sampling queries that failed or hit their 2 s bound, typically one per link click when the query was sent just before the navigation began; sampling simply retries, so these are not errors by themselves." & vbCrLf
         stm.writeText "LEGEND | [REQ-UNPAIRED] tracks request hops by (request id, redirectCount), including suppressed requests. Categories are exclusive: open-at-end=still had no observed terminal event/redirect advance when recording ended; other=no terminal event observed, but later evidence (such as the next redirect hop) showed the hop was no longer open." & vbCrLf
         stm.writeText "LEGEND | Known observation (Edge): a new top-level context opened by a rel=noopener / target=_blank link may never report network.responseCompleted for its document request although its domContentLoaded/load arrive (ctx=other:...). Such a hop stays open-at-end; by itself it is NOT evidence of an unfinished wait or a too-short timeout." & vbCrLf
         stm.writeText "LEGEND | [ERR]/[BLOCK] carry request id + normalized key; if fetchError omits its URL, the recorder falls back to the beforeRequestSent id->URL/key cache (including suppressed requests). Path/matrix assignment values such as ;ord=... or /_dc_unique_id=... are stripped to name= so volatile identifiers do not fragment keys." & vbCrLf
@@ -10929,6 +10969,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         If m_captureUserActions Then
             stm.writeText vbCrLf & "4) Reconstruct manual actions from [USER-ACTION] as unverified hints" & vbCrLf
             stm.writeText "   - Use element/ancestor/child/shadowHost attributes and visible text as locator candidates; verify against the live DOM and beware hidden duplicates." & vbCrLf
+            stm.writeText "   - An id that looks generated (UUID-like, long hex, or long digit runs) may change on every page load; prefer visible text or stable attributes for such elements." & vbCrLf
+            stm.writeText "   - Recorded clicks are real (trusted) mouse clicks, but ExecuteClick defaults to a synthetic element.click(). If a replayed click does not produce the change the recording shows after its CONFIRM ([SPA-ACT]/[NAV]), set bidi.UseTrustedClick = True for that click." & vbCrLf
             stm.writeText "   - href/src in [USER-ACTION] are resolved and sanitized, not literal DOM attributes. Never build an exact @href XPath from them; prefer ancestor IDs, visible text, or a distinctive path segment verified against the live DOM." & vbCrLf
             stm.writeText "   - Treat valueLen as a length only. selectedText is the capped visible label of a select choice (not its value attribute); review for personal data. Ask the user for exact typed input values and any full URLs required by replay." & vbCrLf
             stm.writeText "   - A change event may fire on blur, during or after the next pointerdown. Infer editing order using earlier focusin/pointerdown clues and context; do not treat change order as keystroke order." & vbCrLf
@@ -10977,10 +11019,13 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    ClearDiscoveryNavPause
     m_captureUserActions = False
     ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
+    Set m_userActionSeenPushKeys = Nothing
+    Set m_userActionCtxUrlByRealm = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
     Set m_userActionContextUrlByContext = Nothing
     Set m_userActionPendingRebind = Nothing
@@ -11030,10 +11075,13 @@ StopFailedCleanup:
     m_discoveryManualPumpActive = False
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
+    ClearDiscoveryNavPause
     m_captureUserActions = False
     ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
+    Set m_userActionSeenPushKeys = Nothing
+    Set m_userActionCtxUrlByRealm = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
     Set m_userActionContextUrlByContext = Nothing
     Set m_userActionPendingRebind = Nothing
@@ -11246,6 +11294,52 @@ Private Sub ScheduleNextDiscoveryDomPoll(ByVal probeAvailable As Boolean)
     End If
 End Sub
 
+' ---- v7.6: pause manual DOM sampling while the sampled top-level context navigates ----
+Private Function DiscoveryNavPauseTargetContext() As String
+    If Len(m_discoveryDomContextId) > 0 Then
+        DiscoveryNavPauseTargetContext = m_discoveryDomContextId
+    Else
+        DiscoveryNavPauseTargetContext = m_recorderTopContextId
+    End If
+End Function
+
+' Called from DispatchGlobalEvents for every browsingContext.navigationStarted.
+Private Sub NoteDiscoveryNavigationStarted(ByVal json As Object)
+    On Error GoTo Done
+    If Not m_isRecording Then Exit Sub
+    If Not m_discoveryDomCaptureEnabled Then Exit Sub
+    If socket_ Is Nothing Then Exit Sub
+
+    Dim ctx As String: ctx = GetPathString(json, "params.context")
+    If Len(ctx) = 0 Then Exit Sub
+    If StrComp(ctx, DiscoveryNavPauseTargetContext(), vbBinaryCompare) <> 0 Then Exit Sub
+
+    ' A fragment-only change keeps the document, so no load event would end the pause.
+    Dim navUrl As String: navUrl = GetPathString(json, "params.url")
+    If Len(m_discoveryNavPauseDocUrl) > 0 And InStr(1, navUrl, "#", vbBinaryCompare) > 0 Then
+        If StrComp(StripUrlFragment(navUrl), StripUrlFragment(m_discoveryNavPauseDocUrl), vbBinaryCompare) = 0 Then Exit Sub
+    End If
+
+    If Len(m_discoveryNavPauseCtx) = 0 Then m_discoveryNavPauseCount = m_discoveryNavPauseCount + 1
+    m_discoveryNavPauseCtx = ctx
+    m_discoveryNavPauseSinceMs = socket_.nowMs()
+Done:
+End Sub
+
+' The new document exists (READY/DCL/load), Back restored a cached page, the context closed,
+' or the navigation became a download: sampling may resume at once.
+Private Sub ReleaseDiscoveryNavPause(ByVal contextId As String)
+    If Len(m_discoveryNavPauseCtx) = 0 Then Exit Sub
+    If StrComp(contextId, m_discoveryNavPauseCtx, vbBinaryCompare) <> 0 Then Exit Sub
+    ClearDiscoveryNavPause
+    m_nextDiscoveryDomPollMs = 0#
+End Sub
+
+Private Sub ClearDiscoveryNavPause()
+    m_discoveryNavPauseCtx = vbNullString
+    m_discoveryNavPauseSinceMs = 0#
+End Sub
+
 Private Sub PollDiscoverySpaActivityIfDue(Optional ByVal forceSample As Boolean = False)
     If Not m_isRecording Then Exit Sub
     If Not m_discoveryDomCaptureEnabled Then Exit Sub
@@ -11260,6 +11354,18 @@ Private Sub PollDiscoverySpaActivityIfDue(Optional ByVal forceSample As Boolean 
     Dim nowMs As Double: nowMs = socket_.nowMs()
     If Not forceSample Then
         If m_nextDiscoveryDomPollMs > 0# And nowMs < m_nextDiscoveryDomPollMs Then Exit Sub
+    End If
+
+    ' Pick up a navigationStarted that arrived after this pump's queue drain (transport-only).
+    DrainNonBlockingRecorderQueue
+    If Not m_isRecording Or socket_ Is Nothing Then Exit Sub
+    nowMs = socket_.nowMs()
+
+    ' Applies to forceSample too: the tail sample at Stop must not hang on a navigating page.
+    If Len(m_discoveryNavPauseCtx) > 0 Then
+        If nowMs - m_discoveryNavPauseSinceMs < DISCOVERY_NAV_POLL_PAUSE_MAX_MS Then Exit Sub
+        m_discoveryNavPauseTimeouts = m_discoveryNavPauseTimeouts + 1
+        ClearDiscoveryNavPause
     End If
 
     Dim probeReady As Boolean
@@ -11279,7 +11385,11 @@ Private Function CaptureDiscoverySpaActivity(ByRef targetCtx As String, _
     If Len(targetCtx) = 0 Then GoTo ProbeUnavailable
 
     Dim probe As Dictionary
-    Set probe = QuerySpaProbe(targetCtx)
+    If m_discoveryManualPumpActive And Not discardChanges Then
+        Set probe = QuerySpaProbeForDiscoveryPoll(targetCtx)
+    Else
+        Set probe = QuerySpaProbe(targetCtx)
+    End If
 
     If Not discardChanges Then ProcessDiscoverySpaProbeChanges probe
     LogInvalidProbeSelectors probe, targetCtx
@@ -11402,6 +11512,7 @@ Private Sub ResetRecorderQueueStats()
     m_rqMaxLagMs = 0#: m_rqMaxLagArrivalSec = 0#
     m_rqLagOver1s = 0: m_rqLagOver5s = 0
     m_rqMaxDepth = 0
+    m_discoveryNavPauseCount = 0: m_discoveryNavPauseTimeouts = 0: m_discoveryPollQueryFailures = 0
     m_rqMaxDrainGapMs = 0#: m_rqMaxDrainGapEndSec = 0#: m_rqLastDrainEndMs = 0#
     m_rqLossBaseline = CurrentTotalAsyncEventLossCount()
     m_rqOversizeBaseline = SafeTransportOversizedEventCount()
@@ -11487,7 +11598,10 @@ Private Sub AppendRecorderQueueStats()
                      " | maxDrainGapEndAt=" & Format$(m_rqMaxDrainGapEndSec, "0.00") & "s" & _
                      " | parseMs=" & Format$(m_rqParseMs, "0") & " | avgParseUs=" & Format$(avgParseUs, "0") & _
                      " | fastPathMs=" & Format$(m_rqFastMs, "0") & " | avgFastPathUs=" & Format$(avgFastUs, "0") & _
-                     " | asyncLossSinceStart=" & lossText
+                     " | asyncLossSinceStart=" & lossText & _
+                     " | navPollPauses=" & CStr(m_discoveryNavPauseCount) & _
+                     " | navPauseTimeouts=" & CStr(m_discoveryNavPauseTimeouts) & _
+                     " | pollQueryFailures=" & CStr(m_discoveryPollQueryFailures)
 End Sub
 
 
@@ -11871,10 +11985,18 @@ Private Sub FormatAndStoreLog(ByVal json As Object, Optional ByRef rawText As St
             End If
 
         Case "browsingContext.load", "browsingContext.domContentLoaded"
+            ReleaseDiscoveryNavPause GetPathString(json, "params.context")
             Dim navUrl As String
             If Not TryGetScalarTextField(params, "url", navUrl) Then Exit Sub
+            If method = "browsingContext.domContentLoaded" Then
+                If StrComp(GetPathString(json, "params.context"), DiscoveryNavPauseTargetContext(), vbBinaryCompare) = 0 Then _
+                    m_discoveryNavPauseDocUrl = navUrl
+            End If
             ' Normalize navigation URLs so opaque authentication payloads cannot bloat the log.
-            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & NormalizeNavigationDetail(navUrl) & RecorderContextSuffix(params)
+            ' An initial about:blank document can report an empty URL (seen on a cross-origin iframe).
+            Dim navShown As String: navShown = NormalizeNavigationDetail(navUrl)
+            If Len(navShown) = 0 Then navShown = "(empty-url)"
+            LogLine = "[" & relTime & "] [NAV] " & Replace(method, "browsingContext.", "") & " - " & navShown & RecorderContextSuffix(params)
 
             ' Only a document load in the current render-evidence context invalidates that
             ' evidence/carryover state; unrelated iframe/tab loads must not erase this wait.
@@ -11903,6 +12025,8 @@ Private Sub FormatAndStoreLog(ByVal json As Object, Optional ByRef rawText As St
                                 If Not m_userActionContextUrlByContext Is Nothing Then _
                                     m_userActionContextUrlByContext(navCtx) = _
                                         NormalizeNavigationDetail(navUrl)
+                                If Not m_userActionCtxUrlByRealm Is Nothing Then _
+                                    m_userActionCtxUrlByRealm(readyRealmForDcl) = NormalizeNavigationDetail(navUrl)
                             End If
                             If m_userActionLastDclRealmByContext.Exists(navCtx) Then
                                 If StrComp(CStr(m_userActionLastDclRealmByContext(navCtx)), _
@@ -12378,6 +12502,45 @@ Private Sub AppendSuppressedSummary()
     End If
     On Error GoTo 0
 End Sub
+
+' v7.6: manual Discovery polling only. The same probe query as QuerySpaProbe, sent with a short
+' correlation bound, no recovery retry, no ambiguous retry and no context retarget. A query that
+' the browser holds across a navigation then costs at most DISCOVERY_POLL_COMMAND_TIMEOUT_MS and
+' logs no [RECOVERY]; the caller treats the error as "probe unavailable" and retries later.
+Private Function QuerySpaProbeForDiscoveryPoll(ByVal contextId As String) As Dictionary
+    On Error GoTo Failed
+    Dim targetDic As New Dictionary
+    targetDic.Add "context", contextId
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", WrapInSafetyShell(GetProbeJs("query"), DISCOVERY_POLL_COMMAND_TIMEOUT_MS)
+    params.Add "arguments", New Collection
+    params.Add "target", targetDic
+    params.Add "awaitPromise", True
+
+    Dim rawRes As String
+    rawRes = ExecuteBiDiCommand("script.callFunction", params, True, _
+                                allowAmbiguousRetry:=False, _
+                                allowRecoveryRetry:=False, _
+                                allowContextRetarget:=False, _
+                                commandTimeoutMs:=DISCOVERY_POLL_COMMAND_TIMEOUT_MS)
+    Dim json As Object: Set json = ValidateProtocolResponse(rawRes, "script.callFunction")
+    Dim procObj As Object: Set procObj = UnwrapSafetyShell(json, "script.callFunction")
+    Dim innerJsonStr As String
+    innerJsonStr = CStr(GetCleanResult(WebJsonConverter.ConvertToJson(procObj)))
+    If innerJsonStr = "" Then Exit Function
+
+    On Error Resume Next
+    Set QuerySpaProbeForDiscoveryPoll = WebJsonConverter.ParseJson(innerJsonStr)
+    On Error GoTo 0
+    Exit Function
+
+Failed:
+    Dim errNum As Long: errNum = Err.Number
+    Dim errSrc As String: errSrc = Err.source
+    Dim errDesc As String: errDesc = Err.description
+    m_discoveryPollQueryFailures = m_discoveryPollQueryFailures + 1
+    Err.Raise errNum, errSrc, errDesc
+End Function
 
 Private Function QuerySpaProbe(Optional ByVal contextId As String = "") As Dictionary
     Dim strRes As String
@@ -15886,6 +16049,8 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    const scrub=s=>String(s==null?'':s).replace(/[\r\n\t|]/g,' ').replace(/\s+/g,' ').trim();"
     js = js & "    const scrubAttr=s=>String(s==null?'':s).replace(/\r/g,'\\r').replace(/\n/g,'\\n').replace(/\t/g,'\\t').replace(/\|/g,'\\u007c');"
     js = js & "    const cut=(s,n)=>s.length>n?s.slice(0,n-3)+'...':s;"
+    ' v12: keep U+00A0 visible as the 6-char marker \u00a0 (XPath normalize-space() does not fold it).
+    js = js & "    const scrubText=s=>cut(scrub(String(s==null?'':s).replace(/\u00a0/g,'\u0001')),90).replace(/\u0001/g,'\\u00a0');"
     js = js & "    const safeUrl=raw=>{try{const u=new URL(String(raw||''),document.baseURI);"
     js = js & "      if(!/^https?:$/.test(u.protocol))return '[non-http-url]';"
     js = js & "      return cut(scrubAttr(u.origin+u.pathname),120);"
@@ -15916,12 +16081,17 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    const textOf = el => {"
     js = js & "      if (!el || el.nodeType!==1 || el.isContentEditable || /^(INPUT|TEXTAREA|SELECT|SCRIPT|STYLE|NOSCRIPT|TEMPLATE|TITLE|HEAD)$/.test(el.tagName)) return '';"
     js = js & "      const label = el.getAttribute('aria-label');"
-    js = js & "      if (label) return cut(scrub(label),90);"
+    js = js & "      if (label) return scrubText(label);"
     js = js & "      if (el.children && el.children.length>12) return '';"
-    js = js & "      return cut(scrub(el.innerText || el.textContent || ''),90);"
+    js = js & "      return scrubText(el.innerText || el.textContent || '');"
     js = js & "    };"
-    js = js & "    const isActionable = el => el && el.nodeType===1 && (/^(BUTTON|A|INPUT|SELECT|TEXTAREA|OPTION)$/.test(el.tagName) || /^(button|option|combobox|gridcell|tab|link|checkbox|radio|textbox|menuitem|listbox)$/i.test(el.getAttribute('role')||''));"
+    js = js & "    const isActionable = el => el && el.nodeType===1 && (/^(BUTTON|A|INPUT|SELECT|TEXTAREA|OPTION)$/.test(el.tagName) || (el.tagName==='LABEL' && !!el.control) || /^(button|option|combobox|gridcell|tab|link|checkbox|radio|textbox|menuitem|listbox)$/i.test(el.getAttribute('role')||''));"
     js = js & "    const pathOf = e => { try {return e.composedPath();} catch (_) {return [e.target];} };"
+    ' v12: k/n among same-tag element siblings under the same parent (a ShadowRoot counts as the
+    ' parent of its top-level elements); only for elements without an id and only when n > 1.
+    js = js & "    const siblingPos = el => { try { if (!el || el.nodeType!==1 || el.id) return ''; const par=el.parentNode; if (!par || !par.children) return '';"
+    js = js & "      const same=Array.prototype.filter.call(par.children, x => x.tagName===el.tagName); return same.length>1 ? (same.indexOf(el)+1)+'/'+same.length : ''; } catch (_) {return '';} };"
+    js = js & "    const labelControlOf = el => { try {const l=el&&el.closest?el.closest('label'):null;return l?l.control:null;} catch (_) {return null;} };"
     js = js & "    const snap = (e,kind) => {"
     js = js & "      const path=pathOf(e), els=path.filter(x=>x && x.nodeType===1);"
     js = js & "      const target=els[0]||null, found=els.find(isActionable)||null, actionable=found||target;"
@@ -15932,6 +16102,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "        if (!dialog && part && part.nodeType===1 && part.getAttribute('role')==='dialog') dialog=part;"
     js = js & "      }"
     js = js & "      const bits=['event='+kind,'target='+tag(target),'actionable='+(found?tag(found):'(none)')];"
+    js = js & "      { const sp=siblingPos(found||target); if (sp) bits.push('sibling='+sp); }"
     js = js & "      if (found) { if (textOf(found)) bits.push('text='+textOf(found)); }"
     js = js & "      else if (target && !/^(HTML|BODY)$/.test(target.tagName) && (target.children||[]).length<=3) { const tt=textOf(target); if (tt && tt.length<=60 && !tt.endsWith('...')) bits.push('targetText='+tt); }"
     js = js & "      bits.push('scope='+(shadowHost?'shadow':'document'));"
@@ -15969,7 +16140,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "      const line=bits.join(' | ');"
     js = js & "      return {t:performance.now(), kind, target, actionable, line:cut(line,940), confirmed:false};"
     js = js & "    };"
-    js = js & "    let seq=0,lastPointer=null,lastSelectChange=null;"
+    js = js & "    let seq=0,lastPointer=null,lastSelectChange=null,lastLabelClick=null;"
     js = js & "    const seenEvents=new WeakSet();"
     js = js & "    const firstSeen=e=>{if(seenEvents.has(e))return false;seenEvents.add(e);return true;};"
     js = js & "    const emit=(kind,number,line)=>{try{nativeInfo('__SVBA_USER_ACTION__'+"
@@ -15981,13 +16152,15 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "      const onShadowChange=e=>{try{"
     js = js & "        hookRoots(pathOf(e));if(!firstSeen(e))return;"
     js = js & "        const item=snap(e,'change');if(item)emit('change',++seq,item.line);"
+    js = js & "        const st=pathOf(e)[0];if(st&&st.tagName==='SELECT')lastSelectChange={target:st,t:performance.now()};"
     js = js & "      }catch(_){}};"
     js = js & "      root.addEventListener('change',onShadowChange,true);"
     js = js & "      cleanup.push(()=>root.removeEventListener('change',onShadowChange,true));"
     js = js & "      const onShadowFocus=e=>{try{"
     js = js & "        hookRoots(pathOf(e));if(!firstSeen(e))return;"
     js = js & "        const p=lastPointer,path=pathOf(e);"
-    js = js & "        if(p&&performance.now()-p.t<800&&path.includes(p.target))return;"
+    js = js & "        if(p&&performance.now()-p.t<800&&(path.includes(p.target)||path.includes(p.actionable)))return;"
+    js = js & "        if(lastLabelClick&&performance.now()-lastLabelClick.t<1000&&path[0]===lastLabelClick.control)return;"
     js = js & "        const item=snap(e,'focusin');if(item)emit('focusin',++seq,item.line);"
     js = js & "      }catch(_){}};"
     js = js & "      root.addEventListener('focusin',onShadowFocus,true);"
@@ -15995,7 +16168,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    }};"
     js = js & "    emit('installed',0,'');"
     js = js & "    const onDocumentPointer=e=>{try{hookRoots(pathOf(e));"
-    js = js & "      if(!firstSeen(e))return;lastSelectChange=null;"
+    js = js & "      if(!firstSeen(e))return;lastSelectChange=null;lastLabelClick=null;"
     js = js & "      const item=snap(e,'pointerdown');if(!item)return;item.seq=++seq;"
     js = js & "      lastPointer=item;emit('pointerdown',item.seq,item.line);"
     js = js & "    }catch(_){}};"
@@ -16004,9 +16177,11 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    const onDocumentClick=e=>{try{hookRoots(pathOf(e));"
     js = js & "      if(!firstSeen(e))return;"
     js = js & "      const p=lastPointer,path=pathOf(e),now=performance.now();"
+    js = js & "      if(lastLabelClick&&now-lastLabelClick.t<1000&&path[0]===lastLabelClick.control){lastLabelClick=null;return;}"
     js = js & "      if(lastSelectChange && now-lastSelectChange.t<350 &&"
     js = js & "         path.includes(lastSelectChange.target)){lastSelectChange=null;return;}"
     js = js & "      if(p&&now-p.t<1500&&(path.includes(p.target)||path.includes(p.actionable))){"
+    js = js & "        const lc=labelControlOf(p.target);lastLabelClick=(lc&&path[0]!==lc)?{control:lc,t:now}:null;"
     js = js & "        emit('click-confirm',p.seq,'');lastPointer=null;return;}"
     js = js & "      const item=snap(e,'click');if(item)emit('click',++seq,item.line);"
     js = js & "    }catch(_){}};"
@@ -16015,7 +16190,8 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    const onDocumentFocus=e=>{try{hookRoots(pathOf(e));"
     js = js & "      if(!firstSeen(e))return;"
     js = js & "      const p=lastPointer,path=pathOf(e);"
-    js = js & "      if(p&&performance.now()-p.t<800&&path.includes(p.target))return;"
+    js = js & "      if(p&&performance.now()-p.t<800&&(path.includes(p.target)||path.includes(p.actionable)))return;"
+    js = js & "      if(lastLabelClick&&performance.now()-lastLabelClick.t<1000&&path[0]===lastLabelClick.control)return;"
     js = js & "      const item=snap(e,'focusin');if(item)emit('focusin',++seq,item.line);"
     js = js & "    }catch(_){}};"
     js = js & "    document.addEventListener('focusin',onDocumentFocus,true);"
@@ -16029,7 +16205,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "    document.addEventListener('change',onDocumentChange,true);"
     js = js & "    cleanup.push(()=>document.removeEventListener('change',onDocumentChange,true));"
     js = js & "    globalThis[key].rehook=(keep)=>{try{"
-    js = js & "      if(!keep){lastPointer=null;lastSelectChange=null;}"
+    js = js & "      if(!keep){lastPointer=null;lastSelectChange=null;lastLabelClick=null;}"
     js = js & "      for(const [name,fn] of [['pointerdown',onDocumentPointer],['click',onDocumentClick],"
     js = js & "        ['focusin',onDocumentFocus],['change',onDocumentChange]]) {"
     js = js & "        document.removeEventListener(name,fn,true);document.addEventListener(name,fn,true);"
@@ -16339,6 +16515,21 @@ Private Sub HandleDiscoveryUserActionPushCore(ByVal json As Object, ByVal messag
         m_userActionMissingRealm = m_userActionMissingRealm + 1
     End If
 
+    ' The browser can re-deliver a page's earlier console entries (seen on Edge when Back
+    ' restored a page from the back/forward cache). Log each ctx/realm/kind/seq once.
+    If realmId <> "(missing)" And Not m_userActionSeenPushKeys Is Nothing Then
+        Dim pushKey As String
+        pushKey = contextId & "|" & realmId & "|" & kind & "|" & CStr(seq)
+        If m_userActionSeenPushKeys.Exists(pushKey) Then
+            m_userActionReplayDropped = m_userActionReplayDropped + 1
+            ' A re-delivered READY means the browser brought that realm back without a new load
+            ' (no [NAV]); make it the live document again and say so on the timeline.
+            If kind = "installed" Then NoteUserActionRealmRestored contextId, realmId, payload, relTime, arrival
+            Exit Sub
+        End If
+        m_userActionSeenPushKeys(pushKey) = True
+    End If
+
     If deferred Then arrival = " | scopeDeferred=true" & arrival
     Dim common As String
     common = "realm=" & realmId & " | seq=" & CStr(seq) & " | ctx=" & contextId
@@ -16377,6 +16568,7 @@ Private Sub HandleDiscoveryUserActionPushCore(ByVal json As Object, ByVal messag
                 End If
             End If
             m_userActionInstallCount = m_userActionInstallCount + 1
+            ReleaseDiscoveryNavPause contextId
             If contextId = m_recorderTopContextId Then _
                 m_userActionTopReadyCount = m_userActionTopReadyCount + 1
             PushTimelineLine "[" & relTime & "] [USER-ACTION-READY] " & common & _
@@ -16714,6 +16906,36 @@ Private Function IsPopupDisposeTarget(ByVal ctx As String) As Boolean
     End If
 End Function
 
+' Called when a READY is re-delivered for an already logged realm: on Edge this happens when
+' Back/Forward restores a page from the back/forward cache, which emits no load events.
+Private Sub NoteUserActionRealmRestored(ByVal contextId As String, ByVal realmId As String, _
+                                        ByVal payload As Object, ByVal relTime As String, _
+                                        ByVal arrival As String)
+    On Error GoTo Done
+    ReleaseDiscoveryNavPause contextId
+    If Not m_userActionReadyRealmByContext Is Nothing Then m_userActionReadyRealmByContext(contextId) = realmId
+    If Not m_userActionLastDclRealmByContext Is Nothing Then m_userActionLastDclRealmByContext(contextId) = realmId
+    If Not m_userActionPendingRebind Is Nothing Then
+        If m_userActionPendingRebind.Exists(contextId) Then m_userActionPendingRebind.Remove contextId
+    End If
+    Dim restoredUrl As String: restoredUrl = "(unobserved)"
+    If Not m_userActionCtxUrlByRealm Is Nothing Then
+        If m_userActionCtxUrlByRealm.Exists(realmId) Then restoredUrl = CStr(m_userActionCtxUrlByRealm(realmId))
+    End If
+    If Not m_userActionContextUrlByContext Is Nothing Then
+        If restoredUrl = "(unobserved)" Then
+            If m_userActionContextUrlByContext.Exists(contextId) Then m_userActionContextUrlByContext.Remove contextId
+        Else
+            m_userActionContextUrlByContext(contextId) = restoredUrl
+        End If
+    End If
+    PushTimelineLine "[" & relTime & "] [USER-ACTION-RESTORED] realm=" & realmId & " | ctx=" & contextId & _
+                     " | frameUrl=" & NormalizeNavigationDetail(GetPathString(payload, "url")) & _
+                     " | ctxUrl=" & restoredUrl & " | note=page shown again without a new load (Back/Forward cache)" & arrival
+Done:
+    Err.Clear
+End Sub
+
 Private Sub AppendUserActionStats()
     If Not m_captureUserActions Then Exit Sub
     If m_userActionTopReadyCount = 0 Then
@@ -16729,7 +16951,8 @@ Private Sub AppendUserActionStats()
                      " | rehooks=" & CStr(m_userActionRebindCount) & _
                      " | rehookErrors=" & CStr(m_userActionRebindErrors) & _
                      " | rehookGone=" & CStr(m_userActionRebindGone) & _
-                     " | cleanupWarnings=" & CStr(m_userActionCleanupWarnings)
+                     " | cleanupWarnings=" & CStr(m_userActionCleanupWarnings) & _
+                     " | replayDropped=" & CStr(m_userActionReplayDropped)
     If m_capturePopupActions Then
         Dim scopeCount As Long
         If Not m_popupScopeAllowed Is Nothing Then scopeCount = m_popupScopeAllowed.count
