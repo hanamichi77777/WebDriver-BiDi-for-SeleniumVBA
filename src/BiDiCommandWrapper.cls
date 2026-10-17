@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.6"
+Private Const BIDI_WRAPPER_VERSION As String = "7.7"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -261,6 +261,8 @@ Private m_discoveryNavPauseDocUrl As String     ' last DCL URL of the sampled to
 Private m_discoveryNavPauseCount As Long        ' [RECORDER-QUEUE-STATS] navPollPauses
 Private m_discoveryNavPauseTimeouts As Long     ' [RECORDER-QUEUE-STATS] navPauseTimeouts
 Private m_discoveryPollQueryFailures As Long    ' [RECORDER-QUEUE-STATS] pollQueryFailures
+Private m_discoveryPromptOpenCtxs As Dictionary ' contexts with an open JS dialog (DOM sampling paused)
+Private m_discoveryPromptPauseCount As Long     ' [RECORDER-QUEUE-STATS] promptPollPauses
 ' Opt-in, event-driven manual interaction evidence; no input text is captured.
 Private m_captureUserActions As Boolean
 Private m_actionSessionToken As String
@@ -466,6 +468,8 @@ Private m_downloadBatchTransactions As Dictionary
 Private m_lastDownloadFailureDiagnostic As Dictionary
 ' The optional recorder subscription is independent of batch download capture.
 Private m_recDownloadEventsAvailable As Boolean
+Private m_recPromptEventsAvailable As Boolean
+Private m_recPromptLineCount As Long  ' [USER-PROMPT-*] lines this recording (dialog LEGEND/guidance)
 
 ' browser.setDownloadBehavior is browser-side state that may outlive this wrapper/WebSocket.
 ' Once this wrapper attempts to change it, Shutdown must best-effort clear the global behavior
@@ -943,6 +947,9 @@ Private Sub DispatchGlobalEvents(ByVal json As Object, Optional ByRef rawText As
         Case "browsingContext.downloadEnd"
             Call HandleDownloadEndEvent(json)
 
+        Case "browsingContext.userPromptOpened", "browsingContext.userPromptClosed"
+            Call HandleUserPromptEvent(method, json)
+
         Case "browsingContext.contextCreated"
             Call HandleContextCreatedEvent(json)
 
@@ -1195,6 +1202,7 @@ Private Sub HandleContextDestroyedEvent(ByVal json As Object)
 
     InvalidateContextState eventCtx, True
     ReleaseDiscoveryNavPause eventCtx
+    NoteDiscoveryPromptEnded eventCtx
 
     ' A popup that closed before its observer check must not log a false ensure-failed.
     If Not m_popupEnsureDue Is Nothing Then
@@ -2978,6 +2986,132 @@ Public Function ExecuteHandleUserPrompt(ByVal accept As Boolean, Optional ByVal 
 
     ValidateProtocolResponse rawRes, "browsingContext.handleUserPrompt"
 End Function
+
+' ---- JS dialogs: answer set before the action ----
+' Requires a session created with unhandledPromptBehavior=ignore (SeleniumVBA:
+' caps.SetUnhandledPromptBehavior svbaIgnore). An action that opens alert/confirm/prompt does not
+' return while the dialog is open, so ExecuteHandleUserPrompt cannot follow it; arm the answer first:
+'     bidi.ArmUserPromptAnswer True                 ' OK; False = Cancel; True, "text" for prompt()
+'     bidi.ExecuteClick "//button[@id='delete']"
+'     If Not bidi.WaitUserPromptAnswer() Then Debug.Print bidi.UserPromptAnswerStatus
+'     bidi.DisarmUserPromptAnswer                   ' also on the error path
+' The arm answers the first dialog opened in contextId (default: the current target tab) or in a
+' frame that tab has when arming. It stays armed until that dialog arrives or
+' DisarmUserPromptAnswer, so a dialog opened later by a timer is still answered. userText is sent
+' only to prompt(). Dialogs in other tabs are left alone.
+Public Sub ArmUserPromptAnswer(ByVal accept As Boolean, _
+                               Optional ByVal userText As String = "", _
+                               Optional ByVal contextId As String = "")
+    If socket_ Is Nothing Then
+        Err.Raise ERR_ACTION_FAILED, "BiDi:ArmUserPromptAnswer", "The wrapper is not connected."
+    End If
+
+    Dim targetCtx As String
+    targetCtx = ResolveTargetContext(contextId)
+
+    ' The communicator answers from the raw event, so the subscription is all it needs.
+    Call Me.ExecuteSessionSubscribe(Array("browsingContext.userPromptOpened", _
+                                          "browsingContext.userPromptClosed"), , True)
+
+    ' A dialog reports the frame that opened it, so the tab's current frames are accepted too.
+    Dim frameIds As String
+    frameIds = UserPromptFrameContextIds(targetCtx)
+
+    socket_.ArmUserPromptAnswer accept, targetCtx, userText, frameIds
+    LogSignalLine "[USER-PROMPT-ARM] accept=" & IIf(accept, "true", "false") & _
+                  " | userTextLen=" & CStr(Len(userText)) & PromptContextSuffix(targetCtx)
+End Sub
+
+' "|id|id|" of the frames under topCtx (empty when it has none or getTree fails; the arm then
+' covers the top-level document only).
+Private Function UserPromptFrameContextIds(ByVal topCtx As String) As String
+    On Error GoTo Unavailable
+    Dim params As New Dictionary
+    params.Add "root", topCtx
+
+    Dim tree As Object
+    Set tree = ValidateProtocolResponse( _
+        ExecuteBiDiCommand("browsingContext.getTree", params, True), "browsingContext.getTree")
+
+    Dim contexts As Collection
+    Set contexts = GetPathObject(tree, "result.contexts")
+    If contexts Is Nothing Then Exit Function
+
+    Dim ids As New Collection
+    Dim node As Variant
+    For Each node In contexts
+        If IsObject(node) Then CollectDiscoveryActionContextIds node, ids
+    Next node
+
+    Dim s As String
+    Dim v As Variant
+    For Each v In ids
+        If StrComp(CStr(v), topCtx, vbBinaryCompare) <> 0 Then s = s & "|" & CStr(v)
+    Next v
+    If Len(s) > 0 Then s = s & "|"
+    UserPromptFrameContextIds = s
+    Exit Function
+
+Unavailable:
+    UserPromptFrameContextIds = vbNullString
+End Function
+
+Public Sub DisarmUserPromptAnswer()
+    If socket_ Is Nothing Then Exit Sub
+    Dim before As String
+    before = socket_.UserPromptAnswerState
+    socket_.DisarmUserPromptAnswer
+    If before = "armed" Then
+        If socket_.UserPromptOtherContextCount > 0 Then
+            LogSignalLine "[USER-PROMPT-DISARM] unused=true | otherContextPrompts=" & _
+                          CStr(socket_.UserPromptOtherContextCount) & _
+                          " | lastOtherCtx=" & Left$(socket_.UserPromptLastOtherContext, 8)
+        Else
+            LogSignalLine "[USER-PROMPT-DISARM] unused=true"
+        End If
+    End If
+End Sub
+
+' Receives until the armed answer is acknowledged. True only for state=answered; False on
+' timeout, when nothing is armed, or for any other outcome (see UserPromptAnswerStatus).
+' Does not disarm.
+Public Function WaitUserPromptAnswer(Optional ByVal timeoutMs As Long = 10000) As Boolean
+    If socket_ Is Nothing Then Exit Function
+    Dim deadline As Double
+    deadline = socket_.nowMs() + timeoutMs
+    Do
+        Select Case socket_.UserPromptAnswerState
+            Case "answered"
+                WaitUserPromptAnswer = True
+                Exit Function
+            Case "armed", "sent"
+            Case Else
+                Exit Function
+        End Select
+        If socket_.nowMs() >= deadline Then Exit Function
+        socket_.IdleReceive 50
+        If m_isRecording Then DrainNonBlockingRecorderQueue
+    Loop
+End Function
+
+' (none) | armed | sent | answered | protocol-error | send-failed | auto-handled | disarmed |
+' cleared | hook-error. auto-handled = the session's handler was not ignore, so the browser had
+' already closed the dialog and nothing was sent.
+Public Property Get UserPromptAnswerState() As String
+    If socket_ Is Nothing Then
+        UserPromptAnswerState = "(none)"
+    Else
+        UserPromptAnswerState = socket_.UserPromptAnswerState
+    End If
+End Property
+
+Public Property Get UserPromptAnswerStatus() As String
+    If socket_ Is Nothing Then
+        UserPromptAnswerStatus = "state=(none)"
+    Else
+        UserPromptAnswerStatus = socket_.UserPromptAnswerStatus
+    End If
+End Property
 
 Private Function IsExpectedNoUserPromptResponse(ByVal jsonRaw As String) As Boolean
     Dim json As Object
@@ -7429,6 +7563,7 @@ Private Sub ResetSessionBoundaryState()
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     ClearDiscoveryNavPause
+    ClearDiscoveryPromptPause
     m_captureUserActions = False
     ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
@@ -10432,6 +10567,17 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
         m_activeSubscriptions.Exists("browsingContext.downloadWillBegin") And _
         m_activeSubscriptions.Exists("browsingContext.downloadEnd")
 
+    ' JS dialog events are optional in the same way.
+    Dim stagedPromptEventsAvailable As Boolean
+    On Error Resume Next
+    Call Me.ExecuteSessionSubscribe(Array( _
+        "browsingContext.userPromptOpened", "browsingContext.userPromptClosed"), , True)
+    Err.Clear
+    On Error GoTo StartFailed
+    stagedPromptEventsAvailable = _
+        m_activeSubscriptions.Exists("browsingContext.userPromptOpened") And _
+        m_activeSubscriptions.Exists("browsingContext.userPromptClosed")
+
     ' Body capture is opt-in and capability-probed by attempting the collector once. Failure does
     ' not disable the ordinary Discovery recorder. A previous unconfirmed collector cleanup blocks
     ' creation of another collector so we never accumulate browser-side collectors blindly.
@@ -10517,6 +10663,8 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     ResetRecorderRequestHopRunState
     m_recorderTopContextId = stagedRecorderCtx
     m_recDownloadEventsAvailable = stagedDownloadEventsAvailable
+    m_recPromptEventsAvailable = stagedPromptEventsAvailable
+    m_recPromptLineCount = 0
     m_bodyCaptureRequested = captureResponseBodies
     m_bodyCaptureActive = stagedBodyCaptureActive
     m_bodyCaptureUnavailableReason = stagedBodyUnavailableReason
@@ -10543,6 +10691,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     ClearDiscoveryNavPause
+    ClearDiscoveryPromptPause
     m_discoveryNavPauseDocUrl = vbNullString
     m_discoveryStopRequested = False
     m_discoveryStopTabDestroyed = False
@@ -10724,6 +10873,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         m_discoveryDomContextId = vbNullString
         m_nextDiscoveryDomPollMs = 0#
         ClearDiscoveryNavPause
+        ClearDiscoveryPromptPause
         m_captureUserActions = False
         ResetPopupActionScopeState
         m_actionSessionToken = vbNullString
@@ -10766,6 +10916,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
                       " | userActionScript=" & USER_ACTION_SCRIPT_VERSION & _
                       IIf(m_capturePopupActions, " | popupActions=True", "") & _
                       " | downloadEvents=" & DiscoveryDownloadEventsStatus() & _
+                      " | promptEvents=" & IIf(m_recPromptEventsAvailable, "on", "unavailable") & _
                       " | recorderCtx=" & IIf(Len(m_recorderTopContextId) > 0, m_recorderTopContextId, "unresolved") & vbCrLf
         If m_bodyCaptureRequested Then
             stm.writeText "BODY-CONFIG | requested=True | active=" & bodyCaptureWasActive & _
@@ -10813,6 +10964,10 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | downloadEvents=on means both BiDi download events were subscribed; unavailable means the recorder cannot determine whether downloads occurred. [DOWNLOAD-WILL-BEGIN] and [DOWNLOAD-END] correlate by download/navigation IDs (download may be (missing); then match by context+navigation); [DOWNLOAD-END] status=complete is browser-reported, not a disk verification. URL keys are normalized; filepath is a basename only. Filenames and paths can still disclose sensitive details; review before sharing." & vbCrLf
         stm.writeText "LEGEND | A [RES] 200 followed by [ERR] net::ERR_ABORTED for a file may reflect handoff to native download handling; this pair ALONE proves neither successful nor failed download. Check [DOWNLOAD-END] when downloadEvents=on." & vbCrLf
         stm.writeText "LEGEND | [NAV-TARGET] = the URL passed to ExecuteNavigateAndGetStatus while recording, logged as given (query and fragment included). Review before sharing." & vbCrLf
+        If m_recPromptLineCount > 0 Then
+            stm.writeText "LEGEND | [USER-PROMPT-OPENED]/[USER-PROMPT-CLOSED] = a JavaScript alert/confirm/prompt/beforeunload dialog. handler= is the session's unhandledPromptBehavior for that dialog: ignore = the dialog stayed open until a person (or an armed answer) closed it, and accepted= on CLOSED is that choice; accept/dismiss = the browser closed it at once, so accepted= reflects the session setting, not a human choice. messageLen/defaultValueLen/userTextLen are character counts only: dialog text and typed prompt text are never logged. ctx= follows the network-line rule." & vbCrLf
+            stm.writeText "LEGEND | Manual [SPA-ACT] DOM sampling pauses while any dialog is open; promptPollPauses (in [RECORDER-QUEUE-STATS], shown when nonzero) counts those pauses. [USER-PROMPT-ARM]/[USER-PROMPT-DISARM] appear when automation armed an answer with ArmUserPromptAnswer; DISARM unused=true means no dialog consumed it; otherContextPrompts= counts dialogs it skipped because they opened in another tab." & vbCrLf
+        End If
         If m_captureUserActions Then
             stm.writeText "LEGEND | [USER-ACTION] records opt-in manual pointerdown/click/focusin/change event snapshots with target/actionable/ancestor/child/shadowHost clues. These are not verified XPaths; closed Shadow Roots may be opaque and ctx may change after navigation. " & vbCrLf
             stm.writeText "LEGEND | Typed input contents are NEVER collected by this observer: valueLen= carries character counts only. For INPUT types button/submit/reset/image, the displayed value attribute may be recorded (max 96 chars); other INPUT values are shown as (len=N). On select change, selectedText= can include page-defined option labels, which may contain personal information. Unknown attribute values are omitted; only data-testid, data-test, data-qa, data-cy, and date-shaped data-iso expose data-* values (capped); other data-* attributes retain names only. URL attributes/frameUrl are resolved against the page base URL (where applicable), sanitized to origin+pathname, and capped; query and fragment are omitted. These are NOT literal DOM attributes. " & vbCrLf
@@ -10821,7 +10976,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate, as are the click and focusin that a clicked <label> forwards to its control (the label click is the action; the control's change still follows). [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
             stm.writeText "LEGEND | A pointerdown with no [USER-ACTION-CONFIRM] can be a drag: HTML5 drag-and-drop, a slider, a scrollbar, or a text selection. Drops, scrolling, hover, and individual key presses (Enter, Tab, Esc, arrows) are not recorded, and neither are edits inside contenteditable editors (for example rich-text editors in an iframe). Do not replay such a pointerdown as a click without checking the live page." & vbCrLf
             stm.writeText "LEGEND | replayDropped (in [USER-ACTION-STATS]) counts action pushes the browser delivered again for the same realm and seq; each is logged only once. On Edge this happened when Back restored a page from the back/forward cache: no [NAV] appears, and [USER-ACTION-RESTORED] marks the page shown again. Replay that step with history navigation (ExecuteTraverseHistory), not a fresh navigate." & vbCrLf
-            stm.writeText "LEGEND | event=focusin means an element gained focus, not necessarily an explicit user action. It may occur when focus returns to the opener after a popup closes, or after a keyboard Tab move. It also fires on the element that last had focus whenever the browser window or tab regains focus, including after Back shows a cached page ([USER-ACTION-RESTORED]); such a focusin is not a user action. Do not replay focusin alone as a click or keystroke; interpret it using surrounding actions and context transitions." & vbCrLf
+            stm.writeText "LEGEND | event=focusin means an element gained focus, not necessarily an explicit user action. It may occur when focus returns to the opener after a popup closes, when a JS dialog closes, or after a keyboard Tab move. It also fires on the element that last had focus whenever the browser window or tab regains focus, including after Back shows a cached page ([USER-ACTION-RESTORED]); such a focusin is not a user action. Do not replay focusin alone as a click or keystroke; interpret it using surrounding actions and context transitions." & vbCrLf
             stm.writeText "LEGEND | actionable=(none) means no button, link, form control, label with a control, or ARIA widget role was on the event path (page background, a text-selection drag, or a custom clickable element without a role). Such lines carry no text=/children=; targetText= appears only when the target is not html/body, has at most 3 child elements, and its whole visible text is 60 chars or less (a short label, never a container dump). Do NOT turn an actionable=(none) line into a replay step without confirming it against the live DOM." & vbCrLf
             stm.writeText "LEGEND | sibling=k/n gives the position of the actionable element (or the target when actionable=(none)) among its parent's child elements with the same tag, as in XPath parent/button[k]. It appears only for elements without an id that have same-tag siblings, and it is the position at event time, not a stable locator; prefer text or attributes when they are distinctive. In text=/targetText=, \u00a0 marks a non-breaking space (U+00A0) that the page text really contains. XPath normalize-space() does not treat it as a space: build such text in VBA with ChrW(160), or match the words around it with contains()." & vbCrLf
             If m_capturePopupActions Then
@@ -10977,6 +11132,18 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "   - For iframe actions, use ctx and ctxUrl as context hints; frameUrl may become a writer URL after document.open(), and neither URL alone proves a frame locator. Verify the live context tree before replay; a frameUrl does not form a cross-frame XPath. Timing proximity alone does not prove causality." & _
                           IIf(m_capturePopupActions, " Popup/new-tab actions are covered only for contexts listed by [USER-ACTION-SCOPE] status=added; switch to that ctx before replaying them.", " New popup windows outside the recorder top context are not covered.") & vbCrLf
         End If
+        If m_recPromptLineCount > 0 Then
+            stm.writeText vbCrLf & "JS dialogs ([USER-PROMPT-OPENED] lines are present) -- rules for replay code:" & vbCrLf
+            stm.writeText "   - Create the session with caps.SetUnhandledPromptBehavior svbaIgnore before driver.OpenBrowser. With the default behavior the browser dismisses the dialog before VBA can answer it." & vbCrLf
+            stm.writeText "   - The action that opens a dialog does not return until the dialog closes, so ExecuteHandleUserPrompt cannot follow it. Arm the answer immediately before that action (the action just before [USER-PROMPT-OPENED]):" & vbCrLf
+            stm.writeText "       bidi.ArmUserPromptAnswer <accepted of the matching [USER-PROMPT-CLOSED]>[, ""<prompt text>""]" & vbCrLf
+            stm.writeText "       <the action>" & vbCrLf
+            stm.writeText "       If Not bidi.WaitUserPromptAnswer() Then Debug.Print bidi.UserPromptAnswerStatus" & vbCrLf
+            stm.writeText "       bidi.DisarmUserPromptAnswer   ' also in the error handler, so no armed answer is left behind" & vbCrLf
+            stm.writeText "   - Copy accepted= only when the OPENED line shows handler=ignore. For handler=accept/dismiss the value came from the session setting; ask the user which answer is intended." & vbCrLf
+            stm.writeText "   - Pass a text only for type=prompt whose CLOSED line has userTextLen. The log carries the length only: ASK THE USER for the text." & vbCrLf
+            stm.writeText "   - ctx=other:... marks a dialog from a frame or another tab. An arm covers its tab and the frames that tab has when armed; for a dialog in another tab, pass that tab's context id as the third argument (contextId). An arm that no dialog consumes leaves the action waiting until its command timeout (Err 604) with the dialog still open." & vbCrLf
+        End If
         stm.writeText "=== END REQUEST ===" & vbCrLf
         stm.writeText "--------------------------------------------------------" & vbCrLf
 
@@ -11020,6 +11187,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     ClearDiscoveryNavPause
+    ClearDiscoveryPromptPause
     m_captureUserActions = False
     ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
@@ -11076,6 +11244,7 @@ StopFailedCleanup:
     m_discoveryDomContextId = vbNullString
     m_nextDiscoveryDomPollMs = 0#
     ClearDiscoveryNavPause
+    ClearDiscoveryPromptPause
     m_captureUserActions = False
     ResetPopupActionScopeState
     m_actionSessionToken = vbNullString
@@ -11340,6 +11509,99 @@ Private Sub ClearDiscoveryNavPause()
     m_discoveryNavPauseSinceMs = 0#
 End Sub
 
+' ---- v7.7: pause manual DOM sampling while a JS dialog is open (any context: a dialog in an
+' opener-linked popup can block the sampled page as well) ----
+Private Sub NoteDiscoveryPromptOpened(ByVal contextId As String)
+    If Not m_isRecording Then Exit Sub
+    If Len(contextId) = 0 Then Exit Sub
+    If m_discoveryPromptOpenCtxs Is Nothing Then Set m_discoveryPromptOpenCtxs = New Dictionary
+    If m_discoveryPromptOpenCtxs.count = 0 And m_discoveryDomCaptureEnabled And _
+       m_discoveryManualPumpActive Then m_discoveryPromptPauseCount = m_discoveryPromptPauseCount + 1
+    m_discoveryPromptOpenCtxs(contextId) = True
+End Sub
+
+' Dialog closed, or its context was destroyed.
+Private Sub NoteDiscoveryPromptEnded(ByVal contextId As String)
+    If m_discoveryPromptOpenCtxs Is Nothing Then Exit Sub
+    If Not m_discoveryPromptOpenCtxs.Exists(contextId) Then Exit Sub
+    m_discoveryPromptOpenCtxs.Remove contextId
+    If m_discoveryPromptOpenCtxs.count = 0 Then m_nextDiscoveryDomPollMs = 0#
+End Sub
+
+Private Function DiscoveryPromptOpenCount() As Long
+    If m_discoveryPromptOpenCtxs Is Nothing Then Exit Function
+    DiscoveryPromptOpenCount = m_discoveryPromptOpenCtxs.count
+End Function
+
+Private Sub ClearDiscoveryPromptPause()
+    Set m_discoveryPromptOpenCtxs = Nothing
+End Sub
+
+' browsingContext.userPromptOpened / userPromptClosed. Message, default value and typed text are
+' reduced to lengths; the typed text itself is never logged.
+Private Sub HandleUserPromptEvent(ByVal method As String, ByVal json As Object)
+    Dim p As Object
+    Set p = GetPathObject(json, "params")
+    If p Is Nothing Then Exit Sub
+
+    Dim ctx As String
+    Call TryGetScalarTextField(p, "context", ctx)
+
+    Dim line As String
+    If method = "browsingContext.userPromptOpened" Then
+        NoteDiscoveryPromptOpened ctx
+        line = "[USER-PROMPT-OPENED] type=" & PromptEventText(p, "type") & _
+               " | handler=" & PromptEventText(p, "handler") & _
+               " | messageLen=" & CStr(Len(PromptEventText(p, "message"))) & _
+               " | defaultValueLen=" & CStr(Len(PromptEventText(p, "defaultValue")))
+    Else
+        NoteDiscoveryPromptEnded ctx
+        line = "[USER-PROMPT-CLOSED] type=" & PromptEventText(p, "type") & _
+               " | accepted=" & PromptEventBool(p, "accepted")
+        If p.Exists("userText") Then
+            line = line & " | userTextLen=" & CStr(Len(PromptEventText(p, "userText")))
+        End If
+    End If
+    line = line & PromptContextSuffix(ctx)
+
+    If m_debugMode Then Debug.Print "BiDi: " & line
+    If m_isRecording Then
+        m_recPromptLineCount = m_recPromptLineCount + 1
+        PushTimelineLine "[" & Format$(RecorderRelativeSeconds(), "0.00") & "s] " & line & EventArrivalSuffix()
+    End If
+End Sub
+
+' Same marking rule as network lines: unmarked = the recorder top-level context.
+Private Function PromptContextSuffix(ByVal contextId As String) As String
+    If Len(contextId) = 0 Then
+        PromptContextSuffix = " | ctx=(empty)"
+    ElseIf Len(m_recorderTopContextId) > 0 And m_isRecording Then
+        If StrComp(contextId, m_recorderTopContextId, vbBinaryCompare) <> 0 Then _
+            PromptContextSuffix = " | ctx=other:" & Left$(contextId, 8)
+    ElseIf Not m_isRecording Then
+        PromptContextSuffix = " | ctx=" & Left$(contextId, 8)
+    End If
+End Function
+
+Private Function PromptEventText(ByVal p As Object, ByVal key As String) As String
+    On Error GoTo Done
+    If Not p.Exists(key) Then Exit Function
+    If IsObject(p(key)) Then Exit Function
+    If IsNull(p(key)) Then Exit Function
+    PromptEventText = CStr(p(key))
+Done:
+End Function
+
+Private Function PromptEventBool(ByVal p As Object, ByVal key As String) As String
+    On Error GoTo Unknown
+    If Not p.Exists(key) Then GoTo Unknown
+    If VarType(p(key)) <> vbBoolean Then GoTo Unknown
+    PromptEventBool = IIf(p(key), "true", "false")
+    Exit Function
+Unknown:
+    PromptEventBool = "(unknown)"
+End Function
+
 Private Sub PollDiscoverySpaActivityIfDue(Optional ByVal forceSample As Boolean = False)
     If Not m_isRecording Then Exit Sub
     If Not m_discoveryDomCaptureEnabled Then Exit Sub
@@ -11367,6 +11629,9 @@ Private Sub PollDiscoverySpaActivityIfDue(Optional ByVal forceSample As Boolean 
         m_discoveryNavPauseTimeouts = m_discoveryNavPauseTimeouts + 1
         ClearDiscoveryNavPause
     End If
+
+    ' An open JS dialog blocks page scripts; a probe query would only run into its 2 s bound.
+    If DiscoveryPromptOpenCount() > 0 Then Exit Sub
 
     Dim probeReady As Boolean
     probeReady = CaptureDiscoverySpaActivity(m_discoveryDomContextId)
@@ -11513,6 +11778,7 @@ Private Sub ResetRecorderQueueStats()
     m_rqLagOver1s = 0: m_rqLagOver5s = 0
     m_rqMaxDepth = 0
     m_discoveryNavPauseCount = 0: m_discoveryNavPauseTimeouts = 0: m_discoveryPollQueryFailures = 0
+    m_discoveryPromptPauseCount = 0
     m_rqMaxDrainGapMs = 0#: m_rqMaxDrainGapEndSec = 0#: m_rqLastDrainEndMs = 0#
     m_rqLossBaseline = CurrentTotalAsyncEventLossCount()
     m_rqOversizeBaseline = SafeTransportOversizedEventCount()
@@ -11601,7 +11867,8 @@ Private Sub AppendRecorderQueueStats()
                      " | asyncLossSinceStart=" & lossText & _
                      " | navPollPauses=" & CStr(m_discoveryNavPauseCount) & _
                      " | navPauseTimeouts=" & CStr(m_discoveryNavPauseTimeouts) & _
-                     " | pollQueryFailures=" & CStr(m_discoveryPollQueryFailures)
+                     " | pollQueryFailures=" & CStr(m_discoveryPollQueryFailures) & _
+                     IIf(m_discoveryPromptPauseCount > 0, " | promptPollPauses=" & CStr(m_discoveryPromptPauseCount), "")
 End Sub
 
 
@@ -17026,6 +17293,8 @@ Public Sub Shutdown(Optional ByVal ForceClose As Boolean = True)
     ' ClearState remains guarded because it is not teardown and must not erase a live capture.
     On Error Resume Next
     AbandonExclusiveCaptureForShutdownBestEffort
+    ' An armed dialog answer and its prompt text never outlive the session.
+    socket_.DisarmUserPromptAnswer
 
     ' Shutdown is best-effort from this point; cleanup must continue even after detach or
     ' close failure.

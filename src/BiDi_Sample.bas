@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 7.6 / MIT License / Copyright (c) hanamichi77777
+' Version 7.7 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -387,8 +387,8 @@ End Sub
 ' Wait for the page to settle before each action; typed input values are not logged.
 ' Popups and new tabs opened from the target are recorded too (capturePopupActions
 ' defaults to True); [USER-ACTION-SCOPE] status=added lines list those contexts.
-' alert/confirm/prompt dialogs may be closed automatically while recording,
-' depending on the browser and the session's prompt handling.
+' alert/confirm/prompt dialogs stay open for you to answer (unhandledPromptBehavior=ignore);
+' [USER-PROMPT-OPENED]/[USER-PROMPT-CLOSED] lines record the type and your OK/Cancel choice.
 ' No worksheet button or UserForm is needed.
 Public Sub Main09()
     Const MAX_RECORDING_SECONDS As Long = 300
@@ -415,6 +415,7 @@ Public Sub Main09()
     driver.StartEdge
     Set caps = driver.CreateCapabilities
     caps.AddArguments "--start-maximized"
+    caps.SetUnhandledPromptBehavior svbaIgnore   ' leave JS dialogs open for the person recording
     caps.EnableBiDiMode
     driver.OpenBrowser caps
 
@@ -440,7 +441,10 @@ Public Sub Main09()
     stoppedFromControl = bidi.DiscoveryStopRequested
 
     ' Close the control tab before saving; this does not discard the already logged stop event.
+    ' A dialog left open in the target tab is cancelled first so cleanup scripts can run.
     On Error Resume Next
+    bidi.ExecuteHandleUserPrompt False
+    Err.Clear
     bidi.CloseDiscoveryStopTab
     If Err.Number <> 0 Then closeFailure = Err.description
     Err.Clear

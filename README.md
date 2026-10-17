@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v7.6
+# WebDriver BiDi for SeleniumVBA v7.7
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -67,11 +67,12 @@ Setup and import instructions, the getting-started guide, and the API reference 
 * **Use explicit completion signals for important actions.** When a specific DOM rewrite or network response marks completion, arm `ArmContentSignal` and/or `ArmNetworkSignal` immediately before the action. A targeted signal is safer than relying on quietness alone. `ArmNetworkSignal` can also be armed before `ExecuteNavigateAndGetStatus` to gate the post-navigation wait; `ArmContentSignal` and `ArmVisibilitySignal` cannot, because navigation destroys their page-side observers.
 * **This project is not intended for large-scale parallel browser execution.** It is optimized for precise control and observation of one browser, or a small number of sessions, rather than dozens or hundreds of concurrent browsers.
 * **The browser print preview is not reachable through BiDi.** On Edge 154 (observed 2026-10-03), the print preview opened by `window.print()` (`edge://print/`) appears as a CDP target and as a classic WebDriver window handle, but not in the BiDi `browsingContext.getTree`. Operate the print dialog through classic SeleniumVBA.
+* **JavaScript dialogs need their answer set before the action.** With `svbaIgnore`, a click that opens `alert`, `confirm`, or `prompt` does not return while the dialog is open. `ArmUserPromptAnswer` before the click answers it; without a matching answer the click fails after its command timeout (Err 604, about 30 s) and the dialog stays open. An answer covers its tab and the frames the tab has when it is set, not other tabs.
 * **Idle-ignore patterns require careful selection.** An overly broad `AddIdleIgnoreNetworkPattern` rule can exclude meaningful requests and cause an early `STABLE` result.
 * **Limits of the manual action recorder.** The recorder sees what the page's DOM events report, not your intent.
   * Typed text is not recorded, only its length. Tell the AI what you typed.
   * A click that the page performs itself with `element.click()` is recorded in the same form as a click you made. Tell the AI which clicks were yours, or replay code may repeat the page's own clicks.
-  * `alert`, `confirm`, and `prompt` dialogs may close by themselves during a recording (observed on Edge; this depends on the browser and the WebDriver session's prompt setting).
+  * `alert`, `confirm`, and `prompt` dialogs are recorded with their type and your OK/Cancel choice; for `prompt`, only the length of the typed text is kept. `Main09` leaves dialogs open for you (`svbaIgnore`); with the default session setting the browser closes them at once.
   * After a frame is rewritten with `document.open()`, or after some popups load, the recorder's listeners are attached a moment later (about 0.1–0.5 s). An action within that gap may be missed, so let each page settle before operating it.
   * Not recorded: drag-and-drop drops, scrolling, hover, individual key presses (Enter, Tab, Esc), and typing inside rich-text (`contenteditable`) editors. A pointerdown with no click confirmation in the log can mean a drag, a scrollbar, or a text selection.
   * The log keeps labels, button text, the text of chosen options, and the start URL with its query. Review the whole log before sharing it.
@@ -168,6 +169,7 @@ This procedure records the initial page load and the manual browser actions that
 * **Elements you operate:** `captureUserActions:=True` records each click, focus, and change as a `[USER-ACTION]` line with the element's locator attributes, so an AI can build XPaths from the log. Elements without an `id` that sit among same-tag siblings also get their position (`sibling=2/3`), and a non-breaking space in their text is shown as `\u00a0`.
 * **Popups, new tabs, frames, and downloads:** Actions in frames, in popups and new tabs opened from the target page, and downloads started during the recording appear on the same timeline. A page shown again with the browser's Back button is marked `[USER-ACTION-RESTORED]`.
 * **Slow pages do not stall the recorder:** DOM sampling pauses while the page navigates, so actions and network lines keep their timing even when a server takes several seconds to respond.
+* **JavaScript dialogs:** The session is created with `svbaIgnore`, so `alert`, `confirm`, and `prompt` stay open for you to answer. The log records the type and your choice (`[USER-PROMPT-OPENED]`/`[USER-PROMPT-CLOSED]`), and DOM sampling pauses while a dialog is open.
 * **Ending the recording:** A separate STOP tab ends the recording when you click **STOP RECORDING** or close the tab. Nothing is added to the target page. `MAX_RECORDING_SECONDS` (default: 300) is only a safety limit.
 * **Filtering is not blocking:** `excludeImagesAndCss=True` removes common image/CSS entries from the saved diagnostic stream; it does not prevent those resources from loading in the page.
 * **How to use the result:** Use `discovery_log.txt` to decide what should be blocked, ignored, armed, or verified. Do not choose a completion signal from its name alone; confirm its timing and relation to the resulting DOM change.

@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "7.6"
+Private Const BIDI_SOCKET_VERSION As String = "7.7"
 Private m_jpUseDouble As Boolean, m_jpUnquoted As Boolean
 Private m_jpBsNext As Long
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
@@ -42,6 +42,7 @@ Private Declare PtrSafe Function QueryPerformanceFrequency Lib "kernel32" (lpFre
 
 ' IDs [1..99] are reserved for PostScript and rotating heartbeat traffic.
 ' Commands use [CMD_ID_FLOOR..ID_MAX]; id-less BiDi events are not system replies.
+' An armed dialog answer takes a normal command id; its reply is matched in DropLateOrUnknownResponse.
 ' Reserved-band replies are consumed at both receive sites.
 Private Const CMD_ID_FLOOR As Long = 100         ' command ids: [100 .. ID_MAX]
 Private Const ID_MAX As Long = 2000000000        ' wrap ceiling (within VBA Long range)
@@ -95,6 +96,21 @@ Private m_isRaisingStateChanged As Boolean ' Suppresses lifecycle re-entry from 
 Private m_isCommandUiYielding As Boolean ' True only while SendAndReceive temporarily yields to Office
 Private m_isConnectUiYielding As Boolean ' True only while a Connect wait temporarily yields to Office
 Private m_isTerminating As Boolean ' True only during Class_Terminate; state updates continue but events are suppressed
+' Armed JS dialog answer (ArmUserPromptAnswer). One-shot; see TryAnswerArmedUserPrompt.
+Private m_promptArmActive As Boolean
+Private m_promptArmAccept As Boolean
+Private m_promptArmUserText As String
+Private m_promptArmContextId As String     ' top-level context whose dialog is answered
+Private m_promptArmFrameIds As String      ' |id|id| frames of that context at arm time
+Private m_promptArmState As String         ' see UserPromptAnswerState
+Private m_promptArmArmedAtMs As Double
+Private m_promptArmFiredAtMs As Double
+Private m_promptArmType As String
+Private m_promptArmHandler As String
+Private m_promptArmReplyId As String       ' normal command id of the pending handleUserPrompt
+Private m_promptArmError As String
+Private m_promptArmOtherContextCount As Long
+Private m_promptArmLastOtherContext As String
 
 Public Enum BiDiSocketState
     StateDisconnected = 0
@@ -117,7 +133,7 @@ Private m_state As BiDiSocketState
 ' a later connection of the same session, so owners compare this value to detect that a
 ' recovered transport no longer carries the events they subscribed to.
 Private m_connectionGeneration As Long
-Public Event StateChanged(ByVal NewState As BiDiSocketState, ByVal StateName As String)
+Public Event StateChanged(ByVal newState As BiDiSocketState, ByVal StateName As String)
 
 ' Each FIFO item is Array(message, arrivalMs); one item keeps text and arrival time inseparable
 ' through enqueue, eviction, dequeue, reset and teardown.
@@ -600,16 +616,16 @@ Public Property Get TransportPartialDiscardCount() As Long: TransportPartialDisc
 Public Property Get SalvagedDeferredMessageCount() As Long: SalvagedDeferredMessageCount = m_SalvagedDeferredMessageCount: End Property
 Public Property Get LastParsedEventDropReason() As String: LastParsedEventDropReason = m_LastParsedEventDropReason: End Property
 
-Private Sub SetState(ByVal NewState As BiDiSocketState)
-    If m_state = NewState Then Exit Sub
+Private Sub SetState(ByVal newState As BiDiSocketState)
+    If m_state = newState Then Exit Sub
 
     ' Only an established session can suffer an observable continuity break. Connection-attempt
     ' failures occur in StateConnecting and therefore do not poison fresh-session loss counters.
-    If NewState = StateError And m_state = StateConnected Then
+    If newState = StateError And m_state = StateConnected Then
         MarkUnexpectedTransportDiscontinuity "StateConnected -> StateError"
     End If
 
-    m_state = NewState
+    m_state = newState
 
     Dim StateName As String
     Select Case m_state
@@ -1110,6 +1126,225 @@ Public Sub PostScript(ByVal msg As String)
     On Error GoTo 0
 End Sub
 
+' ===== Armed JS dialog answer =====
+' With unhandledPromptBehavior=ignore, an action that opens alert/confirm/prompt does not return
+' until the dialog closes, so the answer must be set before the action. The first
+' browsingContext.userPromptOpened for contextId is answered from inside whatever receive loop
+' sees it (usually the pending action's own wait), with browsingContext.handleUserPrompt sent
+' under a fresh normal command id. The arm is consumed before sending, so the send cannot
+' re-enter the hook. The prompt text is cleared once it has been sent or the arm ends.
+'   States: armed -> sent -> answered | protocol-error; send-failed; auto-handled (the browser's
+'   handler was not ignore, so the dialog was already closed: nothing sent); disarmed (unused);
+'   cleared (the connection ended while armed or waiting for the reply).
+Public Sub ArmUserPromptAnswer(ByVal accept As Boolean, _
+                               ByVal contextId As String, _
+                               Optional ByVal userText As String = vbNullString, _
+                               Optional ByVal frameContextIds As String = vbNullString)
+    If Len(contextId) = 0 Then
+        Err.Raise 5, "BiDiSocket", "ArmUserPromptAnswer requires the target context id."
+    End If
+    m_promptArmActive = False
+    m_promptArmAccept = accept
+    m_promptArmUserText = userText
+    m_promptArmContextId = contextId
+    m_promptArmFrameIds = frameContextIds
+    m_promptArmArmedAtMs = nowMs()
+    m_promptArmFiredAtMs = 0#
+    m_promptArmType = vbNullString
+    m_promptArmHandler = vbNullString
+    m_promptArmReplyId = vbNullString   ' a still-pending earlier reply becomes an ordinary late reply
+    m_promptArmError = vbNullString
+    m_promptArmOtherContextCount = 0
+    m_promptArmLastOtherContext = vbNullString
+    m_promptArmState = "armed"
+    m_promptArmActive = True
+End Sub
+
+Public Sub DisarmUserPromptAnswer()
+    If m_promptArmActive Then
+        m_promptArmActive = False
+        m_promptArmState = "disarmed"
+    End If
+    m_promptArmUserText = vbNullString
+End Sub
+
+' One token: (none) | armed | sent | answered | protocol-error | send-failed | auto-handled |
+' disarmed | cleared | hook-error
+Public Property Get UserPromptAnswerState() As String
+    If Len(m_promptArmState) = 0 Then
+        UserPromptAnswerState = "(none)"
+    Else
+        UserPromptAnswerState = m_promptArmState
+    End If
+End Property
+
+Public Property Get UserPromptAnswerStatus() As String
+    Dim s As String
+    s = "state=" & UserPromptAnswerState
+    If Len(m_promptArmContextId) > 0 Then s = s & " | armedCtx=" & Left$(m_promptArmContextId, 8)
+    If Len(m_promptArmFrameIds) > 0 Then
+        s = s & " | frames=" & CStr(UBound(Split(m_promptArmFrameIds, "|")) - 1)
+    End If
+    If m_promptArmFiredAtMs > 0# Then
+        s = s & " | type=" & m_promptArmType & _
+                " | handler=" & IIf(Len(m_promptArmHandler) = 0, "(missing)", m_promptArmHandler) & _
+                " | openedAfterArmMs=" & CStr(CLng(m_promptArmFiredAtMs - m_promptArmArmedAtMs))
+    End If
+    If Len(m_promptArmError) > 0 Then s = s & " | error=" & m_promptArmError
+    If m_promptArmOtherContextCount > 0 Then
+        s = s & " | otherContextPrompts=" & CStr(m_promptArmOtherContextCount) & _
+                " | lastOtherCtx=" & m_promptArmLastOtherContext
+    End If
+    UserPromptAnswerStatus = s
+End Property
+
+Public Property Get UserPromptOtherContextCount() As Long
+    UserPromptOtherContextCount = m_promptArmOtherContextCount
+End Property
+
+Public Property Get UserPromptLastOtherContext() As String
+    UserPromptLastOtherContext = m_promptArmLastOtherContext
+End Property
+
+Private Sub ClearArmedUserPrompt(ByVal newState As String)
+    If m_promptArmActive Or Len(m_promptArmReplyId) > 0 Then m_promptArmState = newState
+    m_promptArmActive = False
+    m_promptArmReplyId = vbNullString
+    m_promptArmUserText = vbNullString
+End Sub
+
+Private Sub TryAnswerArmedUserPrompt(ByVal rawMsg As String)
+    On Error GoTo HookFailed
+
+    If InStr(1, rawMsg, "userPromptOpened", vbBinaryCompare) = 0 Then Exit Sub
+
+    Dim methodName As String
+    If Not TryExtractTopLevelEventMethod(rawMsg, methodName) Then Exit Sub
+    If methodName <> "browsingContext.userPromptOpened" Then Exit Sub
+
+    ' The top-level message also carries "type":"event"; read the prompt fields inside params.
+    Dim paramsPos As Long
+    paramsPos = InStr(1, rawMsg, """params""", vbBinaryCompare)
+    If paramsPos = 0 Then Exit Sub
+
+    Dim ctx As String
+    ctx = PromptEventStringField(rawMsg, "context", paramsPos)
+    If Len(ctx) = 0 Then Exit Sub
+
+    ' A dialog reports the context of the frame that opened it. One in another tab is not ours;
+    ' keep the arm for the expected one.
+    If StrComp(ctx, m_promptArmContextId, vbBinaryCompare) <> 0 And _
+       InStr(1, m_promptArmFrameIds, "|" & ctx & "|", vbBinaryCompare) = 0 Then
+        If m_promptArmOtherContextCount < 2147483647 Then _
+            m_promptArmOtherContextCount = m_promptArmOtherContextCount + 1
+        m_promptArmLastOtherContext = ctx
+        Exit Sub
+    End If
+
+    m_promptArmActive = False
+    m_promptArmFiredAtMs = nowMs()
+    m_promptArmType = PromptEventStringField(rawMsg, "type", paramsPos)
+    m_promptArmHandler = PromptEventStringField(rawMsg, "handler", paramsPos)
+
+    ' accept/dismiss handlers close the dialog in the browser before this event reaches VBA.
+    If Len(m_promptArmHandler) > 0 And m_promptArmHandler <> "ignore" Then
+        m_promptArmState = "auto-handled"
+        m_promptArmUserText = vbNullString
+        Exit Sub
+    End If
+
+    Dim replyId As Long
+    replyId = GetNextRequestId()
+
+    Dim cmd As String
+    cmd = "{""id"":" & CStr(replyId) & _
+          ",""method"":""browsingContext.handleUserPrompt"",""params"":{""context"":""" & _
+          PromptJsonEscape(ctx) & """,""accept"":" & IIf(m_promptArmAccept, "true", "false")
+    If Len(m_promptArmUserText) > 0 And m_promptArmType = "prompt" Then
+        cmd = cmd & ",""userText"":""" & PromptJsonEscape(m_promptArmUserText) & """"
+    End If
+    cmd = cmd & "}}"
+    m_promptArmUserText = vbNullString
+
+    m_promptArmReplyId = CStr(replyId)
+    m_promptArmState = "sent"
+    If Not SendMessage(cmd, False) Then
+        m_promptArmReplyId = vbNullString
+        m_promptArmState = "send-failed"
+    End If
+    Exit Sub
+
+HookFailed:
+    m_promptArmActive = False
+    m_promptArmReplyId = vbNullString
+    m_promptArmUserText = vbNullString
+    m_promptArmState = "hook-error"
+    m_promptArmError = CStr(Err.Number)
+End Sub
+
+Private Sub CompleteArmedUserPromptReply(ByVal rawMsg As String)
+    m_promptArmReplyId = vbNullString
+    Dim replyType As String
+    replyType = PromptEventStringField(rawMsg, "type", 1)
+    If replyType = "success" Then
+        m_promptArmState = "answered"
+    Else
+        m_promptArmState = "protocol-error"
+        m_promptArmError = PromptEventStringField(rawMsg, "error", 1)
+        If Len(m_promptArmError) = 0 Then m_promptArmError = "(unparsed reply)"
+    End If
+End Sub
+
+' Flat string value of "key" at or after startPos. Used only for the context id, prompt type,
+' handler, reply type and error code, none of which contain escapes. A key inside an escaped
+' string value cannot match because its closing quote is preceded by a backslash.
+Private Function PromptEventStringField(ByVal json As String, ByVal key As String, _
+                                        ByVal startPos As Long) As String
+    Dim p As Long, n As Long, q As Long
+    p = InStr(startPos, json, """" & key & """", vbBinaryCompare)
+    If p = 0 Then Exit Function
+    p = p + Len(key) + 2
+    n = Len(json)
+    Do While p <= n
+        Select Case Mid$(json, p, 1)
+            Case " ", vbTab, vbCr, vbLf: p = p + 1
+            Case Else: Exit Do
+        End Select
+    Loop
+    If Mid$(json, p, 1) <> ":" Then Exit Function
+    p = p + 1
+    Do While p <= n
+        Select Case Mid$(json, p, 1)
+            Case " ", vbTab, vbCr, vbLf: p = p + 1
+            Case Else: Exit Do
+        End Select
+    Loop
+    If Mid$(json, p, 1) <> """" Then Exit Function
+    q = InStr(p + 1, json, """", vbBinaryCompare)
+    If q = 0 Then Exit Function
+    PromptEventStringField = Mid$(json, p + 1, q - p - 1)
+End Function
+
+Private Function PromptJsonEscape(ByVal text As String) As String
+    Dim i As Long, ch As String, code As Long, out As String
+    For i = 1 To Len(text)
+        ch = Mid$(text, i, 1)
+        code = AscW(ch) And &HFFFF&
+        Select Case code
+            Case 34: out = out & "\"""
+            Case 92: out = out & "\\"
+            Case 8: out = out & "\b"
+            Case 9: out = out & "\t"
+            Case 10: out = out & "\n"
+            Case 12: out = out & "\f"
+            Case 13: out = out & "\r"
+            Case Is < 32: out = out & "\u" & Right$("000" & Hex$(code), 4)
+            Case Else: out = out & ch
+        End Select
+    Next i
+    PromptJsonEscape = out
+End Function
+
 Public Function GetNextRequestId() As Long
     m_nextRequestId = m_nextRequestId + 1
     If m_nextRequestId > ID_MAX Then m_nextRequestId = CMD_ID_FLOOR
@@ -1178,9 +1413,17 @@ End Function
 
 ' Root IDs other than the currently owned command or reserved system IDs are stale or
 ' unknown replies. They are counted separately and never consume asynchronous FIFO space.
-Private Sub DropLateOrUnknownResponse(ByVal idStr As String)
+Private Sub DropLateOrUnknownResponse(ByVal idStr As String, Optional ByVal rawMsg As String = vbNullString)
     ' Any root response proves peer progress even when its command owner already timed out.
     m_consecutiveApplicationHeartbeatTimeouts = 0
+
+    ' The armed dialog answer uses its own normal command id and has no SendAndReceive owner.
+    If Len(m_promptArmReplyId) > 0 Then
+        If StrComp(idStr, m_promptArmReplyId, vbBinaryCompare) = 0 Then
+            CompleteArmedUserPromptReply rawMsg
+            Exit Sub
+        End If
+    End If
 
     If m_DroppedLateResponsesCount < 2147483647 Then
         m_DroppedLateResponsesCount = m_DroppedLateResponsesCount + 1
@@ -1286,7 +1529,7 @@ Private Sub SalvageDeferredMessagesAfterTransportFailure(ByVal reason As String)
                 ProcessReservedSystemResponse inId, candidate, False
 
             Case IncomingClass_LateOrUnknownResponse
-                DropLateOrUnknownResponse inId
+                DropLateOrUnknownResponse inId, candidate
 
             Case IncomingClass_Event
                 ObserveWinsockMessage candidate
@@ -1600,6 +1843,9 @@ Public Sub Disconnect(Optional ByVal keepErrorState As Boolean = False)
 
     If m_state = StateDisconnecting Or m_state = StateDisconnected Then Exit Sub
 
+    ' An armed dialog answer never survives the connection that armed it.
+    ClearArmedUserPrompt "cleared"
+
     ' keepErrorState=True is transient transport cleanup before possible recovery; defer the
     ' session summary until an actual session close so counters survive reconnects.
     If Not keepErrorState Then TraceSessionDropSummary
@@ -1805,7 +2051,7 @@ Public Function SendAndReceive(ByVal jsonMessage As String, Optional ByVal waitT
                     ProcessReservedSystemResponse inId, msg, False
 
                 Case IncomingClass_LateOrUnknownResponse
-                    DropLateOrUnknownResponse inId
+                    DropLateOrUnknownResponse inId, msg
 
                 Case IncomingClass_Event
                     EnqueueEventBounded msg
@@ -1948,6 +2194,10 @@ Private Sub ObserveWinsockMessage(ByVal rawMsg As String)
     ' and the hot receive path must not turn ordinary BiDi errors into synchronous file I/O.
     m_consecutiveApplicationHeartbeatTimeouts = 0
     trace ">>> [Winsock] Message assembled. Length: " & Len(rawMsg)
+
+    ' Every receive path passes events through here, including the receive loop of a command
+    ' that is blocked by the dialog itself. One Boolean test when nothing is armed.
+    If m_promptArmActive Then TryAnswerArmedUserPrompt rawMsg
 End Sub
 
 Private Sub ProcessReservedSystemResponse(ByVal inId As String, _
@@ -2007,7 +2257,7 @@ DrainCompleted:
                 ProcessReservedSystemResponse inId, candidate, False
 
             Case IncomingClass_LateOrUnknownResponse
-                DropLateOrUnknownResponse inId
+                DropLateOrUnknownResponse inId, candidate
 
             Case IncomingClass_Event
                 ObserveWinsockMessage candidate
@@ -2182,7 +2432,7 @@ Public Function GetMessage() As String
             ProcessReservedSystemResponse inId, rawMsg, True
 
         Case IncomingClass_LateOrUnknownResponse
-            DropLateOrUnknownResponse inId
+            DropLateOrUnknownResponse inId, rawMsg
 
         Case IncomingClass_Event
             m_lastEventArrivalMs = nowMs()
@@ -2232,7 +2482,7 @@ Public Sub IdleReceive(ByVal ms As Long)
                 Case IncomingClass_ReservedSystemResponse
                     ProcessReservedSystemResponse inId, rawMsg, False
                 Case IncomingClass_LateOrUnknownResponse
-                    DropLateOrUnknownResponse inId
+                    DropLateOrUnknownResponse inId, rawMsg
                 Case IncomingClass_Event
                     EnqueueEventBounded rawMsg
             End Select
