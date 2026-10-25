@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.7"
+Private Const BIDI_WRAPPER_VERSION As String = "7.8"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -126,6 +126,8 @@ Private m_contextLifecycleNeedsReconcile As Boolean
 Private m_cdpSessionId As String
 Private m_cachedRealmIds As Dictionary ' Cached Execution Realm ID
 Private m_validatedContexts As Dictionary ' Context IDs confirmed present in the tree (skips repeat getTree)
+Private m_contextRoutes As Dictionary ' ctx -> "context" | "realm" (see IsRealmRoutedContext)
+Private m_contextRouteEvaluating As Boolean
 Private m_activeSubscriptions As Dictionary ' Event Management (Aggregation)
 ' Context destruction removes event/context keys from the active delta registry, but the server-
 ' issued subscription ID remains ours until session.unsubscribe confirms release.
@@ -523,6 +525,10 @@ Private m_carryoverNoteEmittedThisWait As Boolean ' this wait already emitted it
 Private Const ERR_BIDI_PROTOCOL As Long = vbObjectError + 1001
 Private Const ERR_JS_EXCEPTION As Long = vbObjectError + 1002
 Private Const ERR_ACTION_FAILED As Long = vbObjectError + 1003
+' Realm routing for tabs that stop answering context-targeted commands (IsRealmRoutedContext).
+Private Const CONTEXT_ROUTE_PROBE_MS As Long = 1500
+Private Const CONTEXT_ROUTE_CONFIRM_MS As Long = 1000
+Private Const REALM_LOCATE_MAX_NODES As Long = 50
 Private Const ERR_CONSENSUS_HALT As Long = vbObjectError + 1010  ' Consensus failure: process halted for review
 Private Const ERR_CONNECT_FAILED As Long = vbObjectError + 1011 ' WebSocket connection could not be established
 Private Const ERR_DOWNLOAD_START_TIMEOUT As Long = vbObjectError + 1020
@@ -666,6 +672,7 @@ Private Sub Class_Initialize()
     Set m_pendingSubscriptionCleanupIds = New Dictionary
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
+    Set m_contextRoutes = New Dictionary
     Set m_probeFilterRevisions = New Dictionary
     Set m_probeKnownReadyContexts = New Dictionary
     Set m_reportedInvalidSelectors = New Dictionary
@@ -970,6 +977,10 @@ Private Sub DispatchGlobalEvents(ByVal json As Object, Optional ByRef rawText As
             If Not m_validatedContexts Is Nothing Then
                 If m_validatedContexts.Exists(m_navigationContextId) Then m_validatedContexts.Remove m_navigationContextId
             End If
+            ' A new document gets a fresh realm-routing verdict on its next use.
+            If Not m_contextRoutes Is Nothing Then
+                If m_contextRoutes.Exists(m_navigationContextId) Then m_contextRoutes.Remove m_navigationContextId
+            End If
 
             ' A new document has no applied VBA-side filter revision until its probe is injected.
             If Not m_probeFilterRevisions Is Nothing Then
@@ -1250,6 +1261,10 @@ Private Sub InvalidateContextState(ByVal contextId As String, _
 
     If Not m_validatedContexts Is Nothing Then
         If m_validatedContexts.Exists(contextId) Then m_validatedContexts.Remove contextId
+    End If
+
+    If Not m_contextRoutes Is Nothing Then
+        If m_contextRoutes.Exists(contextId) Then m_contextRoutes.Remove contextId
     End If
 
     If Not m_probeFilterRevisions Is Nothing Then
@@ -5310,6 +5325,7 @@ Private Function PerformSetFiles(ByVal contextId As String, _
                                  Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                  Optional ByVal waitNetworkIdle As Boolean = True, _
                                  Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS) As String
+    RaiseIfRealmRoutedForInput contextId, "File selection (input.setFiles)", "PerformSetFiles"
     If Not IsArray(paths) Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:PerformSetFiles", "Internal: paths must be an array."
     End If
@@ -5416,6 +5432,7 @@ Private Function PerformNativeKeyInput(ByVal contextId As String, _
                                        Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                        Optional ByVal waitNetworkIdle As Boolean = True, _
                                        Optional ByVal minStableMs As Long = DEFAULT_IDLE_STABLE_MS) As String
+    RaiseIfRealmRoutedForInput contextId, "Native key input (useNativeKeys:=True, input.performActions)", "PerformNativeKeyInput"
 
     Dim source As New Dictionary
     source.Add "type", "key"
@@ -5478,6 +5495,8 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
                                      ByVal args As Collection, _
                                      ByVal TIMEOUT As Long, _
                                      Optional ByVal allowSyntheticFallback As Boolean = True) As String
+
+    RaiseIfRealmRoutedForInput contextId, "UseTrustedClick=True (input.performActions)", "PerformTrustedClick"
 
     Dim elemArg As Object: Set elemArg = args(1)
     Dim sharedId As String: sharedId = CStr(elemArg("sharedId"))
@@ -5705,6 +5724,10 @@ Private Function ExecuteBrowsingContextLocateNodes(ByVal xpath As String, _
                                                   Optional ByVal contextId As String = "", _
                                                   Optional ByVal Silent As Boolean = False) As String
     Dim targetCtx As String: targetCtx = ResolveTargetContext(contextId)
+    If IsRealmRoutedContext(targetCtx) Then
+        ExecuteBrowsingContextLocateNodes = ExecuteRealmLocateNodes(xpath, targetCtx, Silent)
+        Exit Function
+    End If
     Dim params As New Dictionary, locator As New Dictionary
     locator.Add "type", "xpath": locator.Add "value", xpath
     params.Add "context", targetCtx: params.Add "locator", locator
@@ -5740,7 +5763,11 @@ Private Function TryResolveUniqueVisibleRoleOptionDeepOnce(ByVal optionText As S
         "return 'N|0|0';}"
 
     args.Add NewLocalValue("string", optionText)
-    targetDic.Add "context", targetCtx
+    If IsRealmRoutedContext(targetCtx) Then
+        targetDic.Add "realm", RequireRoutedRealmId(targetCtx, "script.callFunction")
+    Else
+        targetDic.Add "context", targetCtx
+    End If
 
     params.Add "functionDeclaration", functionDeclaration
     params.Add "arguments", args
@@ -6595,7 +6622,11 @@ Private Function TryResolveShadowElementSharedIdOnce(ByVal xpathArg As Dictionar
     End If
 
     args.Add xpathArg
-    targetDic.Add "context", targetCtx
+    If IsRealmRoutedContext(targetCtx) Then
+        targetDic.Add "realm", RequireRoutedRealmId(targetCtx, "script.callFunction")
+    Else
+        targetDic.Add "context", targetCtx
+    End If
 
     params.Add "functionDeclaration", functionDeclaration
     params.Add "arguments", args
@@ -7184,6 +7215,7 @@ Private Sub ResetVolatileContextState()
 
     Set m_cachedRealmIds = New Dictionary
     Set m_validatedContexts = New Dictionary
+    Set m_contextRoutes = New Dictionary
     Set m_probeFilterRevisions = New Dictionary
     Set m_probeKnownReadyContexts = New Dictionary
     Set m_reportedInvalidSelectors = New Dictionary
@@ -10982,6 +11014,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             If m_capturePopupActions Then
                 stm.writeText "LEGEND | popupActions=True: the action observer is registered for ALL browsing contexts, but a [USER-ACTION] is logged only from the recorder top context, its descendant frames, and top-level contexts whose BiDi originalOpener (or parent frame) is already in scope. [USER-ACTION-SCOPE] status=added marks such a popup/tab with its opener ctx and first URL; use it to switch browsing context during replay (the popup is a separate top-level context, not a frame). Pushes from unrelated tabs and the STOP tab are discarded without logging their content; counts appear in [USER-ACTION-SCOPE-STATS]." & vbCrLf
                 stm.writeText "LEGEND | [USER-ACTION-SCOPE] status=ensured means the observer was re-attached or installed shortly (about 100-300 ms) after that popup's domContentLoaded (needed for window.open('') + document.write popups, and for same-origin window.open(url) popups whose initial about:blank realm is reused: their only READY shows frameUrl=[non-http-url]); actions made before it may be missing; ensure-failed means it could not be attached." & vbCrLf
+                stm.writeText "LEGEND | [CONTEXT-ROUTE] route=realm means a tab opened by the page (BiDi originalOpener set) gave no reply to context-targeted commands while its window realm answered (seen on Edge). Element lookup and script calls for that tab then go to its window realm; UseTrustedClick=True, native keys and file selection are unavailable there and raise an error. route=context with reason=slow-but-not-realm-only means the tab was only slow and keeps the normal route. The verdict is renewed after each navigation of that tab." & vbCrLf
                 stm.writeText "LEGEND | scopeDeferred=true marks an action held until its context's scope was resolved; its [t] and at= are the original receipt times, so it may physically appear after later lines (order by [t]). [SPA-ACT] DOM sampling still covers only the recorder top context; network lines from popups carry ctx=other:." & vbCrLf
             End If
         End If
@@ -14907,6 +14940,8 @@ Public Function CallScript(ByVal js As String, _
                       "forceRealmTarget=True was requested, but no realm could be resolved."
         End If
         targetDic.Add "realm", realmId
+    ElseIf IsRealmRoutedContext(resolvedCtx) Then
+        targetDic.Add "realm", RequireRoutedRealmId(resolvedCtx, "CallScript")
     Else
         targetDic.Add "context", resolvedCtx
     End If
@@ -15157,6 +15192,219 @@ Private Function BuildContextTarget(ByVal contextId As String, _
     End If
     
     Set BuildContextTarget = target
+End Function
+
+' Realm routing. Edge: a tab opened by the page can stop answering every context-targeted
+' command (script.callFunction/evaluate, browsingContext.locateNodes, input.performActions)
+' while script calls addressed to its window realm still answer (J-PlatPat detail tab).
+' Such a context is realm-routed: CallScript/PostScript and the element resolvers address its
+' window realm, locateNodes is emulated there (ExecuteRealmLocateNodes), and input.* commands,
+' which accept only a context, raise a clear error instead of waiting for a reply that never
+' comes. The verdict is cached per context and cleared on navigationStarted and context loss.
+' Only read-only probes decide it, before the caller's command is sent, so no action is resent.
+Private Function IsRealmRoutedContext(ByVal contextId As String) As Boolean
+    If Len(contextId) = 0 Then Exit Function
+    If m_contextRoutes Is Nothing Then Set m_contextRoutes = New Dictionary
+    If m_contextRoutes.Exists(contextId) Then
+        IsRealmRoutedContext = (m_contextRoutes(contextId) = "realm")
+        Exit Function
+    End If
+    ' No probe from inside event dispatch or from inside an evaluation already in progress.
+    If m_contextRouteEvaluating Or m_isProcessingQueue Then Exit Function
+    If socket_ Is Nothing Then Exit Function
+
+    m_contextRouteEvaluating = True
+    Dim route As String
+    On Error Resume Next
+    route = EvaluateContextRoute(contextId)
+    If Err.Number <> 0 Then route = "context"
+    Err.Clear
+    On Error GoTo 0
+    m_contextRouteEvaluating = False
+
+    m_contextRoutes(contextId) = route
+    IsRealmRoutedContext = (route = "realm")
+End Function
+
+' Returns "realm" only for a top-level context opened by another one (originalOpener set) that
+' (1) gives no reply to a context-targeted script call within CONTEXT_ROUTE_PROBE_MS,
+' (2) answers the same call addressed to its window realm, and (3) still gives no reply to a
+' second context-targeted call. (3) keeps a merely busy page on the context route.
+' The unpinned main context is never probed.
+Private Function EvaluateContextRoute(ByVal contextId As String) As String
+    EvaluateContextRoute = "context"
+    If m_mainContextState <> MainContextPinned Then
+        If StrComp(contextId, m_mainContextId, vbBinaryCompare) = 0 Then Exit Function
+    End If
+    If Not IsOpenedTopLevelContext(contextId) Then Exit Function
+
+    Dim t0 As Double: t0 = socket_.nowMs()
+    Dim otherError As String
+    Dim target As Dictionary
+
+    Set target = New Dictionary: target.Add "context", contextId
+    If TrySendRouteProbe(target, CONTEXT_ROUTE_PROBE_MS, otherError) Then Exit Function
+    If Len(otherError) > 0 Then Exit Function
+
+    Dim realmId As String
+    If Not TryResolveWindowRealmForContext(contextId, realmId) Then GoTo KeepContext
+    Set target = New Dictionary: target.Add "realm", realmId
+    If Not TrySendRouteProbe(target, CONTEXT_ROUTE_PROBE_MS, otherError) Then GoTo KeepContext
+
+    Set target = New Dictionary: target.Add "context", contextId
+    otherError = vbNullString
+    If TrySendRouteProbe(target, CONTEXT_ROUTE_CONFIRM_MS, otherError) Then GoTo KeepContext
+    If Len(otherError) > 0 Then GoTo KeepContext
+
+    EvaluateContextRoute = "realm"
+    LogSignalLine "[CONTEXT-ROUTE] ctx=" & contextId & " | route=realm | reason=context-unanswered-realm-ok" & _
+                  " | detectMs=" & Format$(socket_.nowMs() - t0, "0")
+    Exit Function
+
+KeepContext:
+    LogSignalLine "[CONTEXT-ROUTE] ctx=" & contextId & " | route=context | reason=slow-but-not-realm-only" & _
+                  " | detectMs=" & Format$(socket_.nowMs() - t0, "0")
+End Function
+
+Private Function IsOpenedTopLevelContext(ByVal contextId As String) As Boolean
+    On Error GoTo Failed
+    Dim params As New Dictionary
+    params.Add "root", contextId
+    params.Add "maxDepth", 0
+    Dim raw As String
+    raw = ExecuteBiDiCommand("browsingContext.getTree", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
+    Dim tree As Object
+    Set tree = ValidateProtocolResponse(raw, "browsingContext.getTree")
+    Dim roots As Collection
+    Set roots = GetPathObject(tree, "result.contexts")
+    If roots Is Nothing Then Exit Function
+    If roots.count = 0 Then Exit Function
+    If Not IsObject(roots(1)) Then Exit Function
+    Dim node As Object: Set node = roots(1)
+    If Len(GetPathString(node, "parent")) > 0 Then Exit Function
+    IsOpenedTopLevelContext = (Len(GetPathString(node, "originalOpener")) > 0)
+    Exit Function
+Failed:
+    Err.Clear
+End Function
+
+' True when any reply (success or a protocol error) arrives within timeoutMs. A correlation
+' timeout returns False with otherError empty; any other failure returns False with otherError set.
+Private Function TrySendRouteProbe(ByVal target As Dictionary, _
+                                   ByVal timeoutMs As Long, _
+                                   ByRef otherError As String) As Boolean
+    otherError = vbNullString
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", "() => 1"
+    params.Add "arguments", New Collection
+    params.Add "target", target
+    params.Add "awaitPromise", False
+
+    Dim raw As String, errNum As Long, errDesc As String
+    On Error Resume Next
+    Err.Clear
+    raw = ExecuteBiDiCommand("script.callFunction", params, True, _
+                             allowAmbiguousRetry:=False, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=timeoutMs)
+    errNum = Err.Number: errDesc = Err.description
+    Err.Clear
+    On Error GoTo 0
+
+    If errNum = 0 Then
+        TrySendRouteProbe = True
+    ElseIf InStr(1, errDesc, "CommandCorrelationTimeout:", vbBinaryCompare) = 0 Then
+        otherError = "Err " & CStr(errNum) & ": " & errDesc
+    End If
+End Function
+
+' Resolved on every call (one script.getRealms round trip) rather than from m_cachedRealmIds,
+' so a routed context that replaced its document is not addressed through a stale realm.
+Private Function RequireRoutedRealmId(ByVal contextId As String, ByVal callerName As String) As String
+    Dim realmId As String
+    If Not TryResolveWindowRealmForContext(contextId, realmId) Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:" & callerName, _
+                  "Context " & contextId & " does not answer context-targeted commands and is reached " & _
+                  "through its window realm, but no window realm could be resolved."
+    End If
+    RequireRoutedRealmId = realmId
+End Function
+
+Private Sub RaiseIfRealmRoutedForInput(ByVal contextId As String, _
+                                       ByVal feature As String, _
+                                       ByVal callerName As String)
+    If Not IsRealmRoutedContext(contextId) Then Exit Sub
+    Err.Raise ERR_ACTION_FAILED, "BiDi:" & callerName, _
+              feature & " is not available in context " & contextId & ": this tab does not answer " & _
+              "context-targeted commands, and input.* commands cannot be addressed to its window realm. " & _
+              "The default element.click() and JavaScript input paths work there " & _
+              "(UseTrustedClick=False, useNativeKeys:=False)."
+End Sub
+
+' browsingContext.locateNodes for a realm-routed context: document.evaluate in the window
+' realm returns the first REALM_LOCATE_MAX_NODES matches as nodes, each with the same sharedId
+' element reference locateNodes returns. The reply is reshaped as
+' {"type":"success","result":{"nodes":[...]}}; a script exception (invalid XPath) becomes an
+' "invalid selector" error like the native command, and protocol errors pass through unchanged.
+Private Function ExecuteRealmLocateNodes(ByVal xpath As String, _
+                                         ByVal contextId As String, _
+                                         ByVal Silent As Boolean) As String
+    Dim target As New Dictionary
+    target.Add "realm", RequireRoutedRealmId(contextId, "browsingContext.locateNodes")
+
+    Dim args As New Collection
+    args.Add NewLocalValue("string", xpath)
+    args.Add NewLocalValue("number", REALM_LOCATE_MAX_NODES)
+
+    Dim serialization As New Dictionary
+    serialization.Add "maxDomDepth", 0
+
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", _
+        "function(xp,max){const r=document.evaluate(xp,document,null,7,null);const a=[];" & _
+        "for(let i=0;i<r.snapshotLength&&i<max;i++)a.push(r.snapshotItem(i));return a;}"
+    params.Add "arguments", args
+    params.Add "target", target
+    params.Add "awaitPromise", False
+    params.Add "serializationOptions", serialization
+    params.Add "resultOwnership", "none"
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand("script.callFunction", params, Silent, allowContextRetarget:=False)
+
+    Dim json As Object
+    On Error Resume Next
+    Set json = WebJsonConverter.ParseJson(raw)
+    On Error GoTo 0
+    If json Is Nothing Then ExecuteRealmLocateNodes = raw: Exit Function
+    If json.Exists("error") Then ExecuteRealmLocateNodes = raw: Exit Function
+
+    Dim shaped As New Dictionary
+    If json.Exists("id") Then shaped.Add "id", json("id")
+
+    If LCase$(GetPathString(json, "result.type")) = "exception" Then
+        shaped.Add "type", "error"
+        shaped.Add "error", "invalid selector"
+        shaped.Add "message", "XPath evaluation failed in the window realm: " & _
+                              GetPathString(json, "result.exceptionDetails.text")
+        ExecuteRealmLocateNodes = WebJsonConverter.ConvertToJson(shaped)
+        Exit Function
+    End If
+
+    Dim nodes As Collection
+    Set nodes = GetPathObject(json, "result.result.value")
+    If nodes Is Nothing Then Set nodes = New Collection
+
+    Dim result As New Dictionary
+    result.Add "nodes", nodes
+    shaped.Add "type", "success"
+    shaped.Add "result", result
+    ExecuteRealmLocateNodes = WebJsonConverter.ConvertToJson(shaped)
 End Function
 
 Public Property Let IgnoreSelectors(ByVal cssSelectors As String)
@@ -16553,8 +16801,58 @@ Private Sub CollectDiscoveryActionContextIds(ByVal node As Object, ByRef ids As 
     Next child
 End Sub
 
+' Edge: commands addressed to the context of a same-origin window.open(url) popup whose initial
+' about:blank window was reused get no response (script.callFunction, locateNodes and
+' performActions all time out), while script calls addressed to its window realm answer
+' normally. Maintenance calls therefore resolve the window realm on every call (a navigation
+' replaces it; m_cachedRealmIds is not used) and fall back to the context target when no
+' window realm is listed or getRealms fails.
+Private Function TryResolveWindowRealmForContext(ByVal contextId As String, _
+                                                 ByRef realmId As String) As Boolean
+    realmId = vbNullString
+    On Error GoTo Failed
+
+    Dim params As New Dictionary
+    params.Add "context", contextId
+    params.Add "type", "window"
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand("script.getRealms", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
+
+    Dim parsed As Object
+    Set parsed = ValidateProtocolResponse(raw, "script.getRealms")
+
+    Dim realms As Collection
+    Set realms = GetPathObject(parsed, "result.realms")
+    If realms Is Nothing Then Exit Function
+
+    Dim r As Variant
+    For Each r In realms
+        If IsObject(r) Then
+            If StrComp(GetPathString(r, "context"), contextId, vbBinaryCompare) = 0 Then
+                realmId = GetPathString(r, "realm")
+                If Len(realmId) > 0 Then
+                    TryResolveWindowRealmForContext = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next r
+    Exit Function
+
+Failed:
+    realmId = vbNullString
+    Err.Clear
+End Function
+
 ' Each user-action maintenance call is best-effort and targets an exact browsing context.
 ' Bypass CallScript's 30s correlation floor without changing normal browser actions.
+' The call is addressed to the context's window realm when one is listed
+' (see TryResolveWindowRealmForContext).
 Private Function TryCallDiscoveryActionInContext(ByVal contextId As String, _
                                                  ByVal functionDeclaration As String, _
                                                  ByRef failure As String) As Boolean
@@ -16562,7 +16860,12 @@ Private Function TryCallDiscoveryActionInContext(ByVal contextId As String, _
     On Error GoTo Failed
 
     Dim target As New Dictionary
-    target.Add "context", contextId
+    Dim realmId As String
+    If TryResolveWindowRealmForContext(contextId, realmId) Then
+        target.Add "realm", realmId
+    Else
+        target.Add "context", contextId
+    End If
     Dim params As New Dictionary
     params.Add "functionDeclaration", functionDeclaration
     params.Add "arguments", New Collection
@@ -17658,13 +17961,19 @@ Private Sub BestEffortRemoveKnownShadowUnlockerSuppressor()
     End If
 End Sub
 
+' Addressed to the window realm when one is listed (see TryResolveWindowRealmForContext).
 Private Function TryRestoreShadowUnlockerInContext(ByVal contextId As String, _
                                                    ByRef failureDescription As String) As Boolean
     failureDescription = vbNullString
     On Error GoTo Failed
 
     Dim target As New Dictionary
-    target.Add "context", contextId
+    Dim realmId As String
+    If TryResolveWindowRealmForContext(contextId, realmId) Then
+        target.Add "realm", realmId
+    Else
+        target.Add "context", contextId
+    End If
 
     Dim args As New Collection
     Dim params As New Dictionary
@@ -18125,7 +18434,11 @@ Public Sub PostScript(ByVal js As String, _
 
     Dim finalJs As String: finalJs = WrapInSafetyShell(js, 1000)
 
-    targetDic.Add "context", resolvedCtx
+    If IsRealmRoutedContext(resolvedCtx) Then
+        targetDic.Add "realm", RequireRoutedRealmId(resolvedCtx, "PostScript")
+    Else
+        targetDic.Add "context", resolvedCtx
+    End If
     params.Add "functionDeclaration", finalJs
 
     Dim safeArgs As Collection
