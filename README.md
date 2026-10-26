@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v7.8
+# WebDriver BiDi for SeleniumVBA v7.9
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -78,7 +78,7 @@ Setup and import instructions, the getting-started guide, and the API reference 
   * The log keeps labels, button text, the text of chosen options, and the start URL with its query. Review the whole log before sharing it.
   * `Shutdown` may print `BiDi CRITICAL: Shutdown could not confirm ... Shadow Unlocker ...` after a recording on a page with frames that did not answer the listener cleanup (`[USER-ACTION-CLEANUP-WARN]`). It means the Shadow DOM Unlocker could not be confirmed as restored in those frames; it does not by itself mean that the browser or the connection stopped. If no frame can explain it, check the Immediate Window output before it.
   * Other recorder observations (`focusin`, `actionable=(none)`, `noopener` popups, download status) are described in the Wiki under `StartDiscoveryLog`.
-* **Trusted clicks are opt-in.** `ExecuteClick` uses the synthetic `element.click()` by default, while a recording captures real mouse clicks. Set `UseTrustedClick = True` only for sites that reject synthetic clicks (for example, the UI Testing Playground *Click* page reacts only to a trusted click). On Google Flights, trusted clicks caused the search results page to fail ("Oops, something went wrong") in 3 out of 3 runs. Whether a site breaks under trusted clicks cannot be detected in advance; compare runs with `True` and `False` and check the Discovery Log. File dialogs, new-context capture and downloads always use trusted clicks regardless of this setting.
+* **Trusted clicks are opt-in.** `ExecuteClick` uses the synthetic `element.click()` by default, while a recording captures real mouse clicks. Set `UseTrustedClick = True` only for sites that reject synthetic clicks (for example, the UI Testing Playground *Click* page reacts only to a trusted click). On Google Flights, trusted clicks caused the search results page to fail ("Oops, something went wrong") in 3 out of 3 runs. Whether a site breaks under trusted clicks cannot be detected in advance; compare runs with `True` and `False` and check the Discovery Log. File dialogs, new-context capture and downloads always use trusted clicks regardless of this setting. Likewise, `ExecuteInputValue` types with JavaScript by default; set `UseNativeKeys = True` only for sites that ignore JavaScript input (for example, a Power BI search box that shows the typed text but does not start a search).
 
 ---
 
@@ -166,7 +166,7 @@ This procedure records the initial page load and the manual browser actions that
 
 * **Target URL:** An input box asks for the URL at startup (default: `https://note.com/`), so no code change is needed to record another site.
 * **Recording starts before navigation:** `StartDiscoveryLog` is called before `ExecuteNavigateAndGetStatus`, so the log shows whether the page keeps loading data or rendering after the load event. The start URL is recorded as `[NAV-TARGET]` exactly as entered.
-* **Elements you operate:** `captureUserActions:=True` records each click, focus, and change as a `[USER-ACTION]` line with the element's locator attributes, so an AI can build XPaths from the log. Elements without an `id` that sit among same-tag siblings also get their position (`sibling=2/3`), and a non-breaking space in their text is shown as `\u00a0`.
+* **Elements you operate:** `captureUserActions:=True` records each click, focus, and change as a `[USER-ACTION]` line with the element's locator attributes, so an AI can build XPaths from the log. Elements without an `id` that sit among same-tag siblings also get their position (`sibling=2/3`), and a non-breaking space in their text is shown as ` `.
 * **Popups, new tabs, frames, and downloads:** Actions in frames, in popups and new tabs opened from the target page, and downloads started during the recording appear on the same timeline. A page shown again with the browser's Back button is marked `[USER-ACTION-RESTORED]`.
 * **Slow pages do not stall the recorder:** DOM sampling pauses while the page navigates, so actions and network lines keep their timing even when a server takes several seconds to respond.
 * **JavaScript dialogs:** The session is created with `svbaIgnore`, so `alert`, `confirm`, and `prompt` stay open for you to answer. The log records the type and your choice (`[USER-PROMPT-OPENED]`/`[USER-PROMPT-CLOSED]`), and DOM sampling pauses while a dialog is open.

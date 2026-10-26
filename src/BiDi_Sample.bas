@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 7.8 / MIT License / Copyright (c) hanamichi77777
+' Version 7.9 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -72,9 +72,9 @@ End Sub
 Public Sub Main02()
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
-   
+
   .StartEdge
-   
+
   Dim caps As WebCapabilities: Set caps = .CreateCapabilities
   caps.AddArguments "--start-maximized"
   caps.EnableBiDiMode
@@ -84,16 +84,16 @@ Public Sub Main02()
     bidi.ExecuteNavigateAndGetStatus url, True
     ' The scroll wait seeks practical quiescence; it does not exhaust an infinite feed.
     bidi.ExecuteLazyLoadScroll
-    
+
     Dim elms_title As WebElements ' List of article elements
-    
+
     Set elms_title = .FindElements(By.xpath, "//a[contains(@href, '/n/') and @aria-label and @title]")
-    
+
     Dim msgText As String, msgCaption As String
     msgText = "Article count: " & elms_title.count
     msgCaption = "Wait Complete"
     MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
-    
+
     bidi.Shutdown: Set bidi = Nothing
     .CloseBrowser: .Shutdown
 End With
@@ -108,9 +108,9 @@ Public Sub Main03()
 
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
-    
+
     .StartEdge
-      
+
     Dim caps As WebCapabilities: Set caps = .CreateCapabilities
     caps.AddArguments "--start-maximized"
     caps.EnableBiDiMode
@@ -124,7 +124,7 @@ Public Sub Main03()
     bidi.AddIdleIgnoreNetworkPattern "*/api/compat/suggest/*"
     bidi.AddIdleIgnoreNetworkPattern "*client-side-metrics*"
     bidi.AddIdleIgnoreNetworkPattern "*fundingchoicesmessages.google.com*"
-    
+
     Dim url As String: url = "https://world.jorudan.co.jp/mln/en/"
     bidi.ExecuteNavigateAndGetStatus url
     bidi.StartDiscoveryLog
@@ -137,9 +137,9 @@ Public Sub Main03()
     bidi.StopAndSaveDiscoveryLog logPath
     bidi.Shutdown: Set bidi = Nothing
     .CloseBrowser: .Shutdown
-    
+
     MsgBox "Completed"
-    
+
 End With
 End Sub
 
@@ -150,27 +150,27 @@ Public Sub Main04()
 
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
-     
+
     .StartEdge
-    
+
     Dim caps As WebCapabilities: Set caps = .CreateCapabilities
     caps.AddArguments "--start-maximized"
     caps.EnableBiDiMode
-      
+
     .OpenBrowser caps
    Dim bidi As New BiDiCommandWrapper: bidi.ConnectTo .GetWebSocketUrl
-        
+
     Dim loginUrl As String: loginUrl = "https://hotel-example-site.takeyaqa.dev/ja/login.html"
     'userName = "ichiro@example.com"
     'pw = "password"
     bidi.ExecuteNavigateAndGetStatus loginUrl, True
-      
+
     ' waitNetworkIdle=True requires both the URL match and post-navigation settling.
     Dim isLoginSuccess As Boolean
     isLoginSuccess = bidi.ExecuteIsUrlContains("https://hotel-example-site.takeyaqa.dev/ja/mypage.html", True, , 30000)
-      
+
     Dim msgText As String, msgCaption As String
-      
+
     If isLoginSuccess Then
         msgText = "BiDi Event Received!" & vbCrLf & "Login (Navigation) Confirmed."
         msgCaption = "Success"
@@ -180,10 +180,10 @@ Public Sub Main04()
         msgCaption = "Failed"
         MESSAGEbox 0, msgText, msgCaption, MB_OK Or MB_ForeFront
     End If
-      
+
     bidi.Shutdown: Set bidi = Nothing
     .CloseBrowser: .Shutdown
-      
+
   End With
 End Sub
 
@@ -195,10 +195,10 @@ Public Sub Main05()
     With driver
 
     .StartEdge
-    
+
     Dim caps As WebCapabilities: Set caps = driver.CreateCapabilities
     caps.EnableBiDiMode
-    
+
     .OpenBrowser caps
     Dim bidi As New BiDiCommandWrapper: bidi.ConnectTo .GetWebSocketUrl
 
@@ -206,7 +206,7 @@ Public Sub Main05()
 
     bidi.ExecuteInputValue "//input[@name='typer']", "aaa", , False
     bidi.ExecuteClick "//input[@id='red']", , False
-    
+
     bidi.ExecuteClick "//input[@value='Add Label']", , , 1000
 
     Debug.Assert driver.FindElement(By.xpath, "//div[@id='update_butter']").GetText = "Done!"
@@ -223,23 +223,23 @@ Public Sub Main06()
 
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
-    
+
   .StartEdge
-    
+
   Dim caps As WebCapabilities: Set caps = .CreateCapabilities
   caps.AddArguments "--start-maximized"
   caps.EnableBiDiMode
   .OpenBrowser caps
    Dim bidi As New BiDiCommandWrapper: bidi.ConnectTo .GetWebSocketUrl
    bidi.ExecuteNavigateAndGetStatus "https://www.customs.go.jp/toukei/srch/index.htm?M=01&P=0", False
-   
+
    Dim conID As String
    conID = bidi.GetIframeContextIdByUrl("jccht00d")
    bidi.ExecuteClick "//input[@id='la_imp']", , , , , conID
-   
+
    bidi.Shutdown: Set bidi = Nothing
    .CloseBrowser: .Shutdown
-   
+
   End With
 End Sub
 
@@ -252,7 +252,7 @@ Public Sub Main07()
     Dim caps As WebCapabilities
     Dim bidi As BiDiCommandWrapper
     Dim targetUrl As String: targetUrl = "https://developer.servicenow.com/"
-        
+
     With driver
     .StartEdge
     Set caps = .CreateCapabilities
@@ -260,31 +260,31 @@ Public Sub Main07()
     .OpenBrowser caps
     Set bidi = New BiDiCommandWrapper
     bidi.ConnectTo driver.GetWebSocketUrl
-    
+
     bidi.StartDiscoveryLog
 
     bidi.ExecuteRegisterAutoClicker "//button[@id='truste-consent-button']"
-    
+
     bidi.ExecuteNavigateAndGetStatus targetUrl
-        
+
     bidi.ArmNetworkSignal "metadata/application"
     ' searchShadow:=True evaluates the XPath in the document and in every nested ShadowRoot.
     ' The match is searched root by root, so //*[@id=...]//button stays inside one tree.
     bidi.ExecuteClick "//*[@id='utility-sign-in']//button", searchShadow:=True
-            
+
     ' Use a non-sensitive test value when adapting this sample.
     bidi.ExecuteInputValue "//input[@id='username']", "aaa"
-    
+
     ' Saves discovery_log.txt in the same folder as the current VBA host file.
     bidi.StopAndSaveDiscoveryLog
-    
+
     bidi.Shutdown: Set bidi = Nothing
-    
+
     ' Modern SPA pages may still have background activity when VBA-side work has completed.
     ' CloseBrowser/Shutdown can therefore take a few seconds while the browser exits cleanly.
     ' Do not add an artificial wait just to make shutdown appear faster.
     .CloseBrowser: .Shutdown
-           
+
     End With
 End Sub
 
@@ -301,13 +301,13 @@ Public Sub Main08()
     Dim driver As WebDriver: Set driver = New WebDriver
     With driver
         .StartEdge
-        
+
         Dim caps As WebCapabilities: Set caps = .CreateCapabilities
         caps.AddArguments "--start-maximized"
         caps.AddArguments "--lang=en"
         caps.AddArguments "--disable-blink-features=AutomationControlled"
         caps.EnableBiDiMode
-        
+
         .OpenBrowser caps
         Dim bidi As New BiDiCommandWrapper
         bidi.ConnectTo .GetWebSocketUrl
@@ -317,67 +317,67 @@ Public Sub Main08()
         bidi.AddIdleIgnoreNetworkPattern "/log?"
         bidi.AddIdleIgnoreNetworkPattern "*generate_204*"
         bidi.AddIdleIgnoreNetworkPattern "GetAsyncData"
-        
+
         bidi.StartDiscoveryLog
-        
+
         Dim url As String: url = "https://www.google.com/travel/flights"
         bidi.ExecuteNavigateAndGetStatus url
-        
+
         bidi.ExecuteSelectValue "(//div[@role='combobox'])[1]", "One way"
-                
+
         ' Actions use the first visible match among duplicates, so plain XPaths suffice.
         Dim depXPath As String
         depXPath = "//input[contains(@aria-label, 'Where from')]"
-        
+
         Dim depSuggestXPath As String
         depSuggestXPath = "//li[@role='option' and contains(@aria-label, 'Sapporo')]"
         bidi.ExecuteInputValue depXPath, "Sapporo", useKeyEvents:=False
-        
+
         bidi.ArmNetworkSignal "rpcids=tDoGIe"
         bidi.ExecuteClick depSuggestXPath, minStableMs:=1000
-        
-        
+
+
         Dim destXPath As String
         destXPath = "//input[contains(@aria-label, 'Where to')]"
-        
+
         Dim destSuggestXPath As String
         destSuggestXPath = "//li[@role='option' and contains(@aria-label, 'Paris')]"
         bidi.ExecuteInputValue destXPath, "Paris", useKeyEvents:=False
-        
+
         bidi.ArmNetworkSignal "rpcids=BVAT3"
         bidi.ExecuteClick destSuggestXPath, minStableMs:=1000
-        
-        
+
+
         bidi.ArmNetworkSignal "GetCalendarPicker"
         bidi.ArmVisibilitySignal "//div[@data-gs]"
         bidi.ExecuteClick "//input[@aria-label='Departure']"
-        
+
         ' Departure date: one week from today. Day cells carry data-iso="yyyy-mm-dd".
         Dim departDate As String
         departDate = Format$(Date + 7, "yyyy-mm-dd")
         bidi.ExecuteClick "//div[@role='gridcell' and @data-iso='" & departDate & "']//div[@role='button']"
         bidi.ExecuteClick "//button[contains(., 'Done')]"
-        
-        
+
+
         Dim searchXPath As String
         searchXPath = "//button[@aria-label='Search']"
 
 
         bidi.ArmNetworkSignal "GetShoppingResults"
         bidi.ExecuteClick searchXPath, maxTimeoutMs:=30000
-        
+
         ' Saves discovery_log.txt in the same folder as the current VBA host file.
         bidi.StopAndSaveDiscoveryLog
-        
+
         bidi.Shutdown: Set bidi = Nothing
-        
+
         ' Modern SPA pages may still have background activity when VBA-side work has completed.
         ' CloseBrowser/Shutdown can therefore take a few seconds while the browser exits cleanly.
         ' Do not add an artificial wait just to make shutdown appear faster.
         .CloseBrowser: .Shutdown
-        
+
         MsgBox "Google Flights Test Completed"
-        
+
     End With
 End Sub
 
@@ -500,20 +500,20 @@ Public Sub Main10()
     caps.EnableBiDiMode
     .OpenBrowser caps
     Set bidi = New BiDiCommandWrapper: bidi.ConnectTo driver.GetWebSocketUrl
-    
+
     bidi.AddIdleIgnoreNetworkPattern "www.scrapethissite.com/cdn-cgi/rum"
     bidi.AddIdleIgnoreNetworkPattern "www.facebook.com/tr/"
 
     bidi.StartDiscoveryLog
-    
+
     bidi.ExecuteNavigateAndGetStatus targetUrl
-    
+
     bidi.ArmContentSignal "//*[@id='table-body']"
     bidi.ExecuteClick "//section[@id='oscars']//a[@id='2015']"
-    
+
     bidi.ArmContentSignal "//*[@id='table-body']"
     bidi.ExecuteClick "//section[@id='oscars']//a[@id='2014']"
-    
+
     ' Saves discovery_log.txt in the same folder as the current VBA host file.
     bidi.StopAndSaveDiscoveryLog
 
@@ -532,26 +532,26 @@ Public Sub Main11()
     Dim driver As New WebDriver
     Dim caps As WebCapabilities
     Dim bidi As BiDiCommandWrapper
-    
+
     Dim targetUrl As String
     Dim filePath As String
-    
+
     targetUrl = "https://hanamichi77777.github.io/WebDriver-BiDi-for-SeleniumVBA/file-dialog-probe/"
-    
+
     With driver
         .StartEdge
-    
+
         ' Create the file used by this example.
         .SaveStringToFile "Hello World", ".\sample.txt"
-    
+
         ' input.setFiles needs the actual local file path.
         filePath = .ResolvePath(".\sample.txt", True)
-    
+
         Set caps = .CreateCapabilities
         caps.EnableBiDiMode
         .OpenBrowser caps
         Set bidi = New BiDiCommandWrapper: bidi.ConnectTo driver.GetWebSocketUrl
-    
+
         bidi.StartDiscoveryLog
         bidi.ExecuteNavigateAndGetStatus targetUrl
         ' ------------------------------------------------------------
@@ -562,7 +562,7 @@ Public Sub Main11()
         ' The waiting strategy can be replaced as appropriate when
         ' adapting this example to an actual application.
         ' ------------------------------------------------------------
-        
+
 '        bidi.ArmVisibilitySignal "//*[@id='done']"
         ' ------------------------------------------------------------
         ' IMPORTANT:
@@ -573,13 +573,13 @@ Public Sub Main11()
         ' is removed immediately after input.click().
         ' ------------------------------------------------------------
         bidi.ExecuteSetFileSelectionViaDialog "//*[@id='short-lived']", filePath
-        
+
         ' Saves discovery_log.txt in the same folder as the current VBA host file.
         bidi.StopAndSaveDiscoveryLog
-    
+
         bidi.Shutdown: Set bidi = Nothing
         .CloseBrowser: .Shutdown
-    
+
     End With
 
 End Sub

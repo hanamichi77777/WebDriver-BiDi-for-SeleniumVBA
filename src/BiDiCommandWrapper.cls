@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.8"
+Private Const BIDI_WRAPPER_VERSION As String = "7.9"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -43,6 +43,7 @@ Private m_boundConnectionGeneration As Long
 ' True when no live session still requires teardown.
 Private m_shutdownCompleted As Boolean
 Private m_useTrustedClick As Boolean        ' default False -> synthetic JS clicks (proven path); True = trusted pointer clicks (opt-in)
+Private m_useNativeKeys As Boolean          ' default False -> key-event input; True = native key input when ExecuteInputValue omits useNativeKeys
 Private m_noVisibleMatchPreference As Boolean ' default False -> interactive XPath actions prefer the first visible match
 Private m_debugMode As Boolean              ' Backing field for the DebugMode property. Default On; set in Class_Initialize.
 
@@ -158,6 +159,11 @@ Private Const NAVIGATION_INTERACTIVE_TRANSPORT_FLOOR_MS As Long = 60000
 Private Const COMMAND_CORRELATION_TIMEOUT_MARGIN_MS As Long = 5000
 Private Const DEFAULT_STALE_RETRIES As Long = 3
 Private Const SHORT_WAIT_MS As Long = 500
+' Trusted click: a target that exists before layout (zero-size box) is re-tested for the action's
+' maxTimeoutMs before the node-addressed synthetic fallback is used; this value applies only when
+' no positive action timeout is available.
+Private Const TRUSTED_ZERO_BOX_WAIT_MS As Long = 10000
+Private Const TRUSTED_ZERO_BOX_POLL_MS As Long = 100
 
 ' Internal non-blocking drains are fairness slices, not full FIFO flushes. Remaining events
 ' stay queued for later passes; no event is discarded by these limits.
@@ -377,6 +383,10 @@ Private m_sigDomXPath As String             ' armed target (diagnostics only)
 Private m_sigNetArmed As Boolean            ' ArmNetworkSignal active (API response arrival)
 Private m_sigNetSeen As Boolean             ' latched: matching responseCompleted observed
 Private m_sigNetPattern As String           ' armed URL pattern (UrlMatchesPattern notation)
+Private m_sigNetArmMs As Double             ' monotonic socket clock at ARM; rejects queued pre-arm responses
+Private m_sigNetExpectedMethod As String    ' optional HTTP method; by default OPTIONS preflight is excluded
+Private m_sigNetStaleWarned As Boolean      ' one-shot warning for pre-arm/stampless response
+Private m_sigNetMethodWarned As Boolean     ' one-shot warning for excluded request methods
 Private m_signalOwnerContextId As String    ' one browsing context owns every active completion arm
 Private m_sigVisArmed As Boolean            ' ArmVisibilitySignal active (new-element appearance)
 Private m_sigVisSeen As Boolean             ' latched: target became visible
@@ -693,6 +703,7 @@ Private Sub Class_Initialize()
     m_shutdownCompleted = True
     m_debugMode = True
     m_useTrustedClick = False
+    m_useNativeKeys = False
 End Sub
 
 Public Property Get Version() As String
@@ -1007,8 +1018,9 @@ Private Sub DispatchGlobalEvents(ByVal json As Object, Optional ByRef rawText As
                 HandleNavigationResponseStartedEvent json
             End If
 
-            ' Network-signal matching runs on every responseCompleted before noise filtering;
-            ' an ignored endpoint may still be an explicitly armed completion signal.
+            ' Match every responseCompleted before noise filtering; ignored URLs may still be armed.
+            ' Socket arrival time (not dispatch time) prevents queued pre-arm responses from
+            ' opening the gate when Discovery processing falls behind. OPTIONS is not API data.
             If method = "network.responseCompleted" And m_sigNetArmed And Not m_sigNetSeen Then
                 Dim sigUrl As String: sigUrl = GetPathString(json, "params.response.url")
                 Dim sigContext As String: sigContext = GetPathString(json, "params.context")
@@ -1016,29 +1028,61 @@ Private Sub DispatchGlobalEvents(ByVal json As Object, Optional ByRef rawText As
                     Dim sigContextless As Boolean
                     sigContextless = (Len(sigContext) = 0 And m_sigNetAllowContextless)
                     If StrComp(sigContext, m_signalOwnerContextId, vbBinaryCompare) = 0 Or sigContextless Then
-                        m_sigNetSeen = True
-                        m_sigNetHitMs = socket_.nowMs()
-                        m_sigNetHitKey = NormalizeEndpointKey(sigUrl)
-                        m_sigNetContentObserved = False
-                        GetCompletionInterval json, m_sigNetLoEpochMs, m_sigNetHiEpochMs
-                        Dim sigStatus As String: sigStatus = GetPathString(json, "params.response.status")
-                        Dim netQuietDiag As String
-                        netQuietDiag = " | quietAtHit=unknown"
-                        If m_lastProbeSampleMs > 0 And _
-                           StrComp(sigContext, m_lastProbeContextId, vbBinaryCompare) = 0 Then
-                            Dim probeSampleAgeMs As Double
-                            probeSampleAgeMs = socket_.nowMs() - m_lastProbeSampleMs
-                            If probeSampleAgeMs < 0 Then probeSampleAgeMs = 0
-                            netQuietDiag = netQuietDiag & _
-                                           " | lastPolledQuietMs=" & Format(m_lastProbeQuietMs, "0") & "ms" & _
-                                           " | sampleAgeMs=" & Format(probeSampleAgeMs, "0")
-                        Else
-                            netQuietDiag = netQuietDiag & " | lastPolledQuietMs=unknown"
+                        Dim sigArrivalMs As Double: sigArrivalMs = socket_.LastEventArrivalMs
+                        Dim sigMethod As String
+                        sigMethod = UCase$(Trim$(GetPathString(json, "params.request.method")))
+                        Dim sigMethodMatches As Boolean
+                        sigMethodMatches = (Len(sigMethod) > 0)
+                        If sigMethodMatches Then
+                            If Len(m_sigNetExpectedMethod) > 0 Then
+                                sigMethodMatches = (StrComp(sigMethod, m_sigNetExpectedMethod, vbBinaryCompare) = 0)
+                            Else
+                                sigMethodMatches = (StrComp(sigMethod, "OPTIONS", vbBinaryCompare) <> 0)
+                            End If
                         End If
-                        LogSignalLine "[SPA-SIGNAL-HIT] type=net | key=" & NormalizeEndpointKey(sigUrl) & _
-                                      " | status=" & sigStatus & _
-                                      IIf(sigContextless, " | ctx=(empty) | contextlessOptIn=true | attribution=unverified", " | ctx=" & sigContext) & _
-                                      netQuietDiag & EventArrivalSuffix()
+
+                        If sigArrivalMs <= 0# Or sigArrivalMs <= m_sigNetArmMs Then
+                            ' Fail closed on missing arrival timestamps. Log once per arm.
+                            If Not m_sigNetStaleWarned Then
+                                m_sigNetStaleWarned = True
+                                LogSignalLine "[SPA-SIGNAL-STALE-SKIP] type=net | key=" & _
+                                              NormalizeEndpointKey(sigUrl) & " | method=" & sigMethod & _
+                                              " | reason=" & IIf(sigArrivalMs <= 0#, "no-arrival-timestamp", "arrival-before-arm") & _
+                                              EventArrivalSuffix()
+                            End If
+                        ElseIf Not sigMethodMatches Then
+                            If Not m_sigNetMethodWarned Then
+                                m_sigNetMethodWarned = True
+                                LogSignalLine "[SPA-SIGNAL-METHOD-SKIP] type=net | key=" & _
+                                              NormalizeEndpointKey(sigUrl) & " | method=" & sigMethod & _
+                                              " | expected=" & IIf(Len(m_sigNetExpectedMethod) > 0, m_sigNetExpectedMethod, "non-OPTIONS") & _
+                                              EventArrivalSuffix()
+                            End If
+                        Else
+                            m_sigNetSeen = True
+                            m_sigNetHitMs = socket_.nowMs()
+                            m_sigNetHitKey = NormalizeEndpointKey(sigUrl)
+                            m_sigNetContentObserved = False
+                            GetCompletionInterval json, m_sigNetLoEpochMs, m_sigNetHiEpochMs
+                            Dim sigStatus As String: sigStatus = GetPathString(json, "params.response.status")
+                            Dim netQuietDiag As String
+                            netQuietDiag = " | quietAtHit=unknown"
+                            If m_lastProbeSampleMs > 0 And _
+                               StrComp(sigContext, m_lastProbeContextId, vbBinaryCompare) = 0 Then
+                                Dim probeSampleAgeMs As Double
+                                probeSampleAgeMs = socket_.nowMs() - m_lastProbeSampleMs
+                                If probeSampleAgeMs < 0 Then probeSampleAgeMs = 0
+                                netQuietDiag = netQuietDiag & _
+                                               " | lastPolledQuietMs=" & Format(m_lastProbeQuietMs, "0") & "ms" & _
+                                               " | sampleAgeMs=" & Format(probeSampleAgeMs, "0")
+                            Else
+                                netQuietDiag = netQuietDiag & " | lastPolledQuietMs=unknown"
+                            End If
+                            LogSignalLine "[SPA-SIGNAL-HIT] type=net | key=" & NormalizeEndpointKey(sigUrl) & _
+                                          " | method=" & sigMethod & " | status=" & sigStatus & _
+                                          IIf(sigContextless, " | ctx=(empty) | contextlessOptIn=true | attribution=unverified", " | ctx=" & sigContext) & _
+                                          netQuietDiag & EventArrivalSuffix()
+                        End If
                     ElseIf Not m_sigNetContextMissWarned Then
                         m_sigNetContextMissWarned = True
                         Dim actualSigContext As String: actualSigContext = sigContext
@@ -4445,7 +4489,7 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
                                        ByVal maxTimeoutMs As Long, _
                                        ByVal contextId As String, _
                                        ByVal useKeyEvents As Boolean, _
-                                       ByVal useNativeKeys As Boolean, _
+                                       ByVal UseNativeKeys As Boolean, _
                                        ByVal callerName As String, _
                                        Optional ByVal selectAllFirst As Boolean = False) As String
     ResetLastSyncState
@@ -4456,7 +4500,7 @@ Private Function ExecuteInputValueCore(ByVal locatorKind As ElementLocatorKind, 
         preferVisible:=PrefersVisibleTarget("input"))
 
     Dim args As Collection: Set args = NewElementArgs(sharedId, valueToSet)
-    If useNativeKeys Then
+    If UseNativeKeys Then
         Dim nativeKeyActions As Collection
         Set nativeKeyActions = BuildNativeKeyActions(valueToSet, callerName, selectAllFirst)
 
@@ -4527,7 +4571,7 @@ Public Function ExecuteInputValue(ByVal xpath As Variant, _
                                   Optional ByVal maxTimeoutMs As Long = DEFAULT_IDLE_TIMEOUT_MS, _
                                   Optional ByVal contextId As String = "", _
                                   Optional ByVal useKeyEvents As Boolean = True, _
-                                  Optional ByVal useNativeKeys As Boolean = False, _
+                                  Optional ByVal UseNativeKeys As Variant, _
                                   Optional ByVal selectAllFirst As Boolean = False, _
                                   Optional ByVal searchShadow As Boolean = False, _
                                   Optional ByVal requireUnlocker As Boolean = False) As String
@@ -4536,9 +4580,20 @@ Public Function ExecuteInputValue(ByVal xpath As Variant, _
     On Error GoTo Failed
     kind = SelectElementLocatorKind(searchShadow, requireUnlocker, METHOD_NAME, xpath)
 
+    ' useNativeKeys has no default so an omitted argument is detectable (IsMissing).
+    ' Explicit argument > explicit useKeyEvents:=False (direct write) > UseNativeKeys property.
+    Dim effectiveNativeKeys As Boolean
+    If Not IsMissing(UseNativeKeys) Then
+        effectiveNativeKeys = CBool(UseNativeKeys)
+    ElseIf Not useKeyEvents Then
+        effectiveNativeKeys = False
+    Else
+        effectiveNativeKeys = m_useNativeKeys
+    End If
+
     ExecuteInputValue = ExecuteInputValueCore( _
         kind, xpath, valueToSet, searchTimeoutMs, waitNetworkIdle, _
-        minStableMs, maxTimeoutMs, contextId, useKeyEvents, useNativeKeys, _
+        minStableMs, maxTimeoutMs, contextId, useKeyEvents, effectiveNativeKeys, _
         METHOD_NAME, selectAllFirst)
     Exit Function
 
@@ -5507,6 +5562,15 @@ Private Function PerformTrustedClick(ByVal contextId As String, _
     Dim onTarget As Boolean, missReason As String
     onTarget = RequireTrustedHitTestResult(contextId, args, missReason)
 
+    ' A zero-size box is usually transient (the node exists before the page lays it out, e.g.
+    ' Power BI visuals). Re-test for a bounded time instead of falling back at once: a synthetic
+    ' click on such a node is silently ignored by pages that need real pointer input.
+    If Not onTarget Then
+        If IsZeroBoxMiss(missReason) Then
+            onTarget = WaitTrustedTargetLayout(contextId, args, TIMEOUT, missReason)
+        End If
+    End If
+
     If onTarget Then
         Dim ptrActions As New Collection
         ptrActions.Add BuildPointerMove(sharedId, 0, 0)
@@ -5587,6 +5651,44 @@ Private Function RequireTrustedHitTestResult(ByVal contextId As String, _
                   "TrustedClickHitTestIndeterminate: unexpected hit-test verdict '" & verdict & _
                   "'; synthetic fallback was not attempted."
     End If
+End Function
+
+Private Function IsZeroBoxMiss(ByVal missReason As String) As Boolean
+    IsZeroBoxMiss = (missReason = "zero-box" Or Left$(missReason, 9) = "zero-box;")
+End Function
+
+' Re-runs the trusted hit-test until the target gets a box, its miss reason changes (for example
+' to covered, which keeps the normal miss handling), or the bounded wait expires. Hit-test
+' errors (stale node, transport) propagate exactly as on the first test.
+Private Function WaitTrustedTargetLayout(ByVal contextId As String, _
+                                         ByVal args As Collection, _
+                                         ByVal TIMEOUT As Long, _
+                                         ByRef missReason As String) As Boolean
+    ' TIMEOUT is the action's maxTimeoutMs (default 10000), so callers can extend the wait.
+    Dim budgetMs As Long: budgetMs = TIMEOUT
+    If budgetMs <= 0 Then budgetMs = TRUSTED_ZERO_BOX_WAIT_MS
+
+    Dim startTick As Currency: startTick = socket_.NowTicks()
+    Dim polls As Long
+    Do
+        WaitHeartbeat TRUSTED_ZERO_BOX_POLL_MS
+        polls = polls + 1
+        missReason = ""
+        If RequireTrustedHitTestResult(contextId, args, missReason) Then
+            LogSignalLine "[TRUSTED-HITTEST-WAIT] reason=zero-box | outcome=laid-out" & _
+                          " | waitedMs=" & Format$(socket_.elapsedMs(startTick), "0") & _
+                          " | polls=" & CStr(polls)
+            WaitTrustedTargetLayout = True
+            Exit Function
+        End If
+        If Not IsZeroBoxMiss(missReason) Then Exit Do
+        If socket_.elapsedMs(startTick) >= budgetMs Then Exit Do
+    Loop
+
+    LogSignalLine "[TRUSTED-HITTEST-WAIT] reason=zero-box | outcome=" & _
+                  IIf(IsZeroBoxMiss(missReason), "timeout", "changed") & _
+                  " | waitedMs=" & Format$(socket_.elapsedMs(startTick), "0") & _
+                  " | polls=" & CStr(polls) & " | budgetMs=" & CStr(budgetMs)
 End Function
 
 Private Function HitTestJs() As String
@@ -11033,6 +11135,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         stm.writeText "LEGEND | [SPA-PROBE-INITIALIZING]/[SPA-PROBE-READY]=normal first-use/new-document lazy initialization. [SPA-PROBE-UNHEALTHY]/[SPA-PROBE-RECOVERED]=a probe already verified healthy in the same document was later missing/unhealthy and recovered. Unverified samples contribute NO stability evidence; READY/RECOVERED restart the full confirmation window. WAIT-END reports probeHealthy, probeInitializations, probeRecoveries, and detectedUnhealthyMs." & vbCrLf
         stm.writeText "LEGEND | leading [t] = when the recorder/wrapper processed or observed the line (VBA poll-based, ~100ms granularity; do not over-trust sub-100ms gaps). Event-derived lines ([REQ]/[RES]/[ERR]/[BLOCK]/[NAV]/console and net [SPA-SIGNAL-HIT]) also carry at=<sec>s = socket arrival time; [t] can lag at= by seconds when events queued faster than the recorder dispatched them (event bursts such as SPA boot, or long commands such as native key input). Order by [t]; use at= for event timing. minStableMs/maxTimeoutMs above are DEFAULTS; per-action effective values appear on each [SPA-WAIT-BEGIN]." & vbCrLf
         stm.writeText "LEGEND | [SPA-SIGNAL-ARM/HIT]=completion-signal gate (type=dom|net|vis; Arm*Signal APIs). A HIT opens the gate and resets the consensus stability window. dom/vis quietAtHit is measured on the poll that detects the hit (~100ms). net HITs are event-triggered between polls, so quietAtHit=unknown; lastPolledQuietMs/sampleAgeMs are diagnostic samples only and MUST NOT be treated as quiet at the network event. [SPA-NET-TO-CONTENT] is the earliest content mutation at/after the armed net response's completion lower bound. A response completes within [lo, hi]: lo = request timings responseEnd (header receipt for streamed bodies), hi = event arrival mapped to the page clock. relation=AFTER (mutation after hi) or INDETERMINATE (inside the interval; order not determinable); delayMs=min..max is completion-to-mutation delay, widthMs=hi-lo; observedMs is only HIT-to-poll observation delay; owner is not asserted. Gated waits carry signal=<armed types> on BEGIN and hit|miss on END." & vbCrLf
+        stm.writeText "LEGEND | A net arm rejects responses whose socket arrival predates ARM ([SPA-SIGNAL-STALE-SKIP]) and ignores OPTIONS by default ([SPA-SIGNAL-METHOD-SKIP]); requestMethod can restrict to a specific method. These checks do not prove a post-arm response was caused by the intended action." & vbCrLf
+        stm.writeText "LEGEND | UseTrustedClick=True: [TRUSTED-HITTEST] hit=0 reason=zero-box means the target had no layout box. [TRUSTED-HITTEST-WAIT] shows the bounded re-test (outcome=laid-out: trusted click sent; timeout: node-addressed synthetic fallback follows; changed: the new miss reason, e.g. covered, is handled as usual)." & vbCrLf
         stm.writeText "LEGEND | A net arm rejects responses from another or empty browsing context ([SPA-SIGNAL-CTX-MISS]); ArmNetworkSignal allowContextless:=True additionally accepts empty-context (e.g. Web Worker) responses, logged as ctx=(empty) | contextlessOptIn=true | attribution=unverified because such a HIT cannot be tied to the owner tab." & vbCrLf
         stm.writeText "LEGEND | If a net HIT occurs before SPA-WAIT-BEGIN, the net gate is already open when the wait starts. The wait's stability window starts at SPA-WAIT-BEGIN (after the HIT), so no separate HIT reset is needed. SPA-NET-TO-CONTENT is NOT measured for such a HIT. Completion then relies on the idle/DOM-quiet/probe state observed during the wait; the net gate itself does NOT link that HIT to any specific render." & vbCrLf
         stm.writeText "LEGEND | For dom signals, count= is the cumulative number of MutationRecords observed by the armed MutationObserver from ARM until the polling cycle that first detects the HIT. The observer watches the subtree of the single target node resolved at ARM (the FIRST node matched by xpath=). Attribute mutations are included only when the ARM line shows attributes=true. count= is NOT the number of matched elements, rendered rows, page-wide mutations, or mutations attributable only to the subsequent action." & vbCrLf
@@ -13385,7 +13489,7 @@ End Sub
 ' SPA idle is negative evidence and can pass during a response-to-render gap. Arm* adds
 ' caller-selected positive evidence:
 '   ArmContentSignal: existing subtree is rewritten.
-'   ArmNetworkSignal: matching responseCompleted arrives.
+'   ArmNetworkSignal: matching post-ARM responseCompleted arrives (OPTIONS ignored by default).
 '   ArmVisibilitySignal: previously absent/hidden element becomes visible.
 ' A hit opens the gate and restarts minStableMs. Arms are live immediately, multiple arms
 ' compose with AND, and the first following SPA-idle wait consumes them on any outcome.
@@ -13455,10 +13559,13 @@ Public Sub ArmContentSignal(ByVal signalXPath As Variant, _
 End Sub
 
 ' ArmNetworkSignal uses the shared URL-pattern syntax and matches before ignore filters.
+' A queued response whose socket arrival predates ARM cannot satisfy the signal.
+' A default arm ignores OPTIONS; specify requestMethod:="POST" for POST-only APIs.
 ' Arrival is not rendering; increase the tail or combine with a DOM signal when needed.
 Public Sub ArmNetworkSignal(ByVal urlPattern As String, _
                             Optional ByVal contextId As String = "", _
-                            Optional ByVal allowContextless As Boolean = False)
+                            Optional ByVal allowContextless As Boolean = False, _
+                            Optional ByVal requestMethod As String = "")
     If Len(Trim$(urlPattern)) = 0 Then
         Err.Raise ERR_ACTION_FAILED, "BiDi:ArmNetworkSignal", "urlPattern is empty."
     End If
@@ -13472,12 +13579,16 @@ Public Sub ArmNetworkSignal(ByVal urlPattern As String, _
 
     ClaimSignalOwner targetCtx
     If m_sigNetArmed Then LogSignalLine "[SPA-SIGNAL-ARM] type=net | overwrite=true (previous net arm replaced)"
+    m_sigNetArmMs = socket_.nowMs()
     m_sigNetArmed = True: m_sigNetSeen = False: m_sigNetPattern = urlPattern
     m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False: m_sigNetLoEpochMs = 0#: m_sigNetHiEpochMs = 0#
     m_sigNetContextMissWarned = False
+    m_sigNetStaleWarned = False: m_sigNetMethodWarned = False
+    m_sigNetExpectedMethod = UCase$(Trim$(requestMethod))
     m_sigNetAllowContextless = allowContextless
     LogSignalLine "[SPA-SIGNAL-ARM] type=net | pattern=" & urlPattern & _
                   " | ctx=" & targetCtx & _
+                  " | method=" & IIf(Len(m_sigNetExpectedMethod) > 0, m_sigNetExpectedMethod, "non-OPTIONS") & _
                   IIf(allowContextless, " | allowContextless=true", "")
 End Sub
 
@@ -13708,6 +13819,8 @@ End Sub
 Private Sub ResetSignalState()
     m_sigDomArmed = False: m_sigDomSeen = False: m_sigDomXPath = ""
     m_sigNetArmed = False: m_sigNetSeen = False: m_sigNetPattern = ""
+    m_sigNetArmMs = 0#: m_sigNetExpectedMethod = ""
+    m_sigNetStaleWarned = False: m_sigNetMethodWarned = False
     m_sigNetHitMs = 0#: m_sigNetHitKey = "": m_sigNetContentObserved = False: m_sigNetLoEpochMs = 0#: m_sigNetHiEpochMs = 0#
     m_sigVisArmed = False: m_sigVisSeen = False: m_sigVisXPath = ""
     m_signalOwnerContextId = ""
@@ -18271,6 +18384,18 @@ Public Property Get UseTrustedClick() As Boolean
 End Property
 Public Property Let UseTrustedClick(ByVal value As Boolean)
     m_useTrustedClick = value
+End Property
+
+' False (default): ExecuteInputValue uses the key-event path unless useNativeKeys:=True is passed.
+' True: ExecuteInputValue calls that omit useNativeKeys use native key input (input.performActions).
+' Precedence: an explicit useNativeKeys argument always wins (unchanged behavior); an explicit
+' useKeyEvents:=False without useNativeKeys keeps the direct value write; otherwise this property.
+' Native key input is unavailable on realm-routed tabs ([CONTEXT-ROUTE] route=realm) and raises.
+Public Property Get UseNativeKeys() As Boolean
+    UseNativeKeys = m_useNativeKeys
+End Property
+Public Property Let UseNativeKeys(ByVal value As Boolean)
+    m_useNativeKeys = value
 End Property
 
 ' The forensic incident ring is independent of Discovery Log recording and DebugMode.
