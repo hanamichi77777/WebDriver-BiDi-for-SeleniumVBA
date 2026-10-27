@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 7.9 / MIT License / Copyright (c) hanamichi77777
+' Version 8.0 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -18,10 +18,29 @@ Public Const MB_ForeFront = &H40000              ' Topmost flag (MB_TOPMOST)
 ' Main01 - Install Google Translate through WebDriver BiDi
 ' Current Chrome installs this unpacked extension at runtime with
 ' webExtension.install; classic capabilities and --load-extension are not used.
-' Requires --remote-debugging-pipe, --enable-unsafe-extension-debugging and BiDi.
-' extensionPath must be the version folder containing manifest.json; managed
-' browser policy may still block installation.
+' Google Translate must already be installed in your everyday Chrome profile
+' (Default); the newest version folder containing manifest.json is used, so
+' extension updates need no code change. Older Chrome/ChromeDriver builds may
+' also need --remote-debugging-pipe and --enable-unsafe-extension-debugging.
+' Managed browser policy may still block installation.
 Public Sub Main01()
+  Const EXTENSION_ID As String = "aapbdbdomjkkjkaonfhkkikfgjllcleb"
+
+  ' Resolve the extension folder before starting the browser.
+  Dim extensionRoot As String
+  extensionRoot = Environ("LOCALAPPDATA") & _
+      "\Google\Chrome\User Data\Default\Extensions\" & EXTENSION_ID
+
+  Dim extensionPath As String
+  extensionPath = FindLatestExtensionVersionFolder(extensionRoot)
+  If Len(extensionPath) = 0 Then
+    MESSAGEbox 0, "No version folder with manifest.json was found under:" & vbCrLf & _
+               extensionRoot & vbCrLf & vbCrLf & _
+               "Install Google Translate in Chrome (Default profile) first.", _
+               "Extension Not Found", MB_OK Or MB_ForeFront
+    Exit Sub
+  End If
+
   Dim driver As WebDriver: Set driver = New WebDriver
   With driver
 
@@ -32,9 +51,6 @@ Public Sub Main01()
     caps.AddArguments "--start-maximized"
     caps.AddArguments "--propagate-iph-for-testing"
 
-    caps.AddArguments "--remote-debugging-pipe"
-    caps.AddArguments "--enable-unsafe-extension-debugging"
-
     caps.EnableBiDiMode
 
     .OpenBrowser caps
@@ -43,11 +59,7 @@ Public Sub Main01()
     bidi.ConnectTo .GetWebSocketUrl
     'bidi.DebugMode = False  'Mute developer trace in the Immediate window (default: On)
 
-    ' Use the extension version directory that directly contains manifest.json.
-    Dim extensionPath As String
-    extensionPath = Environ("LOCALAPPDATA") & _
-        "\Google\Chrome\User Data\Default\Extensions\" & _
-        "aapbdbdomjkkjkaonfhkkikfgjllcleb\2.0.17_0"
+    Debug.Print "Extension folder: " & extensionPath
 
     Dim installResponse As String
     installResponse = bidi.ExecuteWebExtensionInstall(extensionPath)
@@ -65,6 +77,45 @@ Public Sub Main01()
 
   End With
 End Sub
+
+' Returns the newest version subfolder (for example 2.0.17_0) that directly
+' contains manifest.json, or "" when none exists.
+Private Function FindLatestExtensionVersionFolder(ByVal extensionRoot As String) As String
+  Dim fso As New FileSystemObject
+  If Not fso.FolderExists(extensionRoot) Then Exit Function
+
+  Dim versionFolder As Scripting.Folder
+  Dim sortKey As String
+  Dim bestKey As String
+  For Each versionFolder In fso.GetFolder(extensionRoot).SubFolders
+    If fso.FileExists(fso.BuildPath(versionFolder.path, "manifest.json")) Then
+      sortKey = ExtensionVersionSortKey(versionFolder.name)
+      If sortKey > bestKey Then
+        bestKey = sortKey
+        FindLatestExtensionVersionFolder = versionFolder.path
+      End If
+    End If
+  Next versionFolder
+End Function
+
+' "2.0.17_0" -> "0000000002.0000000000.0000000017.0000000000.0000000000"
+' Numeric parts are zero-padded so a plain string comparison orders versions.
+Private Function ExtensionVersionSortKey(ByVal folderName As String) As String
+  Const PART_COUNT As Long = 5
+  Dim parts() As String
+  parts = Split(Replace(folderName, "_", "."), ".")
+
+  Dim i As Long
+  Dim part As String
+  For i = 0 To PART_COUNT - 1
+    part = "0"
+    If i <= UBound(parts) Then
+      If parts(i) Like "#*" And Not parts(i) Like "*[!0-9]*" Then part = parts(i)
+    End If
+    If i > 0 Then ExtensionVersionSortKey = ExtensionVersionSortKey & "."
+    ExtensionVersionSortKey = ExtensionVersionSortKey & Right$(String$(10, "0") & part, 10)
+  Next i
+End Function
 
 ' Main02 - Lazy-load scroll
 ' Replace the URL and result XPath for the target site. The final count is a

@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v7.9
+# WebDriver BiDi for SeleniumVBA v8.0
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -91,8 +91,8 @@ This procedure is intentionally limited to one task: installing the unpacked Goo
 
 * **Runtime installation instead of startup injection:** Calls `ExecuteWebExtensionInstall`, which sends the W3C `webExtension.install` command after Chrome has started. The extension itself is not passed through `caps.AddExtensions` or `--load-extension`.
 * **Why classic capabilities are not used:** Branded Chrome removed the `--load-extension` flag in Chrome 137. Therefore, the traditional startup-capability approach commonly shown in older Selenium examples is not a dependable route for this unpacked-extension scenario in current normal Chrome.
-* **Required browser configuration:** The sample enables BiDi and launches Chrome with `--remote-debugging-pipe` and `--enable-unsafe-extension-debugging` before connecting `BiDiCommandWrapper`.
-* **Local source-path requirement:** `extensionPath` must identify the Google Translate version directory containing `manifest.json`. The version folder can change whenever Chrome updates the extension.
+* **Required browser configuration:** The sample enables BiDi before connecting `BiDiCommandWrapper`. Current Chrome installs the extension without `--remote-debugging-pipe` and `--enable-unsafe-extension-debugging`; older Chrome/ChromeDriver builds may still need them.
+* **Local source-path requirement:** Google Translate must already be installed in Chrome's `Default` profile. The sample picks the newest version folder containing `manifest.json` under the extension ID folder, so an extension update needs no code change; if none is found, it shows a message before starting the browser. For another profile, change `Default` in the path.
 * **Easy diagnosis:** No navigation or SPA wait is performed. Failures are therefore normally attributable to the local path, the manifest, Chrome/ChromeDriver support, startup arguments, or enterprise browser policy rather than synchronization logic.
 * **Result handling:** The raw BiDi response is written to the Immediate window. Because installation changes browser state, an ambiguous transport failure is not automatically retried.
 

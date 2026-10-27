@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "7.9"
+Private Const BIDI_WRAPPER_VERSION As String = "8.0"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -255,6 +255,11 @@ Private m_rqMaxDrainGapEndSec As Double
 Private m_rqLastDrainEndMs As Double
 Private m_rqLossBaseline As Long
 Private m_rqOversizeBaseline As Long
+Private m_rqParsedOversizeBaseline As Long
+Private m_rqMalformedBaseline As Long
+Private m_rqDispatchBaseline As Long
+Private m_rqCriticalBaseline As Long
+Private m_rqLossCauseShown As Boolean   ' asyncLossSinceStart cause list written (LEGEND gating)
 Private m_rqReduced As Long             ' events parsed from a reduced copy
 Private m_rqReducedFallback As Long     ' reduced copy failed to parse; original parsed instead (expected 0)
 Private m_excludeResources As Boolean
@@ -11125,6 +11130,10 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         End If
         stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
         stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
+        If m_rqLossCauseShown Then
+            stm.writeText "LEGEND | asyncLossSinceStart other causes, listed only when nonzero: parsedOversize=events larger than the 512 KiB parsed-event limit, discarded without parsing; malformed=events that were not valid JSON; dispatch=events parsed but whose handler failed. The listed causes need not add up to the total. A lost network terminal event leaves its request open in [REQ-UNPAIRED]." & vbCrLf
+            stm.writeText "LEGEND | critical= (always shown with a nonzero loss) counts lost events the wrapper itself depends on: browsing-context created/destroyed, navigationStarted, download, file dialog, or events whose method could not be read. critical=0 means context tracking, download capture and file-dialog capture lost nothing; SPA idle waits count Fetch/XHR inside the page and do not depend on these events. Not covered by critical: network responses used by ArmNetworkSignal and by the HTTP status of ExecuteNavigateAndGetStatus, so a wait ending signal=net:miss next to a nonzero loss may have lost its response." & vbCrLf
+        End If
         stm.writeText "LEGEND | navPollPauses (in [RECORDER-QUEUE-STATS]) counts top-level navigations during which manual [SPA-ACT] DOM sampling paused, from browsingContext.navigationStarted until the new document's READY/domContentLoaded/load (or a Back/Forward cache restore, the context closing, or a download starting). No [SPA-ACT] is sampled during a pause; user actions and network lines continue. navPauseTimeouts counts pauses that reached the 30 s cap. pollQueryFailures counts manual sampling queries that failed or hit their 2 s bound, typically one per link click when the query was sent just before the navigation began; sampling simply retries, so these are not errors by themselves." & vbCrLf
         stm.writeText "LEGEND | [REQ-UNPAIRED] tracks request hops by (request id, redirectCount), including suppressed requests. Categories are exclusive: open-at-end=still had no observed terminal event/redirect advance when recording ended; other=no terminal event observed, but later evidence (such as the next redirect hop) showed the hop was no longer open." & vbCrLf
         stm.writeText "LEGEND | Known observation (Edge): a new top-level context opened by a rel=noopener / target=_blank link may never report network.responseCompleted for its document request although its domContentLoaded/load arrive (ctx=other:...). Such a hop stays open-at-end; by itself it is NOT evidence of an unfinished wait or a too-short timeout." & vbCrLf
@@ -11919,7 +11928,52 @@ Private Sub ResetRecorderQueueStats()
     m_rqMaxDrainGapMs = 0#: m_rqMaxDrainGapEndSec = 0#: m_rqLastDrainEndMs = 0#
     m_rqLossBaseline = CurrentTotalAsyncEventLossCount()
     m_rqOversizeBaseline = SafeTransportOversizedEventCount()
+    m_rqParsedOversizeBaseline = SafeParsedOversizeCount()
+    m_rqMalformedBaseline = SafeParsedMalformedCount()
+    m_rqDispatchBaseline = m_dispatchEventLossCount
+    m_rqCriticalBaseline = SafeCriticalEventLossCount()
+    m_rqLossCauseShown = False
 End Sub
+
+Private Function SafeParsedOversizeCount() As Long
+    On Error GoTo Unavailable
+    SafeParsedOversizeCount = socket_.DroppedParsedOversizeCount
+    Exit Function
+Unavailable:
+    SafeParsedOversizeCount = 0
+End Function
+
+Private Function SafeParsedMalformedCount() As Long
+    On Error GoTo Unavailable
+    SafeParsedMalformedCount = socket_.DroppedParsedMalformedCount
+    Exit Function
+Unavailable:
+    SafeParsedMalformedCount = 0
+End Function
+
+' Losses of events the wrapper depends on: context lifecycle, navigationStarted, download,
+' file dialog, and events whose method could not be read (communicator and dispatch).
+Private Function SafeCriticalEventLossCount() As Long
+    Dim total As Double
+    total = CDbl(m_dispatchLifecycleEventLossCount) + CDbl(m_dispatchDownloadEventLossCount) + _
+            CDbl(m_dispatchFileDialogEventLossCount) + CDbl(m_dispatchUnknownCriticalEventLossCount)
+
+    On Error GoTo Done
+    If Not socket_ Is Nothing Then
+        total = total + CDbl(socket_.LifecycleEventLossCount) + CDbl(socket_.DownloadEventLossCount) + _
+                CDbl(socket_.FileDialogEventLossCount) + CDbl(socket_.UnknownCriticalEventLossCount)
+    End If
+Done:
+    If total >= 2147483647# Then
+        SafeCriticalEventLossCount = 2147483647
+    Else
+        SafeCriticalEventLossCount = CLng(total)
+    End If
+End Function
+
+Private Function NonNegativeDelta(ByVal current As Long, ByVal baseline As Long) As Long
+    If current > baseline Then NonNegativeDelta = current - baseline
+End Function
 
 ' Transport-cap event drops; already included in the total async loss count.
 Private Function SafeTransportOversizedEventCount() As Long
@@ -11982,7 +12036,19 @@ Private Sub AppendRecorderQueueStats()
         Dim oversizeDelta As Long
         oversizeDelta = SafeTransportOversizedEventCount() - m_rqOversizeBaseline
         If oversizeDelta < 0 Then oversizeDelta = 0
-        lossText = lossText & " (transportOversize=" & CStr(oversizeDelta) & ")"
+        lossText = lossText & " (transportOversize=" & CStr(oversizeDelta)
+
+        Dim causeDelta As Long
+        causeDelta = NonNegativeDelta(SafeParsedOversizeCount(), m_rqParsedOversizeBaseline)
+        If causeDelta > 0 Then lossText = lossText & ", parsedOversize=" & CStr(causeDelta)
+        causeDelta = NonNegativeDelta(SafeParsedMalformedCount(), m_rqMalformedBaseline)
+        If causeDelta > 0 Then lossText = lossText & ", malformed=" & CStr(causeDelta)
+        causeDelta = NonNegativeDelta(m_dispatchEventLossCount, m_rqDispatchBaseline)
+        If causeDelta > 0 Then lossText = lossText & ", dispatch=" & CStr(causeDelta)
+
+        lossText = lossText & ", critical=" & _
+                   CStr(NonNegativeDelta(SafeCriticalEventLossCount(), m_rqCriticalBaseline)) & ")"
+        m_rqLossCauseShown = True
     End If
 
     Dim avgParseUs As Double, avgFastUs As Double
