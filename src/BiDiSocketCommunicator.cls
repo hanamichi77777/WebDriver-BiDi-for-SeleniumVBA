@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_SOCKET_VERSION As String = "8.2"
+Private Const BIDI_SOCKET_VERSION As String = "8.1"
 Private m_jpUseDouble As Boolean, m_jpUnquoted As Boolean
 Private m_jpBsNext As Long
 ' BiDiSocketCommunicator owns loopback WebSocket transport, RFC 6455 framing,
@@ -53,10 +53,8 @@ Private Const DEFAULT_TIMEOUT_MS As Long = 30000
 Private Const DEFAULT_POLLING_INTERVAL_MS As Long = 100
 Private Const MIN_POLLING_INTERVAL_MS As Long = 10
 Private Const MAX_POLLING_INTERVAL_MS As Long = 5000 ' Must not exceed the application-heartbeat timeout
-Private Const EVENT_BUFFER_MAX_COUNT As Long = 2000 ' default count cap; EventBufferMaxCount may raise it
-Private Const EVENT_BUFFER_MAX_COUNT_CEILING As Long = 50000 ' highest count cap EventBufferMaxCount accepts
-Private Const EVENT_BUFFER_MAX_BYTES As Long = 33554432 ' default byte cap: 32 MiB of VBA string storage measured by LenB
-Private Const EVENT_BUFFER_MAX_BYTES_CEILING As Long = 268435456 ' highest byte cap EventBufferMaxBytes accepts (256 MiB)
+Private Const EVENT_BUFFER_MAX_COUNT As Long = 2000
+Private Const EVENT_BUFFER_MAX_BYTES As Long = 33554432 ' 32 MiB of VBA string storage measured by LenB
 Private Const DEFERRED_TEXT_QUEUE_MAX_COUNT As Long = 2000
 Private Const DEFERRED_TEXT_QUEUE_TARGET_BYTES As Long = 33554432 ' 32 MiB normal backlog target measured by LenB(String)
 Private Const PARSED_ASYNC_EVENT_MAX_CHARS As Long = 524288 ' decoded VBA-character ceiling used by TryGetParsedEvent/Wrapper
@@ -148,18 +146,6 @@ Private m_lastEventArrivalMs As Double ' nowMs() at which the most recently retu
 Private m_DefaultTimeout As Long
 Private m_PollingInterval As Long
 Private m_DroppedEventsCount As Long
-' Subset of m_DroppedEventsCount: queued events evicted (oldest first) because the FIFO reached
-' its count cap (EventBufferMaxCount) or byte cap (EventBufferMaxBytes). Already included in TotalAsyncEventLossCount
-' through m_DroppedEventsCount, so it must never be added to that total again.
-Private m_FifoOverflowEventCount As Long
-' Count cap of the event FIFO; 0 means EVENT_BUFFER_MAX_COUNT. The byte cap is never changed.
-Private m_eventBufferMaxCount As Long
-' Byte cap of the event FIFO (LenB of retained strings); 0 means EVENT_BUFFER_MAX_BYTES.
-Private m_eventBufferMaxBytes As Long
-' Subset of m_FifoOverflowEventCount evicted because the byte cap, not the count cap, was reached.
-Private m_FifoOverflowByBytesCount As Long
-' Highest m_EventBufferBytes since the last ResetEventBufferPeak (diagnostic).
-Private m_MaxEventBufferBytes As Long
 Private m_DroppedLateResponsesCount As Long
 Private m_DroppedParsedOversizeCount As Long
 Private m_DroppedParsedMalformedCount As Long
@@ -585,44 +571,6 @@ Public Property Get MaxIncomingSize() As Long: MaxIncomingSize = m_maxIncomingSi
 Public Property Get ParsedAsyncEventMaxChars() As Long: ParsedAsyncEventMaxChars = PARSED_ASYNC_EVENT_MAX_CHARS: End Property
 Public Property Get ParsedAsyncEventMaxUtf8Bytes() As Long: ParsedAsyncEventMaxUtf8Bytes = PARSED_ASYNC_EVENT_MAX_UTF8_BYTES: End Property
 Public Property Get DroppedEventsCount() As Long: DroppedEventsCount = m_DroppedEventsCount: End Property
-Public Property Get FifoOverflowEventCount() As Long: FifoOverflowEventCount = m_FifoOverflowEventCount: End Property
-' Count cap of the asynchronous-event FIFO. Raising it lets a burst wait in the FIFO instead of
-' evicting the oldest events; EVENT_BUFFER_MAX_BYTES still bounds retained memory. Values are
-' clamped to EVENT_BUFFER_MAX_COUNT..EVENT_BUFFER_MAX_COUNT_CEILING. Lowering it does not trim
-' the FIFO at once; the next enqueue evicts down to the cap and counts as FIFO overflow.
-Public Property Get EventBufferMaxCount() As Long
-    If m_eventBufferMaxCount <= 0 Then
-        EventBufferMaxCount = EVENT_BUFFER_MAX_COUNT
-    Else
-        EventBufferMaxCount = m_eventBufferMaxCount
-    End If
-End Property
-Public Property Let EventBufferMaxCount(ByVal value As Long)
-    If value < EVENT_BUFFER_MAX_COUNT Then value = EVENT_BUFFER_MAX_COUNT
-    If value > EVENT_BUFFER_MAX_COUNT_CEILING Then value = EVENT_BUFFER_MAX_COUNT_CEILING
-    m_eventBufferMaxCount = value
-End Property
-' Byte cap of the asynchronous-event FIFO, measured by LenB of the retained strings (Collection
-' and Variant overhead not included). Clamped to EVENT_BUFFER_MAX_BYTES..EVENT_BUFFER_MAX_BYTES_CEILING.
-' Like the count cap, lowering it does not trim at once; the next enqueue evicts down to it.
-Public Property Get EventBufferMaxBytes() As Long
-    If m_eventBufferMaxBytes <= 0 Then
-        EventBufferMaxBytes = EVENT_BUFFER_MAX_BYTES
-    Else
-        EventBufferMaxBytes = m_eventBufferMaxBytes
-    End If
-End Property
-Public Property Let EventBufferMaxBytes(ByVal value As Long)
-    If value < EVENT_BUFFER_MAX_BYTES Then value = EVENT_BUFFER_MAX_BYTES
-    If value > EVENT_BUFFER_MAX_BYTES_CEILING Then value = EVENT_BUFFER_MAX_BYTES_CEILING
-    m_eventBufferMaxBytes = value
-End Property
-Public Property Get EventBufferBytes() As Long: EventBufferBytes = m_EventBufferBytes: End Property
-Public Property Get MaxEventBufferBytes() As Long: MaxEventBufferBytes = m_MaxEventBufferBytes: End Property
-Public Property Get FifoOverflowByBytesCount() As Long: FifoOverflowByBytesCount = m_FifoOverflowByBytesCount: End Property
-Public Sub ResetEventBufferPeak()
-    m_MaxEventBufferBytes = m_EventBufferBytes
-End Sub
 Public Property Get TotalDroppedEventsCount() As Long
     Dim total As Double
     total = CDbl(m_DroppedEventsCount) + CDbl(m_DroppedParsedOversizeCount) + _
@@ -780,9 +728,6 @@ Public Function Connect(ByVal wsUrl As String, ByVal localPort As Long) As Boole
     If Not m_isRecovering Then
         ResetEventBuffer
         m_DroppedEventsCount = 0
-        m_FifoOverflowEventCount = 0
-        m_FifoOverflowByBytesCount = 0
-        m_MaxEventBufferBytes = 0
         m_DroppedLateResponsesCount = 0
         m_DroppedParsedOversizeCount = 0
         m_DroppedParsedMalformedCount = 0
@@ -1500,9 +1445,7 @@ Private Sub TraceSessionDropSummary()
        m_SalvagedDeferredMessageCount = 0 Then Exit Sub
 
     trace ">>> [Session Summary] Connection closing. Dropped asynchronous events=" & _
-          m_DroppedEventsCount & " (fifoOverflow=" & m_FifoOverflowEventCount & _
-          ", byBytes=" & m_FifoOverflowByBytesCount & _
-          "); dropped late/unknown command responses=" & _
+          m_DroppedEventsCount & "; dropped late/unknown command responses=" & _
           m_DroppedLateResponsesCount & "; parsed-event oversize drops=" & _
           m_DroppedParsedOversizeCount & "; malformed drops=" & _
           m_DroppedParsedMalformedCount & "; filtered drops=" & _
@@ -1770,7 +1713,6 @@ Private Sub DropOldestBufferedEvent()
 
     If m_DroppedEventsCount < 2147483647 Then _
         m_DroppedEventsCount = m_DroppedEventsCount + 1
-    IncrementLossCounter m_FifoOverflowEventCount
 
     Dim droppedMethod As String
     RecordAsyncMessageLoss dropped, droppedMethod
@@ -1782,8 +1724,7 @@ Private Sub EnqueueEventBounded(ByVal msg As String)
     Dim msgBytes As Long
     msgBytes = LenB(msg)
 
-    Dim maxBytes As Long: maxBytes = EventBufferMaxBytes
-    If msgBytes > maxBytes Then
+    If msgBytes > EVENT_BUFFER_MAX_BYTES Then
         If m_DroppedEventsCount < 2147483647 Then _
             m_DroppedEventsCount = m_DroppedEventsCount + 1
 
@@ -1794,20 +1735,17 @@ Private Sub EnqueueEventBounded(ByVal msg As String)
 
     If m_EventBuffer Is Nothing Then ResetEventBuffer
 
-    Dim maxCount As Long: maxCount = EventBufferMaxCount
-    Do While m_EventBuffer.count >= maxCount Or _
-             m_EventBufferBytes > (maxBytes - msgBytes)
+    Do While m_EventBuffer.count >= EVENT_BUFFER_MAX_COUNT Or _
+             m_EventBufferBytes > (EVENT_BUFFER_MAX_BYTES - msgBytes)
         If m_EventBuffer.count = 0 Then
             m_EventBufferBytes = 0
             Exit Do
         End If
-        If m_EventBuffer.count < maxCount Then IncrementLossCounter m_FifoOverflowByBytesCount
         DropOldestBufferedEvent
     Loop
 
     m_EventBuffer.Add Array(msg, nowMs())
     m_EventBufferBytes = m_EventBufferBytes + msgBytes
-    If m_EventBufferBytes > m_MaxEventBufferBytes Then m_MaxEventBufferBytes = m_EventBufferBytes
 End Sub
 
 Private Function TryDequeueBufferedEvent(ByRef msg As String) As Boolean
