@@ -1,3 +1,11 @@
-   *.cls -text
-   *.bas -text
-   *.frm -text
+*.cls -text
+*.bas -text
+*.frm -text
+
+/docs export-ignore
+/image export-ignore
+/Architecture_*.md export-ignore
+/README.md export-ignore
+/SeleniumVBA_BiDi.xlsm export-ignore
+/.gitattributes export-ignore
+/.github export-ignore
