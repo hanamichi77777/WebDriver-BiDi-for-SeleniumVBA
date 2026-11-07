@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "8.1"
+Private Const BIDI_WRAPPER_VERSION As String = "8.2"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -167,6 +167,8 @@ Private Const TRUSTED_ZERO_BOX_POLL_MS As Long = 100
 
 ' Internal non-blocking drains are fairness slices, not full FIFO flushes. Remaining events
 ' stay queued for later passes; no event is discarded by these limits.
+' URL-stability heartbeat skips only the 32-message fairness cap; it retains the 250ms
+' budget and ProcessRecorderQueueCore's shared 1000-message safety cap.
 Private Const NONBLOCKING_DRAIN_MAX_MESSAGES As Long = 32
 Private Const NONBLOCKING_DRAIN_BUDGET_MS As Long = 250
 
@@ -225,7 +227,7 @@ Private Const POST_SCRIPT_ID As Long = 2
 
 Private Const DEFAULT_IGNORE_SELECTORS As String = "script, link, input[type='hidden'], .vba-ignore, #vba-bidi-hud, [id^='sizzle']"
 Private Const DEFAULT_IGNORE_NETWORK As String = "google-analytics, doubleclick, /collect, /beacon, .woff2, favicon.ico"
-Private Const USER_ACTION_SCRIPT_VERSION As Long = 12 ' v12: sibling=k/n for id-less elements with same-tag siblings; non-breaking spaces in text= kept as \u00a0; v11: select change inside Shadow DOM and label activation no longer add duplicate click lines, and a click on an icon/span inside a button or link no longer adds a focusin line; v10: rehook(keep) keeps pointer pairing for popup ensure; v9: non-rendered text excluded, actionable=(none)
+Private Const USER_ACTION_SCRIPT_VERSION As Long = 13 ' v13: treeitem, switch, slider and other ARIA widget roles count as actionable; observer exposes getSeq for the end-of-recording sequence check; v12: sibling=k/n for id-less elements with same-tag siblings; non-breaking spaces in text= kept as \u00a0; v11: select change inside Shadow DOM and label activation no longer add duplicate click lines, and a click on an icon/span inside a button or link no longer adds a focusin line; v10: rehook(keep) keeps pointer pairing for popup ensure; v9: non-rendered text excluded, actionable=(none)
 Private Const SPA_PROBE_VERSION As Long = 48 ' Internal probe generation/quiet/filter/health-diagnostic/observation-start/overflow contract
 Private m_userIgnoreSelectors As Collection
 Private m_userIgnoreNetworkPatterns As Collection
@@ -255,6 +257,27 @@ Private m_rqMaxDrainGapEndSec As Double
 Private m_rqLastDrainEndMs As Double
 Private m_rqLossBaseline As Long
 Private m_rqOversizeBaseline As Long
+Private m_rqFifoOverflowBaseline As Long
+' [FIFO-PHASE] diagnostics: communicator FIFO-overflow count at the previous phase mark, and
+' whether the navigate path has already marked the start of the following settle.
+Private m_fifoPhaseLastOverflow As Long
+Private m_fifoPhaseSettleMarked As Boolean
+' Drain-level overflow marks ([FIFO-PHASE] phase=manual-drain/drain) use their own baseline so
+' the navigate/settle marks keep their deltas; lines are capped per recording.
+Private m_fifoDrainLastOverflow As Long
+Private m_fifoDrainLinesWritten As Long
+Private m_fifoDrainLinesOmitted As Long
+' While recording, the communicator FIFO count cap is raised so bursts wait instead of being
+' evicted; the previous cap is restored when recording ends. 0 = not raised.
+Private Const RECORDER_FIFO_COUNT_CAP As Long = 20000
+Private Const RECORDER_FIFO_BYTE_CAP As Long = 134217728 ' 128 MiB of LenB while recording
+Private m_recorderFifoCapPrev As Long
+Private m_recorderFifoCapRaised As Boolean
+Private m_recorderFifoCapText As String
+Private m_recorderFifoBytesPrev As Long
+Private m_recorderFifoBytesRaised As Boolean
+Private m_recorderFifoBytesText As String
+Private m_rqFifoByBytesBaseline As Long
 Private m_rqParsedOversizeBaseline As Long
 Private m_rqMalformedBaseline As Long
 Private m_rqDispatchBaseline As Long
@@ -293,6 +316,19 @@ Private m_userActionPreloadScriptId As String
 Private m_userActionReadyRealmByContext As Dictionary
 Private m_userActionSeenPushKeys As Dictionary   ' ctx|realm|kind|seq already logged (pushes can be re-delivered)
 Private m_userActionReplayDropped As Long
+' v13 per-realm sequence checks (recorder-run scoped; see FinalizeUserActionSeqChecks).
+Private m_userActionSeqReceived As Dictionary     ' realm -> Dictionary(CStr(seq) -> True) of logged numbered pushes
+Private m_userActionSeqMax As Dictionary          ' realm -> highest logged seq
+Private m_userActionSeqCtx As Dictionary          ' realm -> ctx of the latest logged push
+Private m_userActionSeqDropped As Dictionary      ' realm|seq -> True: discarded by popup scope handling
+Private m_userActionConfirmSeqs As Dictionary     ' realm|seq -> True: click-confirm received
+Private m_userActionFinalSeq As Dictionary        ' realm -> last issued seq read at dispose
+Private m_userActionFinalCtx As Dictionary        ' realm -> ctx that answered the dispose
+Private m_userActionGapNumbers As Long
+Private m_userActionScopeDroppedNumbers As Long
+Private m_userActionConfirmOrphans As Long
+Private m_userActionSeqEndChecked As Long
+Private m_userActionSeqEndUnverified As Long
 Private m_userActionCtxUrlByRealm As Dictionary  ' realm -> ctxUrl, restored when Back brings a cached page back
 Private m_userActionLastDclRealmByContext As Dictionary
 ' Per-context last observed document-load URL, pinned across same-realm DOM rewrites.
@@ -4123,12 +4159,14 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
     ' cross the per-attempt boundary. No Office yield occurs between this drain/arm and send.
     DrainNonBlockingRecorderQueue
     ArmNavigationSupersessionWatch targetCtx
+    NoteFifoPhase "nav-begin"
 
     Dim strRes As String
     strRes = ExecuteBiDiCommand("browsingContext.navigate", params, _
                                 allowAmbiguousRetry:=False, _
                                 allowContextRetarget:=allowRetarget, _
                                 commandTimeoutMs:=ResolveNavigationTransportTimeout(maxTimeoutMs))
+    NoteFifoPhase "nav-end"
     Dim navJson As Object
     Set navJson = ValidateProtocolResponse(strRes, "browsingContext.navigate")
 
@@ -4151,6 +4189,7 @@ Private Function ExecuteBrowsingContextNavigate(ByVal url As String, _
     End If
 
     If LCase$(waitMode) = "complete" Then
+        m_fifoPhaseSettleMarked = True
         SettleAfterNavigation targetCtx, minStableMs, maxTimeoutMs
     End If
     ExecuteBrowsingContextNavigate = strRes
@@ -4371,14 +4410,20 @@ Private Sub SettleAfterNavigation(ByVal contextId As String, _
                                   ByVal minStableMs As Long, _
                                   ByVal maxTimeoutMs As Long)
     m_lastSyncAttempted = True
+    ' A settle reached without ExecuteBrowsingContextNavigate (adopted concurrent navigation)
+    ' marks its own start; after navigate, nav-end already marks it.
+    If Not m_fifoPhaseSettleMarked Then NoteFifoPhase "settle-begin"
+    m_fifoPhaseSettleMarked = False
     On Error GoTo Failed
 
     Dim urlStable As Boolean
     urlStable = WaitForUrlStability(contextId, 1000, maxTimeoutMs)
+    NoteFifoPhase "url-stable-end"
     If StrComp(contextId, m_mainContextId, vbBinaryCompare) = 0 Then
         UpdateMainContextId True, True
     End If
     WaitForNetworkIdleSpa minStableMs, maxTimeoutMs, contextId
+    NoteFifoPhase "spa-end"
 
     m_lastSyncSucceeded = urlStable
     If Not urlStable Then
@@ -4394,6 +4439,7 @@ Failed:
     Dim errorDescription As String: errorDescription = Err.description
     RecordSyncFailure errorNumber, errorSource, errorDescription
     On Error GoTo 0
+    NoteFifoPhase "settle-error"
 
     If errorNumber = ERR_CONSENSUS_HALT Then
         Err.Raise errorNumber, errorSource, errorDescription
@@ -7675,6 +7721,7 @@ End Sub
 ' Flags are dropped before their collections so guarded append paths stay safe.
 Private Sub ResetSessionBoundaryState()
     m_isRecording = False
+    RestoreRecorderFifoCap False
     m_isProcessingQueue = False
     m_recDownloadEventsAvailable = False
     m_downloadForensicGraceArmed = False
@@ -7712,6 +7759,7 @@ Private Sub ResetSessionBoundaryState()
     m_userActionPreloadScriptId = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
     Set m_userActionSeenPushKeys = Nothing
+    ResetUserActionSeqState False
     Set m_userActionCtxUrlByRealm = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
     Set m_userActionContextUrlByContext = Nothing
@@ -10850,6 +10898,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
     m_userActionRebindGone = 0
     Set m_userActionReadyRealmByContext = New Dictionary
     Set m_userActionSeenPushKeys = New Dictionary
+    ResetUserActionSeqState True
     Set m_userActionCtxUrlByRealm = New Dictionary
     m_userActionReplayDropped = 0
     Set m_userActionLastDclRealmByContext = New Dictionary
@@ -10876,6 +10925,7 @@ Public Sub StartDiscoveryLog(Optional ByVal excludeImagesAndCss As Boolean = Tru
 
     m_isRecording = True
     m_discoveryStartInProgress = False
+    RaiseRecorderFifoCap
 
     ' Manual actions are opt-in. Install once before the caller navigates; preload
     ' covers the top context and every new descendant without polling by URL.
@@ -10977,6 +11027,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     AppendUserActionStats
 
     m_isRecording = False
+    RestoreRecorderFifoCap True
 
     Dim bodyCaptureWasActive As Boolean
     bodyCaptureWasActive = m_bodyCaptureActive
@@ -11115,6 +11166,8 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
             stm.writeText "LEGEND | [USER-ACTION-CONFIRM] pairs click to pointerdown within 1500ms by realm/seq; no confirm is not proof of failure. A click immediately after select change on the same element is suppressed as a duplicate, as are the click and focusin that a clicked <label> forwards to its control (the label click is the action; the control's change still follows). [USER-ACTION-STATS] records count, installs, missing realms, parse errors, listener rehooks/errors, and cleanup warnings. A rehook is requested only after repeated domContentLoaded with no new READY realm; it is not proof of document.open. " & vbCrLf
             stm.writeText "LEGEND | A pointerdown with no [USER-ACTION-CONFIRM] can be a drag: HTML5 drag-and-drop, a slider, a scrollbar, or a text selection. Drops, scrolling, hover, and individual key presses (Enter, Tab, Esc, arrows) are not recorded, and neither are edits inside contenteditable editors (for example rich-text editors in an iframe). Do not replay such a pointerdown as a click without checking the live page." & vbCrLf
             stm.writeText "LEGEND | replayDropped (in [USER-ACTION-STATS]) counts action pushes the browser delivered again for the same realm and seq; each is logged only once. On Edge this happened when Back restored a page from the back/forward cache: no [NAV] appears, and [USER-ACTION-RESTORED] marks the page shown again. Replay that step with history navigation (ExecuteTraverseHistory), not a fresh navigate." & vbCrLf
+            stm.writeText "LEGEND | Sequence checks: each realm's observer numbers its pointerdown/click/focusin/change pushes 1,2,3... (click-confirm reuses the pointerdown seq). [USER-ACTION-GAP] lists numbers below the highest logged seq that never arrived; reason=scope-dropped means the recorder itself discarded them while deciding popup scope (pendingOverflow/unresolvedDropped), reason=unaccounted means no recorder-side reason is known." & vbCrLf
+            stm.writeText "LEGEND | Sequence checks (end): At Stop each live in-scope realm reports its last issued seq; [USER-ACTION-SEQ-END] status=gap lists numbers after the highest logged seq that never arrived. seqEndChecked counts realms verified this way; seqEndUnverified counts realms that could not be read (navigated away, closed, or dispose failed): their tail loss is unknown, not zero. [USER-ACTION-CONFIRM-ORPHAN] is a click confirm whose pointerdown never arrived. A gap shows that an action push was lost; it does not show the cause (compare asyncLossSinceStart fifoOverflow, but do not attribute an individual gap to it)." & vbCrLf
             stm.writeText "LEGEND | event=focusin means an element gained focus, not necessarily an explicit user action. It may occur when focus returns to the opener after a popup closes, when a JS dialog closes, or after a keyboard Tab move. It also fires on the element that last had focus whenever the browser window or tab regains focus, including after Back shows a cached page ([USER-ACTION-RESTORED]); such a focusin is not a user action. Do not replay focusin alone as a click or keystroke; interpret it using surrounding actions and context transitions." & vbCrLf
             stm.writeText "LEGEND | actionable=(none) means no button, link, form control, label with a control, or ARIA widget role was on the event path (page background, a text-selection drag, or a custom clickable element without a role). Such lines carry no text=/children=; targetText= appears only when the target is not html/body, has at most 3 child elements, and its whole visible text is 60 chars or less (a short label, never a container dump). Do NOT turn an actionable=(none) line into a replay step without confirming it against the live DOM." & vbCrLf
             stm.writeText "LEGEND | sibling=k/n gives the position of the actionable element (or the target when actionable=(none)) among its parent's child elements with the same tag, as in XPath parent/button[k]. It appears only for elements without an id that have same-tag siblings, and it is the position at event time, not a stable locator; prefer text or attributes when they are distinctive. In text=/targetText=, \u00a0 marks a non-breaking space (U+00A0) that the page text really contains. XPath normalize-space() does not treat it as a space: build such text in VBA with ChrW(160), or match the words around it with contains()." & vbCrLf
@@ -11128,8 +11181,11 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
         If m_discoveryStopTabUsed Then
             stm.writeText "LEGEND | [DISCOVERY-CONTROL] marks a separate, opt-in control tab. [DISCOVERY-STOP] source=control-tab means STOP clicked; source=control-tab-closed means the tab was closed; source=time-limit means the safety maximum elapsed. Control-tab cleanup is separate; the target page DOM is unchanged." & vbCrLf
         End If
-        stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed script loads handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
-        stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]." & vbCrLf
+        stm.writeText "LEGEND | [RECORDER-QUEUE-STATS] (end) = recorder health. events=taken from the event FIFO while recording; parsed=JSON-parsed (reducedEvents of them from a header/cookie-stripped copy; fallbackOriginalParse=reduced copy rejected and original parsed, expected 0); fastPath=suppressed network events (script loads and excludeResources URLs/MIME types) handled without a JSON parse; maxEventFifoDepth=deepest FIFO at a drain start (limit = fifoCap, 20000 while recording; unavailable = fixed 2000); maxDispatchLagMs=largest socket-arrival-to-take delay (maxLagArrivalAt=its arrival time); lagOver1s/lagOver5s=events taken 1 s/5 s or more after arrival; maxDrainGapMs=longest pause between recorder drains; parseMs/fastPathMs=time spent parsing/fast-handling (event retrieval excluded); asyncLossSinceStart=events lost during recording. Large lag means recording itself may have shifted waits and element searches; compare with an unrecorded run before tuning timing from this log." & vbCrLf
+        stm.writeText "LEGEND | fifoByteCap = the communicator FIFO byte cap while recording (LenB of retained event strings; default 32 MiB, raised to 128 MiB while recording; Collection/Variant overhead not included). maxFifoBytes = peak LenB held during this recording. fifoOverflow=n (byBytes=m): m of the n evictions happened because the byte cap, not the count cap, was reached." & vbCrLf
+        stm.writeText "LEGEND | asyncLossSinceStart (transportOversize=n) = how many of the lost events were dropped at the 5 MiB transport receive cap; such requests never reach the timeline and are absent from [REQ-UNPAIRED]. fifoOverflow=n = queued events the communicator evicted, oldest first, because its event FIFO reached its count or byte limit (included in the asyncLossSinceStart total, not added to it); unavailable means the communicator does not expose that counter." & vbCrLf
+        stm.writeText "LEGEND | [FIFO-PHASE] (diagnostic) marks navigate and its settle: nav-begin (just before browsingContext.navigate is sent), nav-end (response received; no recorder drain runs while it is awaited), url-stable-end, spa-end, settle-begin (settle of an adopted navigation), settle-error. overflowDelta = events the communicator FIFO evicted since the previous mark, overflowTotal = since recording started, depth = FIFO depth at that moment (not at a drain start). A nonzero delta locates the phase in which eviction happened; it does not identify which events were evicted." & vbCrLf
+        stm.writeText "LEGEND | [FIFO-PHASE] phase=manual-drain (during manual recording) or phase=drain (elsewhere) is written after a recorder drain only when the FIFO evicted events since the previous such line; overflowDelta counts those evictions, so these lines show when eviction happened, including between the navigate/settle marks (whose deltas are counted separately). At most 40 such lines per recording." & vbCrLf
         If m_rqLossCauseShown Then
             stm.writeText "LEGEND | asyncLossSinceStart other causes, listed only when nonzero: parsedOversize=events larger than the 512 KiB parsed-event limit, discarded without parsing; malformed=events that were not valid JSON; dispatch=events parsed but whose handler failed. The listed causes need not add up to the total. A lost network terminal event leaves its request open in [REQ-UNPAIRED]." & vbCrLf
             stm.writeText "LEGEND | critical= (always shown with a nonzero loss) counts lost events the wrapper itself depends on: browsing-context created/destroyed, navigationStarted, download, file dialog, or events whose method could not be read. critical=0 means context tracking, download capture and file-dialog capture lost nothing; SPA idle waits count Fetch/XHR inside the page and do not depend on these events. Not covered by critical: network responses used by ArmNetworkSignal and by the HTTP status of ExecuteNavigateAndGetStatus, so a wait ending signal=net:miss next to a nonzero loss may have lost its response." & vbCrLf
@@ -11339,6 +11395,7 @@ Public Sub StopAndSaveDiscoveryLog(Optional ByVal filePath As String = ".\discov
     m_actionSessionToken = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
     Set m_userActionSeenPushKeys = Nothing
+    ResetUserActionSeqState False
     Set m_userActionCtxUrlByRealm = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
     Set m_userActionContextUrlByContext = Nothing
@@ -11373,6 +11430,7 @@ StopFailedCleanup:
     If Not outStm Is Nothing Then outStm.Close
 
     m_isRecording = False
+    RestoreRecorderFifoCap False
 
     Dim stopBodyCleanupFailure As String
     Call ReleaseBodyDataCollectorBestEffort(stopBodyCleanupFailure)
@@ -11396,6 +11454,7 @@ StopFailedCleanup:
     m_actionSessionToken = vbNullString
     Set m_userActionReadyRealmByContext = Nothing
     Set m_userActionSeenPushKeys = Nothing
+    ResetUserActionSeqState False
     Set m_userActionCtxUrlByRealm = Nothing
     Set m_userActionLastDclRealmByContext = Nothing
     Set m_userActionContextUrlByContext = Nothing
@@ -11573,6 +11632,7 @@ End Sub
 
 Public Sub ProcessRecorderQueue()
     ProcessRecorderQueueCore False
+    NoteFifoOverflowAfterDrain
 
     ' Only the explicit timed manual recorder can issue repair calls. Never inject
     ' from FormatAndStoreLog / ProcessRecorderQueueCore (non-reentrant dispatcher).
@@ -11590,10 +11650,13 @@ Public Sub ProcessRecorderQueue()
     PollDiscoverySpaActivityIfDue
 End Sub
 
-Private Sub DrainNonBlockingRecorderQueue()
+Private Sub DrainNonBlockingRecorderQueue(Optional ByVal skipFairnessCountCap As Boolean = False, _
+                                         Optional ByVal budgetMs As Long = 0)
     ' Internal drains must remain transport-only. In particular, QuerySpaProbe -> CallScript ->
     ' ResolveTargetContext can enter here; polling Discovery DOM again would recurse.
-    ProcessRecorderQueueCore True
+    ' Only URL-stability heartbeat opts out of the 32-message fairness cap and passes budgetMs.
+    ProcessRecorderQueueCore True, skipFairnessCountCap, budgetMs
+    NoteFifoOverflowAfterDrain
 End Sub
 
 Private Sub ScheduleNextDiscoveryDomPoll(ByVal probeAvailable As Boolean)
@@ -11916,6 +11979,176 @@ Private Sub RecordDispatchEventLoss(ByVal json As Object, ByRef detectedMethod A
     End Select
 End Sub
 
+' Diagnostic only: writes where FIFO overflow happened relative to navigate and its settle
+' phases. Changes no queue behaviour. overflowDelta is the eviction count since the previous
+' mark, overflowTotal since recording started, depth the FIFO depth at this moment.
+Private Sub NoteFifoPhase(ByVal phase As String)
+    If Not m_isRecording Then Exit Sub
+    If socket_ Is Nothing Then Exit Sub
+    On Error GoTo Done
+
+    Dim available As Boolean
+    Dim nowOverflow As Long
+    nowOverflow = SafeFifoOverflowCount(available)
+
+    Dim depth As Long: depth = SafeEventQueueDepth()
+
+    Dim line As String
+    line = "[" & Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & "s] [FIFO-PHASE] phase=" & phase
+    If available Then
+        line = line & " | overflowDelta=" & CStr(NonNegativeDelta(nowOverflow, m_fifoPhaseLastOverflow)) & _
+                      " | overflowTotal=" & CStr(NonNegativeDelta(nowOverflow, m_rqFifoOverflowBaseline))
+        m_fifoPhaseLastOverflow = nowOverflow
+    Else
+        line = line & " | overflow=unavailable"
+    End If
+    PushTimelineLine line & " | depth=" & CStr(depth)
+Done:
+    Err.Clear
+End Sub
+
+' Diagnostic only: called after each recorder drain. Writes a line only when the communicator
+' evicted events since the previous drain-level check, so it shows when (not why) overflow
+' happened outside the navigate/settle marks, e.g. during manual recording.
+Private Sub NoteFifoOverflowAfterDrain()
+    Const MAX_DRAIN_LINES As Long = 40
+    If Not m_isRecording Then Exit Sub
+    If socket_ Is Nothing Then Exit Sub
+    On Error GoTo Done
+
+    Dim available As Boolean
+    Dim nowOverflow As Long
+    nowOverflow = SafeFifoOverflowCount(available)
+    If Not available Then Exit Sub
+    If nowOverflow <= m_fifoDrainLastOverflow Then Exit Sub
+
+    Dim delta As Long: delta = nowOverflow - m_fifoDrainLastOverflow
+    m_fifoDrainLastOverflow = nowOverflow
+    If m_fifoDrainLinesWritten >= MAX_DRAIN_LINES Then
+        m_fifoDrainLinesOmitted = m_fifoDrainLinesOmitted + 1
+        Exit Sub
+    End If
+    m_fifoDrainLinesWritten = m_fifoDrainLinesWritten + 1
+
+    Dim phase As String
+    If m_discoveryManualPumpActive Then phase = "manual-drain" Else phase = "drain"
+    PushTimelineLine "[" & Format((socket_.nowMs() / 1000) - m_recorderStartTime, "0.00") & _
+                     "s] [FIFO-PHASE] phase=" & phase & _
+                     " | overflowDelta=" & CStr(delta) & _
+                     " | overflowTotal=" & CStr(NonNegativeDelta(nowOverflow, m_rqFifoOverflowBaseline)) & _
+                     " | depth=" & CStr(SafeEventQueueDepth())
+Done:
+    Err.Clear
+End Sub
+
+' Raises the communicator FIFO caps while recording; restored by RestoreRecorderFifoCap.
+Private Sub RaiseRecorderFifoCap()
+    m_recorderFifoCapText = "unavailable"
+    m_recorderFifoBytesText = "unavailable"
+    If socket_ Is Nothing Then Exit Sub
+    On Error Resume Next
+
+    ' Only raise: a cap already at or above the recorder cap is left untouched (and not restored).
+    Dim prevCap As Long
+    If Not m_recorderFifoCapRaised Then
+        prevCap = socket_.EventBufferMaxCount
+        If Err.Number = 0 Then
+            If prevCap < RECORDER_FIFO_COUNT_CAP Then
+                socket_.EventBufferMaxCount = RECORDER_FIFO_COUNT_CAP
+                If Err.Number = 0 Then
+                    m_recorderFifoCapPrev = prevCap
+                    m_recorderFifoCapRaised = True
+                End If
+            End If
+        End If
+        Err.Clear
+    End If
+    m_recorderFifoCapText = CStr(socket_.EventBufferMaxCount)
+    If Err.Number <> 0 Then m_recorderFifoCapText = "unavailable"
+    Err.Clear
+
+    Dim prevBytes As Long
+    If Not m_recorderFifoBytesRaised Then
+        prevBytes = socket_.EventBufferMaxBytes
+        If Err.Number = 0 Then
+            If prevBytes < RECORDER_FIFO_BYTE_CAP Then
+                socket_.EventBufferMaxBytes = RECORDER_FIFO_BYTE_CAP
+                If Err.Number = 0 Then
+                    m_recorderFifoBytesPrev = prevBytes
+                    m_recorderFifoBytesRaised = True
+                End If
+            End If
+        End If
+        Err.Clear
+    End If
+    m_recorderFifoBytesText = CStr(socket_.EventBufferMaxBytes)
+    If Err.Number <> 0 Then m_recorderFifoBytesText = "unavailable"
+    Err.Clear
+
+    socket_.ResetEventBufferPeak
+    Err.Clear
+End Sub
+
+Private Function SafeFifoByBytesCount(ByRef available As Boolean) As Long
+    available = False
+    On Error GoTo Unavailable
+    SafeFifoByBytesCount = socket_.FifoOverflowByBytesCount
+    available = True
+    Exit Function
+Unavailable:
+    Err.Clear
+End Function
+
+Private Function RecorderFifoPeakText() As String
+    On Error GoTo Unavailable
+    RecorderFifoPeakText = CStr(socket_.MaxEventBufferBytes)
+    Exit Function
+Unavailable:
+    RecorderFifoPeakText = "unavailable"
+    Err.Clear
+End Function
+
+Private Function SafeEventBufferBytes() As Long
+    On Error GoTo Unavailable
+    SafeEventBufferBytes = socket_.EventBufferBytes
+    Exit Function
+Unavailable:
+    SafeEventBufferBytes = 0
+    Err.Clear
+End Function
+
+' drainFirst: dispatch the backlog down below the previous cap first, so lowering the cap does
+' not evict buffered events on the next enqueue. Teardown paths restore without draining.
+Private Sub RestoreRecorderFifoCap(ByVal drainFirst As Boolean)
+    If Not m_recorderFifoCapRaised And Not m_recorderFifoBytesRaised Then Exit Sub
+    Dim countRaised As Boolean: countRaised = m_recorderFifoCapRaised
+    Dim bytesRaised As Boolean: bytesRaised = m_recorderFifoBytesRaised
+    m_recorderFifoCapRaised = False
+    m_recorderFifoBytesRaised = False
+    If socket_ Is Nothing Then Exit Sub
+    On Error Resume Next
+    If drainFirst Then
+        Dim pass As Long
+        Dim fits As Boolean
+        For pass = 1 To 60
+            fits = True
+            If countRaised Then fits = (SafeEventQueueDepth() < m_recorderFifoCapPrev)
+            If fits And bytesRaised Then fits = (SafeEventBufferBytes() < m_recorderFifoBytesPrev)
+            If fits Then Exit For
+            ProcessRecorderQueueCore False
+        Next pass
+    End If
+    If countRaised Then socket_.EventBufferMaxCount = m_recorderFifoCapPrev
+    If bytesRaised Then socket_.EventBufferMaxBytes = m_recorderFifoBytesPrev
+    If m_debugMode Then
+        Debug.Print "BiDi: recorder FIFO caps restored | EventBufferMaxCount=" & _
+                    CStr(socket_.EventBufferMaxCount) & _
+                    " | EventBufferMaxBytes=" & CStr(socket_.EventBufferMaxBytes) & _
+                    " | depth=" & CStr(SafeEventQueueDepth())
+    End If
+    Err.Clear
+End Sub
+
 Private Sub ResetRecorderQueueStats()
     m_rqEvents = 0: m_rqDrains = 0: m_rqParsed = 0: m_rqFast = 0: m_rqFastMs = 0#
     m_rqParseMs = 0#
@@ -11928,6 +12161,14 @@ Private Sub ResetRecorderQueueStats()
     m_rqMaxDrainGapMs = 0#: m_rqMaxDrainGapEndSec = 0#: m_rqLastDrainEndMs = 0#
     m_rqLossBaseline = CurrentTotalAsyncEventLossCount()
     m_rqOversizeBaseline = SafeTransportOversizedEventCount()
+    Dim fifoBaselineAvailable As Boolean
+    m_rqFifoOverflowBaseline = SafeFifoOverflowCount(fifoBaselineAvailable)
+    m_rqFifoByBytesBaseline = SafeFifoByBytesCount(fifoBaselineAvailable)
+    m_fifoPhaseLastOverflow = m_rqFifoOverflowBaseline
+    m_fifoPhaseSettleMarked = False
+    m_fifoDrainLastOverflow = m_rqFifoOverflowBaseline
+    m_fifoDrainLinesWritten = 0
+    m_fifoDrainLinesOmitted = 0
     m_rqParsedOversizeBaseline = SafeParsedOversizeCount()
     m_rqMalformedBaseline = SafeParsedMalformedCount()
     m_rqDispatchBaseline = m_dispatchEventLossCount
@@ -11975,7 +12216,18 @@ Private Function NonNegativeDelta(ByVal current As Long, ByVal baseline As Long)
     If current > baseline Then NonNegativeDelta = current - baseline
 End Function
 
-' Transport-cap event drops; already included in the total async loss count.
+' FIFO-overflow event drops; already included in the total async loss count.
+Private Function SafeFifoOverflowCount(ByRef available As Boolean) As Long
+    available = False
+    On Error GoTo Unavailable
+    SafeFifoOverflowCount = socket_.FifoOverflowEventCount
+    available = True
+    Exit Function
+Unavailable:
+    SafeFifoOverflowCount = 0
+    Err.Clear
+End Function
+
 Private Function SafeTransportOversizedEventCount() As Long
     On Error GoTo Unavailable
     SafeTransportOversizedEventCount = socket_.TransportOversizedEventCount
@@ -12038,6 +12290,20 @@ Private Sub AppendRecorderQueueStats()
         If oversizeDelta < 0 Then oversizeDelta = 0
         lossText = lossText & " (transportOversize=" & CStr(oversizeDelta)
 
+        Dim fifoAvailable As Boolean
+        Dim fifoNow As Long
+        fifoNow = SafeFifoOverflowCount(fifoAvailable)
+        If fifoAvailable Then
+            lossText = lossText & ", fifoOverflow=" & CStr(NonNegativeDelta(fifoNow, m_rqFifoOverflowBaseline))
+            Dim byBytesAvailable As Boolean
+            Dim byBytesNow As Long
+            byBytesNow = SafeFifoByBytesCount(byBytesAvailable)
+            If byBytesAvailable Then _
+                lossText = lossText & " (byBytes=" & CStr(NonNegativeDelta(byBytesNow, m_rqFifoByBytesBaseline)) & ")"
+        Else
+            lossText = lossText & ", fifoOverflow=unavailable"
+        End If
+
         Dim causeDelta As Long
         causeDelta = NonNegativeDelta(SafeParsedOversizeCount(), m_rqParsedOversizeBaseline)
         If causeDelta > 0 Then lossText = lossText & ", parsedOversize=" & CStr(causeDelta)
@@ -12060,6 +12326,9 @@ Private Sub AppendRecorderQueueStats()
                      " | reducedEvents=" & CStr(m_rqReduced) & " | fallbackOriginalParse=" & CStr(m_rqReducedFallback) & _
                      " | drains=" & CStr(m_rqDrains) & _
                      " | maxEventFifoDepth=" & CStr(m_rqMaxDepth) & _
+                     " | fifoCap=" & m_recorderFifoCapText & _
+                     " | fifoByteCap=" & m_recorderFifoBytesText & _
+                     " | maxFifoBytes=" & RecorderFifoPeakText() & _
                      " | maxDispatchLagMs=" & Format$(m_rqMaxLagMs, "0") & _
                      " | maxLagArrivalAt=" & Format$(m_rqMaxLagArrivalSec, "0.00") & "s" & _
                      " | lagOver1s=" & CStr(m_rqLagOver1s) & " | lagOver5s=" & CStr(m_rqLagOver5s) & _
@@ -12075,8 +12344,14 @@ Private Sub AppendRecorderQueueStats()
 End Sub
 
 
-Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
+Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean, _
+                                     Optional ByVal skipFairnessCountCap As Boolean = False, _
+                                     Optional ByVal budgetMs As Long = 0)
     If m_isProcessingQueue Then Exit Sub
+    ' budgetMs > 0 replaces the non-blocking 250ms budget (used for the idle part of the
+    ' URL-stability heartbeat); it is checked after each event, like the default budget.
+    Dim drainBudgetMs As Long: drainBudgetMs = NONBLOCKING_DRAIN_BUDGET_MS
+    If budgetMs > 0 Then drainBudgetMs = budgetMs
 
     m_isProcessingQueue = True
     Dim json As Object
@@ -12185,8 +12460,10 @@ Private Sub ProcessRecorderQueueCore(ByVal nonBlocking As Boolean)
         End If
 
         If nonBlocking Then
-            If processedCount >= NONBLOCKING_DRAIN_MAX_MESSAGES Then Exit Do
-            If (socket_.nowMs() - batchStartMs) >= NONBLOCKING_DRAIN_BUDGET_MS Then Exit Do
+            If Not skipFairnessCountCap Then
+                If processedCount >= NONBLOCKING_DRAIN_MAX_MESSAGES Then Exit Do
+            End If
+            If (socket_.nowMs() - batchStartMs) >= drainBudgetMs Then Exit Do
         Else
             If (processedCount Mod 100) = 0 Then socket_.PumpMessages 100
         End If
@@ -15274,9 +15551,10 @@ Private Sub WaitHeartbeat(Optional ByVal sleepMs As Long = 50)
     socket_.IdleReceive vSleep
 End Sub
 
-' URL-stability polling needs queue fairness, while other waits retain the historical full drain.
+' URL-stability polling uses the 250ms budget without the 32-message cap;
+' ordinary command-side drains stay capped, while other waits retain the full drain.
 Private Sub WaitHeartbeatBounded(Optional ByVal sleepMs As Long = 50)
-    DrainNonBlockingRecorderQueue
+    DrainNonBlockingRecorderQueue skipFairnessCountCap:=True
 
     socket_.PumpMessages 100
     AssertSessionContinuity "BiDi:WaitHeartbeatBounded"
@@ -15284,8 +15562,26 @@ Private Sub WaitHeartbeatBounded(Optional ByVal sleepMs As Long = 50)
     Dim vSleep As Long: vSleep = sleepMs
     If vSleep < 50 Then vSleep = 50
 
+    ' While the FIFO still holds events, spend the idle slot draining them (bounded by the
+    ' remaining slot time) instead of only receiving more. The slot length, and so the
+    ' URL-check cadence, is unchanged. Stop when a drain makes no progress (re-entrancy guard,
+    ' or the queue is not shrinking) so this never spins.
+    Dim slotStartMs As Double: slotStartMs = socket_.nowMs()
+    Dim remainMs As Double
+    Dim depthBefore As Long, depthAfter As Long
+    Do
+        depthBefore = SafeEventQueueDepth()
+        If depthBefore <= 0 Then Exit Do
+        remainMs = CDbl(vSleep) - (socket_.nowMs() - slotStartMs)
+        If remainMs < 1# Then Exit Do
+        DrainNonBlockingRecorderQueue True, CLng(remainMs)
+        depthAfter = SafeEventQueueDepth()
+        If depthAfter >= depthBefore Then Exit Do
+    Loop
+
     ' Keep receiving while idle so event arrival times stay close to the wire.
-    socket_.IdleReceive vSleep
+    remainMs = CDbl(vSleep) - (socket_.nowMs() - slotStartMs)
+    If remainMs >= 1# Then socket_.IdleReceive CLng(remainMs)
 End Sub
 
 Private Function GetProbeJs(ByVal probeType As String) As String
@@ -16779,7 +17075,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "      if (el.children && el.children.length>12) return '';"
     js = js & "      return scrubText(el.innerText || el.textContent || '');"
     js = js & "    };"
-    js = js & "    const isActionable = el => el && el.nodeType===1 && (/^(BUTTON|A|INPUT|SELECT|TEXTAREA|OPTION)$/.test(el.tagName) || (el.tagName==='LABEL' && !!el.control) || /^(button|option|combobox|gridcell|tab|link|checkbox|radio|textbox|menuitem|listbox)$/i.test(el.getAttribute('role')||''));"
+    js = js & "    const isActionable = el => el && el.nodeType===1 && (/^(BUTTON|A|INPUT|SELECT|TEXTAREA|OPTION)$/.test(el.tagName) || (el.tagName==='LABEL' && !!el.control) || /^(button|link|checkbox|radio|switch|tab|option|treeitem|gridcell|menuitem|menuitemcheckbox|menuitemradio|combobox|textbox|searchbox|slider|spinbutton|listbox)$/i.test((el.getAttribute('role')||'').trim().split(/\s+/)[0]));"
     js = js & "    const pathOf = e => { try {return e.composedPath();} catch (_) {return [e.target];} };"
     ' v12: k/n among same-tag element siblings under the same parent (a ShadowRoot counts as the
     ' parent of its top-level elements); only for elements without an id and only when n > 1.
@@ -16904,6 +17200,7 @@ Private Sub StartDiscoveryUserActionPreload()
     js = js & "        ['focusin',onDocumentFocus],['change',onDocumentChange]]) {"
     js = js & "        document.removeEventListener(name,fn,true);document.addEventListener(name,fn,true);"
     js = js & "      }return true;}catch(_){return false;}};"
+    js = js & "    globalThis[key].getSeq=()=>seq;"
     js = js & "return true;"
     js = js & "}catch(_){return false;}}"
 
@@ -17079,13 +17376,62 @@ Failed:
     Err.Clear
 End Function
 
-Private Function TryDisposeUserActionInContext(ByVal contextId As String, _
-                                               ByRef failure As String) As Boolean
-    Const DISPOSE_JS As String = _
-        "function(){var k=Symbol.for('seleniumvba.user.action.push');" & _
-        "var r=globalThis[k];if(r&&typeof r.dispose==='function')r.dispose();return true;}"
-    TryDisposeUserActionInContext = _
-        TryCallDiscoveryActionInContext(contextId, DISPOSE_JS, failure)
+' Disposes the observer and returns its last issued seq in the same script call, so no action
+' can be numbered between the read and the detach. The page returns -1 when the realm has no
+' observer. The answering realm is taken from result.realm because the context may have
+' navigated since its pushes were logged. Addressed like TryCallDiscoveryActionInContext.
+Private Function TryDisposeUserActionReadSeq(ByVal contextId As String, _
+                                             ByRef failure As String) As Boolean
+    Const DISPOSE_SEQ_JS As String = _
+        "function(){var k=Symbol.for('seleniumvba.user.action.push');var r=globalThis[k];" & _
+        "if(!r)return -1;var s=(typeof r.getSeq==='function')?r.getSeq():-2;" & _
+        "if(typeof r.dispose==='function')r.dispose();return s;}"
+    failure = vbNullString
+    On Error GoTo Failed
+
+    Dim target As New Dictionary
+    Dim realmId As String
+    If TryResolveWindowRealmForContext(contextId, realmId) Then
+        target.Add "realm", realmId
+    Else
+        target.Add "context", contextId
+    End If
+    Dim params As New Dictionary
+    params.Add "functionDeclaration", DISPOSE_SEQ_JS
+    params.Add "arguments", New Collection
+    params.Add "target", target
+    params.Add "awaitPromise", False
+
+    Dim raw As String
+    raw = ExecuteBiDiCommand("script.callFunction", params, True, _
+                             allowAmbiguousRetry:=True, _
+                             allowRecoveryRetry:=False, _
+                             allowContextRetarget:=False, _
+                             commandTimeoutMs:=2000)
+    Dim parsed As Object
+    Set parsed = ValidateProtocolResponse(raw, "script.callFunction")
+
+    Dim seqValue As Variant
+    Assign seqValue, GetPathValue(parsed, "result.result.value")
+    If IsEmpty(seqValue) Or IsNull(seqValue) Or IsObject(seqValue) Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryDisposeUserActionReadSeq", _
+                  "User-action dispose did not return a sequence number."
+    End If
+    If Not IsNumeric(seqValue) Then
+        Err.Raise ERR_BIDI_PROTOCOL, "BiDi:TryDisposeUserActionReadSeq", _
+                  "User-action dispose did not return a sequence number."
+    End If
+
+    Dim finalSeq As Long: finalSeq = CLng(seqValue)
+    Dim answeredRealm As String: answeredRealm = GetPathString(parsed, "result.realm")
+    If finalSeq >= 0 And Len(answeredRealm) > 0 Then _
+        NoteUserActionFinalSeq answeredRealm, contextId, finalSeq
+    TryDisposeUserActionReadSeq = True
+    Exit Function
+
+Failed:
+    failure = "Err " & CStr(Err.Number) & ": " & Err.description
+    Err.Clear
 End Function
 
 Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, _
@@ -17125,7 +17471,7 @@ Private Function ApplyDiscoveryActionScriptToContexts(ByVal js As String, _
             If Not m_popupScopeAllowed Is Nothing Then m_popupScopeAllowed(CStr(id)) = True
         End If
         If dispose Then
-            ok = TryDisposeUserActionInContext(CStr(id), failure)
+            ok = TryDisposeUserActionReadSeq(CStr(id), failure)
         Else
             ok = TryCallDiscoveryActionInContext(CStr(id), code, failure)
         End If
@@ -17325,12 +17671,14 @@ Private Sub HandleDiscoveryUserActionPushCore(ByVal json As Object, ByVal messag
                              ctxUrlSuffix & arrival
         Case "click-confirm"
             m_userActionConfirmCount = m_userActionConfirmCount + 1
+            NoteUserActionConfirmSeq realmId, seq
             PushTimelineLine "[" & relTime & "] [USER-ACTION-CONFIRM] " & common & _
                              " | event=click" & arrival
         Case "pointerdown", "click", "focusin", "change"
             Dim line As String: line = GetPathString(payload, "line")
             If Len(line) = 0 Then GoTo InvalidPayload
             m_userActionCount = m_userActionCount + 1
+            NoteUserActionSeq realmId, contextId, seq
             PushTimelineLine "[" & relTime & "] [USER-ACTION] " & common & _
                              " | frameUrl=" & NormalizeNavigationDetail(GetPathString(payload, "url")) & _
                              ctxUrlSuffix & " | " & line & arrival
@@ -17451,6 +17799,7 @@ Private Function RoutePopupScopedPush(ByVal json As Object, ByVal message As Str
     If m_popupPending Is Nothing Then Set m_popupPending = New Collection
     If m_popupPending.count >= POPUP_PENDING_MAX Then
         m_popupPendingOverflow = m_popupPendingOverflow + 1
+        NoteUserActionScopeDrop json, message
         Exit Function
     End If
     m_popupPending.Add Array(ctx, json, message, relTime, arrival, socket_.nowMs())
@@ -17547,6 +17896,7 @@ Private Sub ResolvePendingPopupPushes(ByVal force As Boolean)
         ElseIf force Or (nowValue - CDbl(item(5))) >= POPUP_PENDING_GIVEUP_MS Then
             ' Context already gone (or tree unavailable): membership cannot be proven.
             m_popupUnresolvedDropped = m_popupUnresolvedDropped + 1
+            NoteUserActionScopeDrop item(1), CStr(item(2))
         Else
             keep.Add item
         End If
@@ -17685,8 +18035,247 @@ Done:
     Err.Clear
 End Sub
 
+' ===== v13: per-realm action sequence checks =====
+' The observer numbers pointerdown/click/focusin/change pushes 1,2,3... per realm (click-confirm
+' reuses the pointerdown seq). Re-delivered pushes are dropped by the seen-key check before they
+' reach NoteUserActionSeq, so a Back/Forward cache restore does not disturb the numbering, and
+' rehook keeps the same closure, so no baseline reset is needed. Gaps are judged only at Stop,
+' so out-of-order delivery cannot produce a false gap. A gap shows that a push was lost; it does
+' not show why.
+Private Sub ResetUserActionSeqState(ByVal create As Boolean)
+    If create Then
+        Set m_userActionSeqReceived = New Dictionary
+        Set m_userActionSeqMax = New Dictionary
+        Set m_userActionSeqCtx = New Dictionary
+        Set m_userActionSeqDropped = New Dictionary
+        Set m_userActionConfirmSeqs = New Dictionary
+        Set m_userActionFinalSeq = New Dictionary
+        Set m_userActionFinalCtx = New Dictionary
+    Else
+        Set m_userActionSeqReceived = Nothing
+        Set m_userActionSeqMax = Nothing
+        Set m_userActionSeqCtx = Nothing
+        Set m_userActionSeqDropped = Nothing
+        Set m_userActionConfirmSeqs = Nothing
+        Set m_userActionFinalSeq = Nothing
+        Set m_userActionFinalCtx = Nothing
+    End If
+    m_userActionGapNumbers = 0
+    m_userActionScopeDroppedNumbers = 0
+    m_userActionConfirmOrphans = 0
+    m_userActionSeqEndChecked = 0
+    m_userActionSeqEndUnverified = 0
+End Sub
+
+Private Sub NoteUserActionSeq(ByVal realmId As String, ByVal contextId As String, ByVal seq As Long)
+    If m_userActionSeqReceived Is Nothing Then Exit Sub
+    If realmId = "(missing)" Or seq <= 0 Then Exit Sub
+
+    Dim got As Dictionary
+    If m_userActionSeqReceived.Exists(realmId) Then
+        Set got = m_userActionSeqReceived(realmId)
+    Else
+        Set got = New Dictionary
+        m_userActionSeqReceived.Add realmId, got
+    End If
+    got(CStr(seq)) = True
+
+    If m_userActionSeqMax.Exists(realmId) Then
+        If seq > CLng(m_userActionSeqMax(realmId)) Then m_userActionSeqMax(realmId) = seq
+    Else
+        m_userActionSeqMax(realmId) = seq
+    End If
+    m_userActionSeqCtx(realmId) = contextId
+End Sub
+
+Private Sub NoteUserActionConfirmSeq(ByVal realmId As String, ByVal seq As Long)
+    If m_userActionConfirmSeqs Is Nothing Then Exit Sub
+    If realmId = "(missing)" Or seq <= 0 Then Exit Sub
+    m_userActionConfirmSeqs(realmId & "|" & CStr(seq)) = True
+End Sub
+
+' A numbered push the recorder itself discarded while deciding popup scope. Only the realm and
+' seq are kept; the push content is never logged.
+Private Sub NoteUserActionScopeDrop(ByVal json As Object, ByVal message As String)
+    On Error GoTo Done
+    If m_userActionSeqDropped Is Nothing Then Exit Sub
+    Dim realmId As String: realmId = GetPathString(json, "params.source.realm")
+    If Len(realmId) = 0 Then Exit Sub
+
+    Dim payload As Object
+    Set payload = WebJsonConverter.ParseJson(Mid$(message, Len(USER_ACTION_PUSH_PREFIX) + 1))
+    If payload Is Nothing Then Exit Sub
+    If GetPathString(payload, "token") <> m_actionSessionToken Then Exit Sub
+    Select Case GetPathString(payload, "kind")
+        Case "pointerdown", "click", "focusin", "change"
+        Case Else
+            Exit Sub
+    End Select
+
+    Dim seqText As String: seqText = GetPathString(payload, "seq")
+    If Not IsNumeric(seqText) Then Exit Sub
+    m_userActionSeqDropped(realmId & "|" & CStr(CLng(seqText))) = True
+Done:
+    Err.Clear
+End Sub
+
+Private Sub NoteUserActionFinalSeq(ByVal realmId As String, ByVal contextId As String, _
+                                   ByVal finalSeq As Long)
+    If m_userActionFinalSeq Is Nothing Then Exit Sub
+    m_userActionFinalSeq(realmId) = finalSeq
+    m_userActionFinalCtx(realmId) = contextId
+End Sub
+
+' Dispose also reaches contexts that only sent out-of-scope pushes (popup mode), such as the
+' STOP tab. Their pushes were discarded on purpose, so their final seq is not a loss signal.
+Private Function UserActionFinalInScope(ByVal realmId As String) As Boolean
+    If Not m_capturePopupActions Then
+        UserActionFinalInScope = True
+        Exit Function
+    End If
+    If m_popupScopeAllowed Is Nothing Then Exit Function
+    If Not m_userActionFinalCtx.Exists(realmId) Then Exit Function
+    UserActionFinalInScope = m_popupScopeAllowed.Exists(CStr(m_userActionFinalCtx(realmId)))
+End Function
+
+Private Sub EmitUserActionGapLine(ByVal realmId As String, ByVal ctxText As String, _
+                                  ByVal fromSeq As Long, ByVal toSeq As Long, _
+                                  ByVal reason As String, ByVal isTail As Boolean, _
+                                  ByVal maxReceived As Long, ByVal finalSeq As Long, _
+                                  ByRef linesOut As Long, ByRef linesOmitted As Long)
+    Const MAX_GAP_LINES As Long = 50
+    If linesOut >= MAX_GAP_LINES Then
+        linesOmitted = linesOmitted + 1
+        Exit Sub
+    End If
+
+    Dim rangeText As String
+    If fromSeq = toSeq Then rangeText = CStr(fromSeq) Else rangeText = CStr(fromSeq) & ".." & CStr(toSeq)
+
+    If isTail Then
+        PushTimelineLine "[end] [USER-ACTION-SEQ-END] realm=" & realmId & " | ctx=" & ctxText & _
+                         " | receivedMax=" & CStr(maxReceived) & " | finalSeq=" & CStr(finalSeq) & _
+                         " | missing=" & rangeText & " | status=gap | reason=" & reason
+    Else
+        PushTimelineLine "[end] [USER-ACTION-GAP] realm=" & realmId & " | ctx=" & ctxText & _
+                         " | missing=" & rangeText & " | reason=" & reason
+    End If
+    linesOut = linesOut + 1
+End Sub
+
+Private Sub EmitUserActionMissingRanges(ByVal realmId As String, ByVal ctxText As String, _
+                                        ByVal fromSeq As Long, ByVal toSeq As Long, _
+                                        ByVal got As Dictionary, ByVal isTail As Boolean, _
+                                        ByVal maxReceived As Long, ByVal finalSeq As Long, _
+                                        ByRef linesOut As Long, ByRef linesOmitted As Long)
+    Const MAX_SCAN As Long = 100000
+    If toSeq < fromSeq Then Exit Sub
+    If toSeq - fromSeq > MAX_SCAN Then toSeq = fromSeq + MAX_SCAN
+
+    Dim s As Long, runStart As Long, runReason As String, reason As String
+    Dim present As Boolean
+    For s = fromSeq To toSeq + 1
+        reason = vbNullString
+        If s <= toSeq Then
+            present = False
+            If Not got Is Nothing Then present = got.Exists(CStr(s))
+            If Not present Then
+                If m_userActionSeqDropped.Exists(realmId & "|" & CStr(s)) Then
+                    reason = "scope-dropped"
+                    m_userActionScopeDroppedNumbers = m_userActionScopeDroppedNumbers + 1
+                Else
+                    reason = "unaccounted"
+                    m_userActionGapNumbers = m_userActionGapNumbers + 1
+                End If
+            End If
+        End If
+
+        If StrComp(reason, runReason, vbBinaryCompare) <> 0 Then
+            If runStart > 0 Then
+                EmitUserActionGapLine realmId, ctxText, runStart, s - 1, runReason, isTail, _
+                                      maxReceived, finalSeq, linesOut, linesOmitted
+            End If
+            If Len(reason) > 0 Then runStart = s Else runStart = 0
+            runReason = reason
+        End If
+    Next s
+End Sub
+
+Private Sub FinalizeUserActionSeqChecks()
+    If m_userActionSeqMax Is Nothing Then Exit Sub
+
+    Dim realms As New Dictionary
+    Dim k As Variant
+    For Each k In m_userActionSeqMax.keys
+        realms(CStr(k)) = True
+    Next k
+    For Each k In m_userActionFinalSeq.keys
+        If UserActionFinalInScope(CStr(k)) Then realms(CStr(k)) = True
+    Next k
+
+    Dim linesOut As Long, linesOmitted As Long
+    Dim realmKey As Variant
+    For Each realmKey In realms.keys
+        Dim realmId As String: realmId = CStr(realmKey)
+        Dim maxReceived As Long: maxReceived = 0
+        If m_userActionSeqMax.Exists(realmId) Then maxReceived = CLng(m_userActionSeqMax(realmId))
+
+        Dim got As Dictionary: Set got = Nothing
+        If m_userActionSeqReceived.Exists(realmId) Then Set got = m_userActionSeqReceived(realmId)
+
+        Dim ctxText As String: ctxText = "(unknown)"
+        If m_userActionSeqCtx.Exists(realmId) Then
+            ctxText = CStr(m_userActionSeqCtx(realmId))
+        ElseIf m_userActionFinalCtx.Exists(realmId) Then
+            ctxText = CStr(m_userActionFinalCtx(realmId))
+        End If
+
+        ' Inside the logged range: numbers below the highest logged seq that never arrived.
+        EmitUserActionMissingRanges realmId, ctxText, 1, maxReceived - 1, got, False, _
+                                    maxReceived, 0, linesOut, linesOmitted
+
+        If m_userActionFinalSeq.Exists(realmId) Then
+            Dim finalSeq As Long: finalSeq = CLng(m_userActionFinalSeq(realmId))
+            If maxReceived > 0 Or finalSeq > 0 Then
+                m_userActionSeqEndChecked = m_userActionSeqEndChecked + 1
+                EmitUserActionMissingRanges realmId, ctxText, maxReceived + 1, finalSeq, got, True, _
+                                            maxReceived, finalSeq, linesOut, linesOmitted
+            End If
+        ElseIf maxReceived > 0 Then
+            ' Realm navigated away, closed, or its dispose failed: tail loss is unknown, not zero.
+            m_userActionSeqEndUnverified = m_userActionSeqEndUnverified + 1
+        End If
+    Next realmKey
+
+    For Each k In m_userActionConfirmSeqs.keys
+        Dim sep As Long: sep = InStrRev(CStr(k), "|")
+        Dim confirmRealm As String: confirmRealm = Left$(CStr(k), sep - 1)
+        Dim confirmSeq As String: confirmSeq = Mid$(CStr(k), sep + 1)
+        Dim seen As Boolean: seen = False
+        If m_userActionSeqReceived.Exists(confirmRealm) Then
+            seen = m_userActionSeqReceived(confirmRealm).Exists(confirmSeq)
+        End If
+        If Not seen Then
+            m_userActionConfirmOrphans = m_userActionConfirmOrphans + 1
+            If linesOut < 50 Then
+                PushTimelineLine "[end] [USER-ACTION-CONFIRM-ORPHAN] realm=" & confirmRealm & _
+                                 " | seq=" & confirmSeq & " | note=click confirm arrived but its pointerdown did not"
+                linesOut = linesOut + 1
+            Else
+                linesOmitted = linesOmitted + 1
+            End If
+        End If
+    Next k
+
+    If linesOmitted > 0 Then
+        PushTimelineLine "[end] [USER-ACTION-GAP] ... " & CStr(linesOmitted) & _
+                         " more gap/orphan line(s) omitted; totals are in [USER-ACTION-STATS]"
+    End If
+End Sub
+
 Private Sub AppendUserActionStats()
     If Not m_captureUserActions Then Exit Sub
+    FinalizeUserActionSeqChecks
     If m_userActionTopReadyCount = 0 Then
         PushTimelineLine "[USER-ACTION-ROUTE-SILENT] reason=top-installed-not-observed | " & _
                          "scope=recorder-top | note=possible-silent-console-or-no-install"
@@ -17701,7 +18290,12 @@ Private Sub AppendUserActionStats()
                      " | rehookErrors=" & CStr(m_userActionRebindErrors) & _
                      " | rehookGone=" & CStr(m_userActionRebindGone) & _
                      " | cleanupWarnings=" & CStr(m_userActionCleanupWarnings) & _
-                     " | replayDropped=" & CStr(m_userActionReplayDropped)
+                     " | replayDropped=" & CStr(m_userActionReplayDropped) & _
+                     " | gapNumbers=" & CStr(m_userActionGapNumbers) & _
+                     " | scopeDroppedNumbers=" & CStr(m_userActionScopeDroppedNumbers) & _
+                     " | confirmOrphans=" & CStr(m_userActionConfirmOrphans) & _
+                     " | seqEndChecked=" & CStr(m_userActionSeqEndChecked) & _
+                     " | seqEndUnverified=" & CStr(m_userActionSeqEndUnverified)
     If m_capturePopupActions Then
         Dim scopeCount As Long
         If Not m_popupScopeAllowed Is Nothing Then scopeCount = m_popupScopeAllowed.count
@@ -18973,13 +19567,40 @@ Private Function JwReadLong(ByRef raw As String, ByRef b() As Byte, ByVal n As L
 End Function
 
 
+' Cheap gate before field extraction. A false negative only falls back to the full parse, and
+' every candidate is re-checked with IsRecorderSuppressedUrl / IsNoiseMime, so the token list
+' affects speed, never what is suppressed. Keep it in step with IsNoiseUrl and IsNoiseMime.
+' User idle-ignore patterns are deliberately not gated here (they still suppress after a parse).
+Private Function RawMayHoldSuppressedUrl(ByRef raw As String) As Boolean
+    If m_excludeScripts Then
+        If InStr(1, raw, ".js", vbBinaryCompare) > 0 Or InStr(1, raw, ".mjs", vbBinaryCompare) > 0 Then
+            RawMayHoldSuppressedUrl = True
+            Exit Function
+        End If
+    End If
+    If Not m_excludeResources Then Exit Function
+
+    Dim token As Variant
+    For Each token In Array(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".woff", ".ico", _
+                            "data:", "/_next/static/", "webworker.js", _
+                            "google-analytics", "googletagmanager", "doubleclick", "pagead", _
+                            "/collect", "/pixel", "/beacon", _
+                            """image/", """font/", "text/css")
+        If InStr(1, raw, CStr(token), vbBinaryCompare) > 0 Then
+            RawMayHoldSuppressedUrl = True
+            Exit Function
+        End If
+    Next token
+End Function
+
 Private Function TryExtractRecorderScriptFastFields(ByRef raw As String, ByRef method As String, _
                                                     ByRef reqId As String, ByRef url As String, _
                                                     ByRef redirectCount As Long) As Boolean
     On Error GoTo Fallback
     method = vbNullString: reqId = vbNullString: url = vbNullString: redirectCount = 0
-    If Not m_isRecording Or Not m_excludeScripts Then Exit Function
-    If InStr(1, raw, ".js", vbBinaryCompare) = 0 And InStr(1, raw, ".mjs", vbBinaryCompare) = 0 Then Exit Function
+    If Not m_isRecording Then Exit Function
+    If Not m_excludeScripts And Not m_excludeResources Then Exit Function
+    If Not RawMayHoldSuppressedUrl(raw) Then Exit Function
 
     Dim b() As Byte: b = raw
     Dim n As Long: n = Len(raw)
@@ -19030,7 +19651,12 @@ Private Function TryExtractRecorderScriptFastFields(ByRef raw As String, ByRef m
         If StrComp(url, "UNKNOWN", vbTextCompare) = 0 Then Exit Function
     End If
     If Len(url) = 0 Then Exit Function
-    If Not IsScriptUrl(url) Then Exit Function
+    ' Same suppression rule as FormatAndStoreLog; anything else takes the full parse.
+    If Not IsRecorderSuppressedUrl(url) Then
+        If method <> "network.responseCompleted" Then Exit Function
+        If Not m_excludeResources Then Exit Function
+        If Not IsNoiseMime(mime) Then Exit Function
+    End If
 
     TryExtractRecorderScriptFastFields = True
     Exit Function
