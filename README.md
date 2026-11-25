@@ -1,4 +1,4 @@
-# WebDriver BiDi for SeleniumVBA v8.2
+# WebDriver BiDi for SeleniumVBA v8.3
 ![WebDriver BiDi for SeleniumVBA](image/pr_image.jpg)
 
 This project is a WebDriver BiDi extension for **[SeleniumVBA](https://github.com/GCuser99/SeleniumVBA)** by @GCuser99.
@@ -144,6 +144,7 @@ This procedure targets an element inside an iframe by passing a WebDriver BiDi b
 ### 7. Main07: Consent Auto-Clicker, Shadow DOM, and Explicit Network Gate
 This procedure is the ServiceNow validation scenario and combines several features needed for a difficult third-party SPA.
 
+* **Blocking an unneeded overlay:** Before navigation, `ExecuteEnableResourceBlocking` blocks WalkMe (`cdn.walkme.com`, `ec.walkme.com`), an in-app guidance overlay that the login flow does not need. Without the block the sample halted intermittently; with it, the Immediate Window shows `CDP ResourceBlocking [BLOCK]` for the WalkMe script.
 * **Pre-navigation auto-clicker:** `ExecuteRegisterAutoClicker` is registered before navigation so the browser-side helper can dismiss the consent banner as soon as it appears.
 * **Shadow DOM interaction:** `ExecuteClick "//*[@id='utility-sign-in']//button", searchShadow:=True` locates the sign-in button inside encapsulated web components with a single XPath. The wrapper descends through every ShadowRoot recursively. The same `searchShadow:=True` parameter is available on every API that takes an element XPath, including `ExecuteRegisterAutoClicker`, `ArmContentSignal`, and `ArmVisibilitySignal`.
 * **Arm-then-act network gate:** `ArmNetworkSignal "metadata/application"` is called immediately before the Shadow DOM click. The one-shot signal belongs to the next action wait and helps bridge the transition into the sign-in experience.

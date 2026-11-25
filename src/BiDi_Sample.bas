@@ -2,7 +2,7 @@ Attribute VB_Name = "BiDi_Sample"
 Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
-' Version 8.2 / MIT License / Copyright (c) hanamichi77777
+' Version 8.3 / MIT License / Copyright (c) hanamichi77777
 '
 ' Run one MainXX procedure at a time. Live-site selectors and network signals may
 ' change; rediscover them with the Discovery Log instead of adding fixed delays.
@@ -84,12 +84,12 @@ Private Function FindLatestExtensionVersionFolder(ByVal extensionRoot As String)
   Dim fso As New FileSystemObject
   If Not fso.FolderExists(extensionRoot) Then Exit Function
 
-  Dim versionFolder As Scripting.Folder
+  Dim versionFolder As Scripting.folder
   Dim sortKey As String
   Dim bestKey As String
   For Each versionFolder In fso.GetFolder(extensionRoot).SubFolders
     If fso.FileExists(fso.BuildPath(versionFolder.path, "manifest.json")) Then
-      sortKey = ExtensionVersionSortKey(versionFolder.name)
+      sortKey = ExtensionVersionSortKey(versionFolder.Name)
       If sortKey > bestKey Then
         bestKey = sortKey
         FindLatestExtensionVersionFolder = versionFolder.path
@@ -311,6 +311,10 @@ Public Sub Main07()
     .OpenBrowser caps
     Set bidi = New BiDiCommandWrapper
     bidi.ConnectTo driver.GetWebSocketUrl
+
+    ' WalkMe (in-app guidance overlay) is not needed for login; without this block the
+    ' sample intermittently halts. Block it before navigation.
+    bidi.ExecuteEnableResourceBlocking Array("*cdn.walkme.com*", "*ec.walkme.com*")
 
     bidi.StartDiscoveryLog
 

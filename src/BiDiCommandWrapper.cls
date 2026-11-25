@@ -11,7 +11,7 @@ Option Explicit
 ' WebDriver BiDi for SeleniumVBA
 ' https://github.com/hanamichi77777/WebDriver-BiDi-for-SeleniumVBA
 ' MIT License / Copyright (c) hanamichi77777
-Private Const BIDI_WRAPPER_VERSION As String = "8.2"
+Private Const BIDI_WRAPPER_VERSION As String = "8.3"
 '
 ' BiDiCommandWrapper owns command policy, recovery and SPA synchronization;
 ' BiDiSocketCommunicator owns transport and request IDs.
@@ -484,7 +484,8 @@ Private m_newContextOpenerScope As String
 ' Unified download capture. One engine handles a String XPath, a one-item Array/Collection,
 ' or multiple triggers. The outer Dictionary is keyed by a protocol correlation key and each
 ' value is a Dictionary containing one download transaction. Correlation prefers the BiDi
-' download UUID; context+navigation is the measured Edge fallback.
+' download UUID; context+navigation is the fallback for builds that omit it (Edge, 2026-08).
+' Re-measured 2026-11: Chrome and Edge both report the download UUID (navigation=null).
 Private Const DOWNLOAD_CORRELATION_UUID As String = "download"
 Private Const DOWNLOAD_CORRELATION_CONTEXT_NAV As String = "context+navigation"
 Private Const DOWNLOAD_CORRELATION_UNCORRELATABLE As String = "uncorrelatable"
@@ -5745,6 +5746,10 @@ End Function
 Private Function HitTestJs() As String
     Dim js As String
     js = "const e=arguments[0]; e.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); "
+    ' Detached-node check after scrollIntoView: a node removed before or during the scroll would
+    ' otherwise report zero-box and wait the full layout budget; STALE_ELEMENT routes it to the
+    ' existing re-resolve path in ExecuteBaseAction.
+    js = js & "if(!e||!e.isConnected)throw new Error('STALE_ELEMENT'); "
     js = js & "if(window.__vbaIdleProbe) window.__vbaIdleProbe.lastMutationTs = performance.now(); "
     js = js & "const r=e.getBoundingClientRect(); if(!(r.width>0||r.height>0)) return 'hit=0;zero-box'; "
     js = js & "const cx=Math.round(r.left+r.width/2), cy=Math.round(r.top+r.height/2); "
